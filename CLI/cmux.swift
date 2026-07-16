@@ -415,6 +415,33 @@ final class ClaudeHookSessionStore {
         }
     }
 
+    /// Records a prompt lifecycle transition under the hook-store file lock.
+    ///
+    /// The method updates the session turn stack and returns a durable,
+    /// content-free admission order used to prevent a late older prompt from
+    /// replacing a newer private-capture boundary. The order is allocated from
+    /// existing `updatedAt` high-water marks, so no report content or new
+    /// persistence field is introduced.
+    ///
+    /// - Parameters:
+    ///   - sessionId: Exact provider session identity.
+    ///   - workspaceId: Exact routed workspace identity.
+    ///   - surfaceId: Exact routed terminal surface identity.
+    ///   - cwd: Provider working directory metadata.
+    ///   - transcriptPath: Provider rollout path metadata, when supplied.
+    ///   - turnId: Provider turn identity, when supplied.
+    ///   - previousActivePromptTurnIsTerminal: Whether transcript evidence
+    ///     proves the previously active turn completed.
+    ///   - terminalActivePromptTurnIds: Other stacked turns proven terminal.
+    ///   - pid: Provider process identity, when known.
+    ///   - launchCommand: Existing resumable launch metadata.
+    ///   - agentLifecycle: Existing hibernation lifecycle update.
+    ///   - runtimeStatus: Existing runtime status update.
+    ///   - updateRuntimeStatus: Whether to replace runtime status.
+    ///   - autoNameMessages: Existing bounded auto-name transcript metadata.
+    ///   - rejectTerminalTurn: Whether a previously terminal turn must fail.
+    /// - Returns: Stale/nested classification and a content-free admission
+    ///   order, or `nil` order when no valid session was recorded.
     @discardableResult
     func recordPromptSubmit(
         sessionId: String,
@@ -432,11 +459,26 @@ final class ClaudeHookSessionStore {
         updateRuntimeStatus: Bool = false,
         autoNameMessages: [AutoNamingTranscriptMessage] = [],
         rejectTerminalTurn: Bool = false
-    ) throws -> (staleTerminalTurn: Bool, nested: Bool) {
+    ) throws -> (
+        staleTerminalTurn: Bool,
+        nested: Bool,
+        privateCaptureAdmissionOrder: TimeInterval?
+    ) {
         let normalized = normalizeSessionId(sessionId)
-        guard !normalized.isEmpty else { return (staleTerminalTurn: false, nested: false) }
+        guard !normalized.isEmpty else {
+            return (staleTerminalTurn: false, nested: false, privateCaptureAdmissionOrder: nil)
+        }
         return try withLockedState { state in
-            let now = Date().timeIntervalSince1970
+            let wallTime = Date().timeIntervalSince1970
+            let highWater = (state.sessions.values.map(\.updatedAt)
+                + state.activeSessionsBySurface.values.map(\.updatedAt))
+                .filter(\.isFinite)
+                .max() ?? 0
+            // Existing `updatedAt` fields provide a durable Lamport-style
+            // admission order without adding schema. `nextUp` makes prompts
+            // ordered even when wall time is equal or moves backward.
+            let admissionOrder = max(wallTime, highWater.nextUp)
+            let now = admissionOrder
             var record = makeSessionRecord(
                 state: state,
                 sessionId: normalized,
@@ -448,7 +490,7 @@ final class ClaudeHookSessionStore {
             if rejectTerminalTurn,
                let normalizedTurnId,
                terminalPromptTurnSet(from: record).contains(normalizedTurnId) {
-                return (staleTerminalTurn: true, nested: false)
+                return (true, false, nil)
             }
             update(
                 &record,
@@ -479,7 +521,7 @@ final class ClaudeHookSessionStore {
                     record.activePromptTurnIds = nil
                     record.lastPromptTurnId = normalizedTurnId
                     state.sessions[normalized] = record
-                    return (staleTerminalTurn: false, nested: true)
+                    return (false, true, admissionOrder)
                 } else if let activeTurnId = turnStack.last,
                           activeTurnId != normalizedTurnId {
                     var removedTurnCount = 0
@@ -499,26 +541,93 @@ final class ClaudeHookSessionStore {
                     markPromptTurnsTerminal(removedTerminalTurnIds, on: &record)
                     record.lastPromptTurnId = normalizedTurnId
                     state.sessions[normalized] = record
-                    return (staleTerminalTurn: false, nested: totalDepth > 1)
+                    return (false, totalDepth > 1, admissionOrder)
                 }
                 if turnStack.last == normalizedTurnId {
                     let totalDepth = max(legacyDepth, turnStack.count)
                     setActivePromptTurnStack(turnStack, totalDepth: totalDepth, on: &record)
                     record.lastPromptTurnId = normalizedTurnId
                     state.sessions[normalized] = record
-                    return (staleTerminalTurn: false, nested: totalDepth > 1)
+                    return (false, totalDepth > 1, admissionOrder)
                 }
                 let totalDepth = max(legacyDepth, turnStack.count) + 1
                 turnStack.append(normalizedTurnId)
                 setActivePromptTurnStack(turnStack, totalDepth: totalDepth, on: &record)
                 record.lastPromptTurnId = normalizedTurnId
                 state.sessions[normalized] = record
-                return (staleTerminalTurn: false, nested: totalDepth > 1)
+                return (false, totalDepth > 1, admissionOrder)
             }
             let existingTurnStackDepth = activePromptTurnStack(from: record).count
             record.activePromptDepth = max(max(0, record.activePromptDepth ?? 0), existingTurnStackDepth) + 1
             state.sessions[normalized] = record
-            return (staleTerminalTurn: false, nested: (record.activePromptDepth ?? 0) > 1)
+            return (false, (record.activePromptDepth ?? 0) > 1, admissionOrder)
+        }
+    }
+
+    /// Records the exact primary Codex prompt currently authorized to produce
+    /// private report capture on one surface. Call only after preference-
+    /// independent nested/managed/process classification and exact routing.
+    /// An equal or newer active boundary wins, making late writes idempotent
+    /// and preventing old prompts from reclaiming a rebound surface.
+    ///
+    /// - Parameters:
+    ///   - sessionId: Accepted primary Codex session.
+    ///   - surfaceId: Exact live runtime surface.
+    ///   - turnId: Accepted primary Codex turn.
+    ///   - admissionOrder: Durable order returned by `recordPromptSubmit`.
+    /// - Throws: Hook-store lock or persistence errors; callers fail closed.
+    func markPrivateCaptureActiveBoundary(
+        sessionId: String,
+        surfaceId: String,
+        turnId: String,
+        admissionOrder: TimeInterval
+    ) throws {
+        guard let normalizedSession = normalizeOptional(sessionId),
+              let normalizedSurface = normalizeOptional(surfaceId),
+              let normalizedTurn = normalizeOptional(turnId),
+              admissionOrder.isFinite else {
+            return
+        }
+        try withLockedState { state in
+            guard state.sessions[normalizedSession]?.lastPromptTurnId == normalizedTurn else {
+                return
+            }
+            if let existing = state.activeSessionsBySurface[normalizedSurface],
+               existing.updatedAt >= admissionOrder {
+                return
+            }
+            state.activeSessionsBySurface[normalizedSurface] = ClaudeHookActiveSessionRecord(
+                sessionId: normalizedSession,
+                turnId: normalizedTurn,
+                allowsNewSessionReplacement: nil,
+                updatedAt: admissionOrder
+            )
+        }
+    }
+
+    /// Determines whether the durable exact-primary boundary still owns a surface.
+    ///
+    /// - Parameters:
+    ///   - sessionId: Expected provider session.
+    ///   - surfaceId: Exact live runtime surface.
+    ///   - turnId: Expected provider turn.
+    /// - Returns: `true` only when every active-boundary component matches.
+    /// - Throws: Hook-store read/lock errors; callers treat failure as mismatch.
+    func privateCaptureActiveBoundaryMatches(
+        sessionId: String,
+        surfaceId: String,
+        turnId: String
+    ) throws -> Bool {
+        guard let normalizedSession = normalizeOptional(sessionId),
+              let normalizedSurface = normalizeOptional(surfaceId),
+              let normalizedTurn = normalizeOptional(turnId) else {
+            return false
+        }
+        return try withLockedState { state in
+            guard let active = state.activeSessionsBySurface[normalizedSurface] else {
+                return false
+            }
+            return active.sessionId == normalizedSession && active.turnId == normalizedTurn
         }
     }
 
@@ -1091,6 +1200,10 @@ final class ClaudeHookSessionStore {
         return String(value[..<index]) + "…"
     }
 
+    /// Applies shared session metadata while preserving monotonic durable order.
+    ///
+    /// `updatedAt.nextUp` prevents equal or backward wall-clock values from
+    /// collapsing prompt admission order used by private stale-event rejection.
     private func update(
         _ record: inout ClaudeHookSessionRecord,
         workspaceId: String,
@@ -1159,7 +1272,11 @@ final class ClaudeHookSessionStore {
         if let hadPendingBackgroundWorkAtStop {
             record.hadPendingBackgroundWorkAtStop = hadPendingBackgroundWorkAtStop
         }
-        record.updatedAt = now
+        if record.updatedAt.isFinite {
+            record.updatedAt = max(now, record.updatedAt.nextUp)
+        } else {
+            record.updatedAt = now
+        }
     }
 
     func clearNotificationEmission(sessionId: String) throws {
@@ -27433,6 +27550,49 @@ struct CMUXCLI {
         return false
     }
 
+    /// Preference-independent primary-agent guard for private report capture.
+    /// Notification suppression is user-configurable; private output isolation
+    /// is not, so nested/managed/process-ancestry evidence is always enforced.
+    ///
+    /// - Parameters:
+    ///   - currentAgentPID: Provider process used for ancestry classification.
+    ///   - nestedPromptEvent: Hook-store turn-stack nesting evidence.
+    ///   - transcriptSubagentSession: Structured rollout subagent evidence.
+    ///   - env: Hook environment containing managed-subagent markers.
+    /// - Returns: `true` when private capture must fail closed.
+    func shouldRejectPrivateAgentReportCapture(
+        currentAgentPID: Int?,
+        nestedPromptEvent: Bool,
+        transcriptSubagentSession: Bool,
+        env: [String: String]
+    ) -> Bool {
+        if let override = normalizedHookValue(env["CMUX_AGENT_HOOK_SUPPRESS_VISIBLE_MUTATIONS"])?.lowercased(),
+           Self.parseHookBoolean(override) == true {
+            return true
+        }
+        if nestedPromptEvent
+            || managedSubagentVisibleMutationSuppressionRequested(env: env)
+            || transcriptSubagentSession {
+            return true
+        }
+        guard let currentAgentPID, currentAgentPID > 1 else { return false }
+
+        var candidate = pid_t(currentAgentPID)
+        var agentProcessCount = 0
+        var remainingAncestors = 32
+        while candidate > 1, remainingAncestors > 0 {
+            if nativeProcessDescribesKnownAgent(for: candidate) {
+                agentProcessCount += 1
+                if agentProcessCount >= 2 { return true }
+            }
+            let next = parentPID(of: candidate)
+            guard next > 1, next != candidate else { break }
+            candidate = next
+            remainingAncestors -= 1
+        }
+        return false
+    }
+
     private func managedSubagentVisibleMutationSuppressionRequested(env: [String: String]) -> Bool {
         guard let raw = normalizedHookValue(env[managedSubagentEnvironmentKey]),
               let parsed = Self.parseHookBoolean(raw) else {
@@ -30531,6 +30691,37 @@ export default CMUXSessionRestore;
 #endif
             return target
         }
+        func isExactPrivateCaptureTarget(
+            _ target: (workspaceId: String, surfaceId: String),
+            mapped: ClaudeHookSessionRecord?
+        ) -> Bool {
+            // Private report capture never inherits resolveTarget's
+            // focused/default/sole-surface fallback. The resolved tuple must
+            // be independently proven by an exact direct, TTY/PID, or stored
+            // session surface binding.
+            if let binding = processBinding(),
+               resolveAccessibleWorkspaceId(binding.workspaceId) == target.workspaceId,
+               resolveAccessibleSurfaceId(binding.surfaceId, workspaceId: target.workspaceId) == target.surfaceId {
+                return true
+            }
+            if resolvedDirectWorkspaceArg == target.workspaceId,
+               resolveAccessibleSurfaceId(resolvedDirectSurfaceArg, workspaceId: target.workspaceId) == target.surfaceId {
+                return true
+            }
+            if let mapped,
+               let mappedTurnID = normalizedHookValue(input.turnId)
+                    ?? normalizedHookValue(mapped.lastPromptTurnId),
+               (try? store.privateCaptureActiveBoundaryMatches(
+                   sessionId: sessionId,
+                   surfaceId: mapped.surfaceId,
+                   turnId: mappedTurnID
+               )) == true,
+               resolveAccessibleWorkspaceId(mapped.workspaceId) == target.workspaceId,
+               resolveAccessibleSurfaceId(mapped.surfaceId, workspaceId: target.workspaceId) == target.surfaceId {
+                return true
+            }
+            return false
+        }
         defer {
             if !didSendFeedTelemetry, !shouldSuppressGenericFeedTelemetry() {
                 sendAgentFeedTelemetry()
@@ -30813,43 +31004,64 @@ export default CMUXSessionRestore;
                 terminalActivePromptTurnIds = []
                 previousActivePromptTurnIsTerminal = false
             }
-            let nestedPromptSubmit: Bool
+            let promptSubmitRecord: (
+                staleTerminalTurn: Bool,
+                nested: Bool,
+                lifecycleWriteSucceeded: Bool,
+                privateCaptureAdmissionOrder: TimeInterval?
+            )
             if !sessionId.isEmpty {
                 if incomingCodexTurnIsTerminal {
-                    nestedPromptSubmit = false
+                    promptSubmitRecord = (false, false, false, nil)
                 } else {
-                    let recordResult = (try? store.recordPromptSubmit(
-                        sessionId: sessionId,
-                        workspaceId: workspaceId,
-                        surfaceId: surfaceId,
-                        cwd: preferredAgentHookResumeWorkingDirectory(kind: def.name, current: launchCommand, currentCwd: hookCwd, mapped: mapped),
-                        transcriptPath: transcriptPathForStore,
-                        turnId: input.turnId,
-                        previousActivePromptTurnIsTerminal: previousActivePromptTurnIsTerminal,
-                        terminalActivePromptTurnIds: terminalActivePromptTurnIds,
-                        pid: pid,
-                        launchCommand: resumeLaunchCommand,
-                        agentLifecycle: .running,
-                        autoNameMessages: autoNamingMessages(
-                            for: def,
-                            parsedInput: input,
-                            client: client,
-                            workspaceId: workspaceId
-                        ),
-                        rejectTerminalTurn: def.name == "codex"
-                    )) ?? (staleTerminalTurn: false, nested: false)
-                    if recordResult.staleTerminalTurn {
+                    do {
+                        let recordResult = try store.recordPromptSubmit(
+                            sessionId: sessionId,
+                            workspaceId: workspaceId,
+                            surfaceId: surfaceId,
+                            cwd: preferredAgentHookResumeWorkingDirectory(kind: def.name, current: launchCommand, currentCwd: hookCwd, mapped: mapped),
+                            transcriptPath: transcriptPathForStore,
+                            turnId: input.turnId,
+                            previousActivePromptTurnIsTerminal: previousActivePromptTurnIsTerminal,
+                            terminalActivePromptTurnIds: terminalActivePromptTurnIds,
+                            pid: pid,
+                            launchCommand: resumeLaunchCommand,
+                            agentLifecycle: .running,
+                            autoNameMessages: autoNamingMessages(
+                                for: def,
+                                parsedInput: input,
+                                client: client,
+                                workspaceId: workspaceId
+                            ),
+                            rejectTerminalTurn: def.name == "codex"
+                        )
+                        promptSubmitRecord = (
+                            recordResult.staleTerminalTurn,
+                            recordResult.nested,
+                            true,
+                            recordResult.privateCaptureAdmissionOrder
+                        )
+                    } catch {
+                        promptSubmitRecord = (false, false, false, nil)
+                    }
+                    if promptSubmitRecord.staleTerminalTurn {
                         stopStaleCodexPromptSubmit()
                         return
                     }
-                    nestedPromptSubmit = recordResult.nested
                 }
             } else {
-                nestedPromptSubmit = false
+                promptSubmitRecord = (false, false, false, nil)
             }
+            let nestedPromptSubmit = promptSubmitRecord.nested
             let suppressVisibleMutations = shouldSuppressNestedAgentVisibleMutations(
                 currentAgentPID: pid,
                 nestedPromptEvent: nestedPromptSubmit,
+                env: env
+            )
+            let rejectPrivatePromptBoundary = shouldRejectPrivateAgentReportCapture(
+                currentAgentPID: pid,
+                nestedPromptEvent: nestedPromptSubmit,
+                transcriptSubagentSession: false,
                 env: env
             )
             if !suppressVisibleMutations && !incomingCodexTurnIsTerminal {
@@ -30905,6 +31117,22 @@ export default CMUXSessionRestore;
                 if !acceptedRunningUpdate || codexPromptTurnWentTerminal() {
                     stopStaleCodexPromptSubmit()
                     return
+                }
+                if def.name == "codex",
+                   promptSubmitRecord.lifecycleWriteSucceeded,
+                   let admissionOrder = promptSubmitRecord.privateCaptureAdmissionOrder,
+                   !rejectPrivatePromptBoundary,
+                   isExactPrivateCaptureTarget(target, mapped: nil),
+                   let incomingTurnId {
+                    // A failed boundary write fails closed later: neither the
+                    // CLI mapped-target check nor the app hook-store validator
+                    // accepts a missing boundary.
+                    try? store.markPrivateCaptureActiveBoundary(
+                        sessionId: sessionId,
+                        surfaceId: surfaceId,
+                        turnId: incomingTurnId,
+                        admissionOrder: admissionOrder
+                    )
                 }
                 try? store.clearNotificationEmission(sessionId: sessionId)
                 publishAgentSurfaceResumeBinding(
@@ -31135,31 +31363,39 @@ export default CMUXSessionRestore;
             } else {
                 terminalActivePromptTurnIdsForStop = []
             }
-            let nestedPromptStop: Bool
+            let promptStopRecord: (nested: Bool, lifecycleWriteSucceeded: Bool)
             if !sessionId.isEmpty, !staleIdleStopHasNewerRunningSession {
-                nestedPromptStop = (try? store.recordPromptStop(
-                    sessionId: sessionId,
-                    workspaceId: workspaceId,
-                    surfaceId: surfaceId,
-                    cwd: cwd,
-                    transcriptPath: input.transcriptPath ?? mapped?.transcriptPath,
-                    turnId: input.turnId,
-                    terminalActivePromptTurnIds: terminalActivePromptTurnIdsForStop,
-                    pid: pid,
-                    launchCommand: resumeLaunchCommand,
-                    agentLifecycle: lifecycleAfterStop,
-                    lastSubtitle: nil,
-                    lastBody: nil,
-                    autoNameMessages: autoNamingMessages(
-                        for: def,
-                        parsedInput: input,
-                        client: client,
-                        workspaceId: workspaceId
-                    )
-                )) ?? false
+                do {
+                    promptStopRecord = (try store.recordPromptStop(
+                        sessionId: sessionId,
+                        workspaceId: workspaceId,
+                        surfaceId: surfaceId,
+                        cwd: cwd,
+                        transcriptPath: input.transcriptPath ?? mapped?.transcriptPath,
+                        turnId: input.turnId,
+                        terminalActivePromptTurnIds: terminalActivePromptTurnIdsForStop,
+                        pid: pid,
+                        launchCommand: resumeLaunchCommand,
+                        agentLifecycle: lifecycleAfterStop,
+                        lastSubtitle: nil,
+                        lastBody: nil,
+                        autoNameMessages: autoNamingMessages(
+                            for: def,
+                            parsedInput: input,
+                            client: client,
+                            workspaceId: workspaceId
+                        )
+                    ), true)
+                } catch {
+                    // Existing visible notification behavior remains fail-open,
+                    // but private report capture must never treat a failed
+                    // lifecycle mutation as proof of a primary completion.
+                    promptStopRecord = (false, false)
+                }
             } else {
-                nestedPromptStop = false
+                promptStopRecord = (false, false)
             }
+            let nestedPromptStop = promptStopRecord.nested
             let suppressVisibleMutations = shouldSuppressNestedAgentVisibleMutations(
                 currentAgentPID: pid,
                 nestedPromptEvent: nestedPromptStop,
@@ -31168,6 +31404,36 @@ export default CMUXSessionRestore;
             ) || staleIdleStopHasNewerRunningSession
             let suppressCompletionNotification = suppressVisibleMutations
                 || codexSubagentSignals.hasSubagentNotificationRelay
+            let rejectPrivateReportCapture = shouldRejectPrivateAgentReportCapture(
+                currentAgentPID: pid,
+                nestedPromptEvent: nestedPromptStop,
+                transcriptSubagentSession: codexSubagentSignals.isSubagentSession,
+                env: env
+            ) || staleIdleStopHasNewerRunningSession
+                || !promptStopRecord.lifecycleWriteSucceeded
+
+            if def.name == "codex",
+               subcommand == "stop",
+               !sessionId.isEmpty,
+               !rejectPrivateReportCapture,
+               isExactPrivateCaptureTarget(target, mapped: mapped),
+               let captureTurnID = normalizedHookValue(input.turnId)
+                   ?? normalizedHookValue(mapped?.lastPromptTurnId),
+               (try? store.privateCaptureActiveBoundaryMatches(
+                   sessionId: sessionId,
+                   surfaceId: surfaceId,
+                   turnId: captureTurnID
+               )) == true {
+                sendPrivateCodexAgentReportCapture(
+                    client: client,
+                    parsedInput: input,
+                    workspaceID: workspaceId,
+                    surfaceID: surfaceId,
+                    sessionID: sessionId,
+                    turnID: captureTurnID,
+                    transcriptPath: normalizedHookValue(input.transcriptPath ?? mapped?.transcriptPath)
+                )
+            }
 
             if !sessionId.isEmpty, !suppressVisibleMutations {
                 try? store.upsert(sessionId: sessionId, workspaceId: workspaceId, surfaceId: surfaceId, cwd: cwd,
@@ -31864,6 +32130,51 @@ export default CMUXSessionRestore;
               let line = String(data: data, encoding: .utf8)
         else { return }
         sendBestEffortFeedTelemetry(socketPath: client.socketPath, line: line, socketPassword: socketPassword)
+    }
+
+    /// Sends exact Codex completion material only through the private capture
+    /// socket method. Callers must already have passed the primary Stop,
+    /// nested/subagent, stale-turn, and exact-target acceptance boundary.
+    /// The raw reply is read only from `rawObject`; compact preview data is
+    /// deliberately excluded, and no report text is sent through Feed or
+    /// notification methods.
+    ///
+    /// - Parameters:
+    ///   - client: Existing authorized local socket client.
+    ///   - parsedInput: Hook input retaining the exact raw JSON object.
+    ///   - workspaceID: Exact validated workspace identity.
+    ///   - surfaceID: Exact validated runtime surface identity.
+    ///   - sessionID: Exact validated Codex session.
+    ///   - turnID: Exact validated Codex turn.
+    ///   - transcriptPath: Session-bound rollout path, when available.
+    private func sendPrivateCodexAgentReportCapture(
+        client: SocketClient,
+        parsedInput: ClaudeHookParsedInput,
+        workspaceID: String,
+        surfaceID: String,
+        sessionID: String,
+        turnID: String,
+        transcriptPath: String?
+    ) {
+        var params: [String: Any] = [
+            "provider": "codex",
+            "workspace_id": workspaceID,
+            "surface_id": surfaceID,
+            "session_id": sessionID,
+            "turn_id": turnID,
+            "completion_kind": "primaryStop",
+            "completion_timestamp": Date().timeIntervalSince1970,
+        ]
+        if let transcriptPath {
+            params["transcript_path"] = transcriptPath
+        }
+        if let rawFinalReply = parsedInput.rawObject?["last_assistant_message"] as? String,
+           !rawFinalReply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // Preserve the raw hook string exactly. Preview compaction lives on
+            // parsedInput.object and is never consulted for this value.
+            params["raw_final_reply"] = rawFinalReply
+        }
+        _ = try? client.sendV2(method: "agent.report.capture", params: params)
     }
 
     private func feedContextForEvent(

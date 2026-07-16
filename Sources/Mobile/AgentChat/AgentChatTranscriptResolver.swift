@@ -71,6 +71,27 @@ struct AgentChatTranscriptResolver: Sendable {
         }
     }
 
+    /// Resolves a Codex rollout from an already validated recorded path, then
+    /// from the conventional session-id filename. This method performs file
+    /// I/O and must be called off the main actor.
+    ///
+    /// The conventional fallback remains session-specific; it never scans for
+    /// an arbitrary newest transcript and therefore cannot cross sessions.
+    ///
+    /// - Parameters:
+    ///   - recordedPath: Session-validated hook path, when available.
+    ///   - sessionID: Exact Codex session used by the fallback filename scan.
+    /// - Returns: Existing exact-session rollout path, or `nil`.
+    func codexTranscriptPath(recordedPath: String?, sessionID: String) -> String? {
+        if let recordedPath {
+            let expanded = (recordedPath as NSString).expandingTildeInPath
+            if FileManager.default.fileExists(atPath: expanded) {
+                return expanded
+            }
+        }
+        return codexFallbackPath(sessionID: sessionID)
+    }
+
     /// Resolves only paths that are cheap to check from the main-actor mobile
     /// session list path. Codex's fallback scans the full sessions tree, so it is
     /// intentionally excluded here and remains available only when opening a
@@ -125,5 +146,106 @@ struct AgentChatTranscriptResolver: Sendable {
             }
         }
         return nil
+    }
+}
+
+extension AgentChatTranscriptResolver: AgentReportTranscriptRecovering {
+    /// Proves primary-session metadata using off-main streaming JSONL I/O.
+    ///
+    /// - Parameters:
+    ///   - recordedPath: Session-validated hook path, when available.
+    ///   - sessionID: Exact Codex session expected in rollout metadata.
+    /// - Returns: `true` only for a matching primary rollout.
+    func isPrimaryCodexSession(
+        recordedPath: String?,
+        sessionID: String
+    ) async -> Bool {
+        let resolver = self
+        return await Task.detached(priority: .utility) {
+            guard let path = resolver.codexTranscriptPath(
+                recordedPath: recordedPath,
+                sessionID: sessionID
+            ), let lines = CompleteJSONLLineSequence(path: path) else {
+                return false
+            }
+            return CodexFinalReplyExtractor().isPrimarySession(
+                lines: lines,
+                sessionID: sessionID
+            )
+        }.value
+    }
+
+    /// Recovers exact final assistant text using off-main streaming JSONL I/O.
+    ///
+    /// - Parameters:
+    ///   - recordedPath: Session-validated hook path, when available.
+    ///   - sessionID: Exact Codex session expected in rollout metadata.
+    ///   - turnID: Exact terminal turn to extract.
+    /// - Returns: Unmodified final assistant text, or `nil` if unprovable.
+    func recoverCodexFinalReply(
+        recordedPath: String?,
+        sessionID: String,
+        turnID: String
+    ) async -> String? {
+        let resolver = self
+        return await Task.detached(priority: .utility) {
+            guard let path = resolver.codexTranscriptPath(
+                recordedPath: recordedPath,
+                sessionID: sessionID
+            ), let lines = CompleteJSONLLineSequence(path: path) else {
+                return nil
+            }
+            return CodexFinalReplyExtractor().extract(
+                lines: lines,
+                sessionID: sessionID,
+                turnID: turnID
+            )
+        }.value
+    }
+}
+
+/// Streams complete JSONL records without copying an entire long-lived rollout
+/// into memory. The largest retained buffer is one record plus one read chunk;
+/// an incomplete trailing fragment is deliberately discarded at EOF.
+private struct CompleteJSONLLineSequence: Sequence, IteratorProtocol {
+    private static let chunkSize = 64 * 1024
+
+    private let handle: FileHandle
+    private var buffer = Data()
+    private var reachedEOF = false
+
+    /// Opens a rollout for bounded streaming reads.
+    ///
+    /// - Parameter path: Exact session-validated rollout path.
+    init?(path: String) {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
+            return nil
+        }
+        self.handle = handle
+    }
+
+    /// Returns the next newline-terminated record, dropping an incomplete tail.
+    ///
+    /// - Returns: One complete UTF-8-decoded line, or `nil` at safe EOF.
+    mutating func next() -> String? {
+        while true {
+            if let newline = buffer.firstIndex(of: 0x0A) {
+                let line = String(decoding: buffer[..<newline], as: UTF8.self)
+                buffer.removeSubrange(...newline)
+                return line
+            }
+            guard !reachedEOF else {
+                // Rollouts are append-only. Never parse or guess from a
+                // concurrently written, non-newline-terminated JSON fragment.
+                return nil
+            }
+            guard let chunk = try? handle.read(upToCount: Self.chunkSize),
+                  !chunk.isEmpty else {
+                reachedEOF = true
+                try? handle.close()
+                continue
+            }
+            buffer.append(chunk)
+        }
     }
 }

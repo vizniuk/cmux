@@ -1,6 +1,7 @@
 import AppKit
 import CmuxAppKitSupportUI
 import CmuxAuthRuntime
+import CmuxAgentChat
 import CmuxBrowser
 import CmuxCommandPalette
 import CmuxPanes
@@ -778,6 +779,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// Combine subscriptions that publish workspace.updated to mobile clients.
     private var mobileWorkspaceListObservers: [ObjectIdentifier: MobileWorkspaceListObserver] = [:]
     private let agentChatTranscriptService = AgentChatTranscriptService()
+    /// Process-local private report store. Its policy defaults to disabled and
+    /// it is injected only into the dedicated capture transport; exact report
+    /// text is never composed into Feed, notifications, or persisted services.
+    private let agentReportCaptureStore = AgentReportCaptureStore(
+        transcriptRecovery: AgentChatTranscriptResolver()
+    )
     /// The app's settings dependency container, handed over by `cmuxApp` via
     /// `configure(...)` before any main window is created. AppKit builds the
     /// main window's `NSHostingView` itself, so it injects this into the
@@ -2024,6 +2031,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         ClosedItemHistoryStore.shared.flushPendingSaves()
     }
 
+    /// Composes process-wide app services before socket and session activity begins.
+    ///
+    /// Slice A wires the default-disabled private report actor and a
+    /// content-free surface lifecycle invalidator here so ownership remains at
+    /// the executable composition root.
+    ///
+    /// - Parameters:
+    ///   - tabManager: Initial app window's workspace manager.
+    ///   - notificationStore: Existing notification store; private report text
+    ///     is never passed to it.
+    ///   - sidebarState: Shared sidebar state.
+    ///   - settingsRuntime: Existing settings graph; Slice A adds no setting.
+    ///   - auth: Existing authentication composition.
     func configure(
         tabManager: TabManager,
         notificationStore: TerminalNotificationStore,
@@ -2049,6 +2069,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         MacPairedMacBackupPublisher.shared.configure(auth: auth.coordinator)
         TerminalController.shared.attachAuth(coordinator: auth.coordinator, browserSignIn: auth.browserSignIn)
         TerminalController.shared.agentChatTranscriptService = agentChatTranscriptService
+        TerminalController.shared.agentReportCaptureStore = agentReportCaptureStore
+        agentChatTranscriptService.setAgentReportSurfaceInvalidator { [agentReportCaptureStore] surfaceID in
+            Task { await agentReportCaptureStore.invalidatePendingCapture(runtimeSurfaceID: surfaceID) }
+        }
         auth.start()
         ensureMobileWorkspaceListObserver(for: tabManager)
         MobileTerminalRenderObserver.shared.start()

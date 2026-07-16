@@ -11921,6 +11921,8 @@ extension Workspace: BonsplitDelegate {
         return true
     }
 
+    /// Finalizes a surface closure and purges private report state only when
+    /// the panel is truly closed; detach transfers preserve the live surface.
     func splitTabBar(_ controller: BonsplitController, didCloseTab tabId: TabID, fromPane pane: PaneID) {
         forceCloseTabIds.remove(tabId)
         tabStripCloseButtonByTabId.removeValue(forKey: tabId)
@@ -12021,6 +12023,12 @@ extension Workspace: BonsplitDelegate {
             requestTransferredRemoteCleanup: false,
             cleanupControllerSurfaceState: !isDetaching
         )
+        if !isDetaching {
+            // A detached panel remains the same live surface in another pane;
+            // purging only on true closure prevents both stale retention and
+            // accidental loss during a topology-only move.
+            TerminalController.shared.purgeAgentReport(runtimeSurfaceID: panelId)
+        }
         if !isDetaching {
             owningTabManager?.invalidateFocusHistoryTarget(workspaceId: id, panelId: panelId)
         }

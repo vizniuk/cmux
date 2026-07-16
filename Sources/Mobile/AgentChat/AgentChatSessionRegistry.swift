@@ -6,6 +6,12 @@ import Foundation
 /// hook events and the on-disk hook session stores.
 @MainActor
 final class AgentChatSessionRegistry {
+    /// Content-free transcript binding proven for an exact active capture tuple.
+    struct AgentReportCaptureBinding: Sendable {
+        /// Session-validated transcript path, when the hook recorded one.
+        let transcriptPath: String?
+    }
+
     private var records: [String: AgentChatSessionRecord] = [:]
     private var liveSessionIDBySurfaceID: [String: String] = [:]
     private var liveClaudeSessionIDsBySurfaceID: [String: Set<String>] = [:]
@@ -249,6 +255,110 @@ final class AgentChatSessionRegistry {
             return record
         }
         return nil
+    }
+
+    /// Validates the exact Codex workspace/surface/session/turn tuple against
+    /// both the live registry and the CLI-owned hook lifecycle store.
+    ///
+    /// The hook-store read runs off the main actor. The live registry is
+    /// checked again afterward so a concurrent resume or surface rebind cannot
+    /// validate a stale request.
+    ///
+    /// - Parameters:
+    ///   - workspaceID: Exact live workspace claimed by the request.
+    ///   - surfaceID: Exact live runtime surface claimed by the request.
+    ///   - sessionID: Exact provider session claimed by the request.
+    ///   - turnID: Exact provider turn claimed by the request.
+    ///   - requestedTranscriptPath: Hook-supplied path to compare with the
+    ///     authoritative session record, when present.
+    /// - Returns: A content-free validated binding, or `nil` on any mismatch.
+    func agentReportCaptureBinding(
+        workspaceID: String,
+        surfaceID: String,
+        sessionID: String,
+        turnID: String,
+        requestedTranscriptPath: String?
+    ) async -> AgentReportCaptureBinding? {
+        guard Self.sessionRecordAllowsAgentReportCapture(
+            record(sessionID: sessionID),
+            workspaceID: workspaceID,
+            surfaceID: surfaceID,
+            sessionID: sessionID
+        ) else {
+            return nil
+        }
+
+        let hookStore = self.hookStore
+        let entry = await Task.detached(priority: .utility) {
+            hookStore.activeCaptureEntry(
+                agentSource: "codex",
+                sessionID: sessionID,
+                surfaceID: surfaceID,
+                turnID: turnID
+            )
+        }.value
+
+        guard let entry,
+              entry.sessionID == sessionID,
+              Self.sameUUID(entry.workspaceID, workspaceID),
+              Self.sameUUID(entry.surfaceID, surfaceID),
+              entry.lastPromptTurnID == turnID,
+              Self.sessionRecordAllowsAgentReportCapture(
+                  record(sessionID: sessionID),
+                  workspaceID: workspaceID,
+                  surfaceID: surfaceID,
+                  sessionID: sessionID
+              ) else {
+            return nil
+        }
+
+        let recordedTranscriptPath = entry.transcriptPath
+            ?? record(sessionID: sessionID)?.transcriptPath
+        if let requestedTranscriptPath {
+            guard let recordedTranscriptPath,
+                  Self.normalizedPath(requestedTranscriptPath) == Self.normalizedPath(recordedTranscriptPath) else {
+                return nil
+            }
+        }
+        return AgentReportCaptureBinding(
+            transcriptPath: recordedTranscriptPath
+        )
+    }
+
+    /// Applies registry-side session checks without borrowing another
+    /// session's Feed ownership for the same surface.
+    private static func sessionRecordAllowsAgentReportCapture(
+        _ record: AgentChatSessionRecord?,
+        workspaceID: String,
+        surfaceID: String,
+        sessionID: String
+    ) -> Bool {
+        // Feed delivery is intentionally best-effort and can lag the private
+        // Stop request. An absent record is therefore not evidence of a
+        // mismatch; the atomically written active hook-store tuple remains
+        // authoritative. A present record for THIS session must agree exactly,
+        // which rejects cmux-authored resume/rebinds. Do not consult the
+        // surface's current Feed record here: a managed child can temporarily
+        // own that preview index without owning the private capture boundary.
+        guard let record else { return true }
+        return record.agentKind == .codex
+            && record.sessionID == sessionID
+            && sameUUID(record.workspaceID, workspaceID)
+            && sameUUID(record.surfaceID, surfaceID)
+            && record.state != .ended
+    }
+
+    /// Compares required UUID strings canonically and fails closed on absence.
+    private static func sameUUID(_ lhs: String?, _ rhs: String) -> Bool {
+        guard let lhs, let left = UUID(uuidString: lhs), let right = UUID(uuidString: rhs) else {
+            return false
+        }
+        return left == right
+    }
+
+    /// Normalizes a recorded path only for equality; it never reads content.
+    private static func normalizedPath(_ value: String) -> String {
+        URL(fileURLWithPath: (value as NSString).expandingTildeInPath).standardizedFileURL.path
     }
 
     /// The live session for a surface, or its most recently active historical session.

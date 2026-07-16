@@ -1,4 +1,5 @@
 import AppKit
+import CmuxAgentChat
 import CmuxCore
 import Darwin
 import Foundation
@@ -660,6 +661,175 @@ final class TerminalControllerSocketSecurityTests {
         XCTAssertNotEqual(workerError["code"] as? String, "invalid_dispatch")
         XCTAssertNotEqual(workerError["code"] as? String, "method_not_found")
         XCTAssertEqual(workerError["code"] as? String, "not_found")
+    }
+
+    @Test func privateAgentReportCaptureRoutesOnWorkerAndDisabledGateRetainsNothing() async throws {
+        let socketPath = makeSocketPath("report-capture-worker")
+        let tabManager = TabManager()
+        let store = AgentReportCaptureStore(
+            transcriptRecovery: AgentChatTranscriptResolver()
+        )
+        TerminalController.shared.agentReportCaptureStore = store
+        defer { TerminalController.shared.agentReportCaptureStore = nil }
+        TerminalController.shared.start(
+            tabManager: tabManager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let surfaceID = UUID()
+        let privateBody = "PRIVATE-SOCKET-RESPONSE-SENTINEL"
+        let params: [String: Any] = [
+            "provider": "codex",
+            "workspace_id": UUID().uuidString,
+            "surface_id": surfaceID.uuidString,
+            "session_id": "synthetic-session",
+            "turn_id": "synthetic-turn",
+            "completion_kind": "primaryStop",
+            "completion_timestamp": 100.0,
+            "raw_final_reply": privateBody,
+        ]
+        let requestLine = try makeV2RequestLine(method: "agent.report.capture", params: params)
+        let mainEnvelope = try decodeV2Envelope(TerminalController.shared.handleSocketLine(requestLine))
+        let mainError = try XCTUnwrap(mainEnvelope["error"] as? [String: Any])
+        XCTAssertEqual(mainError["code"] as? String, "invalid_dispatch")
+
+        let workerEnvelope = try await sendV2RequestAsync(
+            method: "agent.report.capture",
+            params: params,
+            to: socketPath
+        )
+        XCTAssertEqual(workerEnvelope["ok"] as? Bool, true)
+        let result = try XCTUnwrap(workerEnvelope["result"] as? [String: Any])
+        XCTAssertEqual(result["status"] as? String, "queued")
+        XCTAssertFalse(String(describing: workerEnvelope).contains(privateBody))
+        let retained = await store.latestReport(runtimeSurfaceID: surfaceID)
+        XCTAssertNil(retained)
+    }
+
+    @Test func enabledPrivateAgentReportEndpointValidatesAndCapturesExactLiveSurface() async throws {
+        let socketPath = makeSocketPath("report-capture-enabled")
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-report-endpoint-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let tabManager = TabManager()
+        let workspace = tabManager.addWorkspace(select: true)
+        let panel = try XCTUnwrap(workspace.focusedTerminalPanel)
+        let sessionID = "synthetic-endpoint-session"
+        let turnID = "synthetic-endpoint-turn"
+        let historicalSessionID = "synthetic-historical-endpoint-session"
+        let historicalTurnID = "synthetic-historical-endpoint-turn"
+        let exact = "  ## Exact endpoint reply\n\n日本語 ✅  \n"
+        let transcriptURL = home.appendingPathComponent("synthetic-rollout.jsonl")
+        try #"{"type":"session_meta","payload":{"id":"synthetic-endpoint-session"}}"#
+            .appending("\n")
+            .write(to: transcriptURL, atomically: true, encoding: .utf8)
+        let storeDirectory = home.appendingPathComponent(".cmuxterm", isDirectory: true)
+        try FileManager.default.createDirectory(at: storeDirectory, withIntermediateDirectories: true)
+        let hookStorePayload: [String: Any] = [
+            "sessions": [
+                sessionID: [
+                    "workspaceId": workspace.id.uuidString,
+                    "surfaceId": panel.id.uuidString,
+                    "transcriptPath": transcriptURL.path,
+                    "lastPromptTurnId": turnID,
+                    "updatedAt": 100.0,
+                ],
+                historicalSessionID: [
+                    "workspaceId": workspace.id.uuidString,
+                    "surfaceId": panel.id.uuidString,
+                    "transcriptPath": transcriptURL.path,
+                    "lastPromptTurnId": historicalTurnID,
+                    "updatedAt": 50.0,
+                ],
+            ],
+            "activeSessionsBySurface": [
+                panel.id.uuidString: [
+                    "sessionId": sessionID,
+                    "turnId": turnID,
+                    "updatedAt": 100.0,
+                ],
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: hookStorePayload, options: [.sortedKeys])
+            .write(to: storeDirectory.appendingPathComponent("codex-hook-sessions.json"))
+
+        let resolver = AgentChatTranscriptResolver(homeDirectory: home, environment: [:])
+        let registry = AgentChatSessionRegistry(
+            hookStore: AgentChatHookSessionStore(homeDirectory: home)
+        )
+        let service = AgentChatTranscriptService(registry: registry, resolver: resolver)
+        let store = AgentReportCaptureStore(policy: .enabled, transcriptRecovery: resolver)
+        let controller = TerminalController.shared
+        controller.agentChatTranscriptService = service
+        controller.agentReportCaptureStore = store
+        defer {
+            controller.agentReportCaptureResultObserverForTesting = nil
+            controller.agentChatTranscriptService = nil
+            controller.agentReportCaptureStore = nil
+            if tabManager.tabs.contains(where: { $0.id == workspace.id }) {
+                tabManager.closeWorkspace(workspace)
+            }
+        }
+        controller.start(tabManager: tabManager, socketPath: socketPath, accessMode: .allowAll)
+        try waitForSocket(at: socketPath)
+        #expect(controller.tabManager === tabManager)
+        #expect(workspace.panels[panel.id] === panel)
+        #expect(workspace.surfaceIdFromPanelId(panel.id) != nil)
+        let directBinding = await registry.agentReportCaptureBinding(
+            workspaceID: workspace.id.uuidString,
+            surfaceID: panel.id.uuidString,
+            sessionID: sessionID,
+            turnID: turnID,
+            requestedTranscriptPath: transcriptURL.path
+        )
+        #expect(directBinding?.transcriptPath == transcriptURL.path)
+
+        let params: [String: Any] = [
+            "provider": "codex",
+            "workspace_id": workspace.id.uuidString,
+            "surface_id": panel.id.uuidString,
+            "session_id": sessionID,
+            "turn_id": turnID,
+            "completion_kind": "primaryStop",
+            "completion_timestamp": 100.0,
+            "transcript_path": transcriptURL.path,
+            "raw_final_reply": exact,
+        ]
+        var historicalParams = params
+        historicalParams["session_id"] = historicalSessionID
+        historicalParams["turn_id"] = historicalTurnID
+        historicalParams["raw_final_reply"] = "historical reply must not capture"
+        let results = AsyncStream<AgentReportCaptureResult> { continuation in
+            controller.agentReportCaptureResultObserverForTesting = { result in
+                continuation.yield(result)
+            }
+        }
+        var resultIterator = results.makeAsyncIterator()
+        let historicalEnvelope = try await sendV2RequestAsync(
+            method: "agent.report.capture",
+            params: historicalParams,
+            to: socketPath
+        )
+        #expect(historicalEnvelope["ok"] as? Bool == true)
+        #expect(await resultIterator.next() == .rejected(.inaccessibleSurface))
+        #expect(await store.latestReport(runtimeSurfaceID: panel.id) == nil)
+
+        let envelope = try await sendV2RequestAsync(
+            method: "agent.report.capture",
+            params: params,
+            to: socketPath
+        )
+        #expect(envelope["ok"] as? Bool == true)
+        #expect(!String(describing: envelope).contains(exact))
+        #expect(await resultIterator.next() == .captured)
+
+        let report = try #require(await store.latestReport(runtimeSurfaceID: panel.id))
+        #expect(report.finalReply == exact)
+        #expect(report.captureSource == .rawHook)
     }
 
     @Test func testWorkspaceWorkerMethodRejectsWindowAliasInsteadOfDefaultWindowFallback() async throws {

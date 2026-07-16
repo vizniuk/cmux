@@ -3,6 +3,7 @@ import AppKit
 import CmuxRemoteSession
 import CmuxCore
 import CmuxAuthRuntime
+import CmuxAgentChat
 import CmuxFeedback
 import CmuxBrowser
 import CmuxControlSocket
@@ -125,6 +126,12 @@ class TerminalController {
     @MainActor private(set) var authCoordinator: AuthCoordinator?
     @MainActor private(set) var browserSignInFlow: HostBrowserSignInFlow?
     @MainActor var agentChatTranscriptService: AgentChatTranscriptService?
+    /// Injected process-local private report actor; default policy is disabled.
+    @MainActor var agentReportCaptureStore: AgentReportCaptureStore?
+#if DEBUG
+    /// Test-only content-free capture-result observation seam.
+    @MainActor var agentReportCaptureResultObserverForTesting: ((AgentReportCaptureResult) -> Void)?
+#endif
     // Sendable value type; injected at construction so socket auth never reaches a global.
     nonisolated let passwordStore: SocketControlPasswordStore
     private nonisolated let socketPasswordFileWatcher: FileWatcher?
@@ -1199,6 +1206,8 @@ class TerminalController {
             return v2Ok(id: request.id, result: v2AuthStatusPayload(timedOut: false))
         case "feedback.submit":
             return v2Result(id: request.id, v2FeedbackSubmit(params: request.params))
+        case "agent.report.capture":
+            return v2Result(id: request.id, v2AgentReportCapture(params: request.params))
         case "feed.push":
             return v2Result(id: request.id, v2FeedPush(params: request.params))
         case "feed.permission.reply":
@@ -5544,6 +5553,170 @@ class TerminalController {
         }
 
         return result
+    }
+
+    // MARK: - Private agent report capture
+
+    /// Parses and queues one private exact-report capture request.
+    ///
+    /// The socket response contains only a content-free queued/error category.
+    /// Raw report text bypasses Feed, `CmuxEventBus`, notification storage,
+    /// native notifications, analytics, crash reporting, and logs. The
+    /// default-disabled actor is consulted before topology or transcript work,
+    /// and rejected request bodies are not retained.
+    ///
+    /// - Parameter params: Minimal private socket DTO fields for exact routing,
+    ///   lifecycle identity, and the optional raw reply/transcript path.
+    /// - Returns: Content-free socket result; never echoes report text.
+    private nonisolated func v2AgentReportCapture(params: [String: Any]) -> V2CallResult {
+        guard let providerRaw = params["provider"] as? String,
+              let provider = AgentReportProvider(rawValue: providerRaw),
+              let workspaceRaw = params["workspace_id"] as? String,
+              let workspaceID = UUID(uuidString: workspaceRaw),
+              let surfaceRaw = params["surface_id"] as? String,
+              let runtimeSurfaceID = UUID(uuidString: surfaceRaw),
+              let sessionID = Self.nonEmptyAgentReportValue(params["session_id"] as? String),
+              let turnID = Self.nonEmptyAgentReportValue(params["turn_id"] as? String),
+              let completionKindRaw = params["completion_kind"] as? String,
+              let completionKind = AgentReportCompletionKind(rawValue: completionKindRaw),
+              let completionSeconds = (params["completion_timestamp"] as? NSNumber)?.doubleValue,
+              completionSeconds.isFinite else {
+            return .err(
+                code: "invalid_params",
+                message: "agent.report.capture requires exact provider, workspace, surface, session, turn, completion kind, and timestamp",
+                data: nil
+            )
+        }
+        if let transcriptPath = params["transcript_path"], !(transcriptPath is String) {
+            return .err(code: "invalid_params", message: "transcript_path must be a string", data: nil)
+        }
+        if let rawFinalReply = params["raw_final_reply"], !(rawFinalReply is String) {
+            return .err(code: "invalid_params", message: "raw_final_reply must be a string", data: nil)
+        }
+
+        let request = AgentReportCaptureRequest(
+            provider: provider,
+            workspaceID: workspaceID,
+            runtimeSurfaceID: runtimeSurfaceID,
+            agentSessionID: sessionID,
+            turnID: turnID,
+            completionKind: completionKind,
+            transcriptPath: params["transcript_path"] as? String,
+            rawFinalReply: params["raw_final_reply"] as? String,
+            completionTimestamp: Date(timeIntervalSince1970: completionSeconds)
+        )
+        let store = v2MainSync { self.agentReportCaptureStore }
+        guard let store else {
+            return .err(code: "capture_unavailable", message: "agent report capture is unavailable", data: nil)
+        }
+
+        // The socket reply is intentionally content-free and does not wait on
+        // transcript I/O. The actor checks the disabled-by-default gate before
+        // target validation or recovery and rechecks it before committing.
+        Task { [weak self] in
+            guard await store.isCaptureEnabled else { return }
+            guard let self,
+                  let target = await self.agentReportCaptureTarget(for: request) else {
+                let result = await store.capture(
+                    request,
+                    target: nil,
+                    revalidateTarget: { nil }
+                )
+#if DEBUG
+                await self?.observeAgentReportCaptureResultForTesting(result)
+#endif
+                return
+            }
+            let result = await store.capture(
+                request,
+                target: target,
+                revalidateTarget: { [weak self] in
+                    guard let self else { return nil }
+                    return await self.agentReportCaptureTarget(for: request)
+                }
+            )
+#if DEBUG
+            await self.observeAgentReportCaptureResultForTesting(result)
+#endif
+        }
+        return .ok(["status": "queued"])
+    }
+
+    /// Resolves an exact accessible terminal and its current session binding.
+    ///
+    /// This deliberately performs no focused, default, or sole-surface
+    /// fallback. It captures panel identity before the off-main hook-store read
+    /// and rechecks the same manager/workspace/panel instance afterward so a
+    /// close, replacement, or rebind fails closed.
+    ///
+    /// - Parameter request: Request whose full identity tuple must match.
+    /// - Returns: Fresh authoritative target, or `nil` on any mismatch.
+    @MainActor
+    private func agentReportCaptureTarget(
+        for request: AgentReportCaptureRequest
+    ) async -> AgentReportCaptureTarget? {
+        guard request.provider == .codex,
+              let targetManager = AppDelegate.shared?.tabManagerFor(tabId: request.workspaceID)
+                ?? (tabManager?.tabs.contains(where: { $0.id == request.workspaceID }) == true
+                    ? tabManager
+                    : nil),
+              let workspace = targetManager.tabs.first(where: { $0.id == request.workspaceID }),
+              workspace.surfaceIdFromPanelId(request.runtimeSurfaceID) != nil,
+              let terminalPanel = workspace.panels[request.runtimeSurfaceID] as? TerminalPanel,
+              let registry = agentChatTranscriptService?.registry,
+              let binding = await registry.agentReportCaptureBinding(
+                  workspaceID: request.workspaceID.uuidString,
+                  surfaceID: request.runtimeSurfaceID.uuidString,
+                  sessionID: request.agentSessionID,
+                  turnID: request.turnID,
+                  requestedTranscriptPath: request.transcriptPath
+              ),
+              let currentManager = AppDelegate.shared?.tabManagerFor(tabId: request.workspaceID)
+                ?? (targetManager.tabs.contains(where: { $0.id == request.workspaceID })
+                    ? targetManager
+                    : nil),
+              currentManager === targetManager,
+              let currentWorkspace = currentManager.tabs.first(where: { $0.id == request.workspaceID }),
+              currentWorkspace.surfaceIdFromPanelId(request.runtimeSurfaceID) != nil,
+              currentWorkspace.panels[request.runtimeSurfaceID] === terminalPanel else {
+            return nil
+        }
+        return AgentReportCaptureTarget(
+            workspaceID: request.workspaceID,
+            runtimeSurfaceID: request.runtimeSurfaceID,
+            stableSurfaceID: terminalPanel.stableSurfaceId,
+            agentSessionID: request.agentSessionID,
+            turnID: request.turnID,
+            transcriptPath: binding.transcriptPath
+        )
+    }
+
+    /// Purges completed and in-flight report state for a truly closed surface.
+    ///
+    /// - Parameter runtimeSurfaceID: Exact process-local closed surface.
+    @MainActor
+    func purgeAgentReport(runtimeSurfaceID: UUID) {
+        guard let store = agentReportCaptureStore else { return }
+        Task { await store.purge(runtimeSurfaceID: runtimeSurfaceID) }
+    }
+
+#if DEBUG
+    /// Emits a content-free result to focused socket tests only.
+    ///
+    /// - Parameter result: Capture status without request or report content.
+    @MainActor
+    private func observeAgentReportCaptureResultForTesting(_ result: AgentReportCaptureResult) {
+        agentReportCaptureResultObserverForTesting?(result)
+    }
+#endif
+
+    /// Validates required identifiers without changing their stored spelling.
+    private nonisolated static func nonEmptyAgentReportValue(_ value: String?) -> String? {
+        guard let value,
+              !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return value
     }
 
     // MARK: - V2 Feed (workstream) handlers

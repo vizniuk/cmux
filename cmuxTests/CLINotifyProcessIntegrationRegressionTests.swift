@@ -340,6 +340,393 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         )
     }
 
+    func testCodexPrimaryStopSendsExactRawReportOnlyThroughPrivateCaptureMethod() throws {
+        let context = try makeClaudeHookContext(name: "codex-exact-private-report")
+        defer { context.cleanup() }
+        startAgentHookMockServerAccepting(context: context, connectionLimit: 32)
+        let sessionID = "synthetic-exact-report-session"
+        let turnID = "synthetic-exact-report-turn"
+        let launchEnvironment = codexLaunchEnvironment(context: context, sessionId: sessionID)
+        let prompt = runCodexHook(
+            context: context,
+            subcommand: "prompt-submit",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"\#(turnID)","cwd":"\#(context.root.path)","hook_event_name":"UserPromptSubmit","prompt":"synthetic prompt"}"#,
+            extraEnvironment: launchEnvironment
+        )
+        XCTAssertFalse(prompt.timedOut, prompt.stderr)
+        XCTAssertEqual(prompt.status, 0, prompt.stderr)
+        let promptStoreURL = context.root.appendingPathComponent("codex-hook-sessions.json")
+        let promptStore = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: promptStoreURL)) as? [String: Any]
+        )
+        let activeBySurface = try XCTUnwrap(promptStore["activeSessionsBySurface"] as? [String: Any])
+        let activeBoundary = try XCTUnwrap(activeBySurface[context.surfaceId] as? [String: Any])
+        XCTAssertEqual(activeBoundary["sessionId"] as? String, sessionID)
+        XCTAssertEqual(activeBoundary["turnId"] as? String, turnID)
+
+        let privateTail = "PRIVATE-EXACT-TAIL-SENTINEL"
+        let exact = "  ## Synthetic report\n\n日本語 ✅\n" + String(repeating: "exact-markdown-", count: 1_400) + privateTail + "  \n"
+        XCTAssertGreaterThan(exact.count, 16_384)
+        let stopObject: [String: Any] = [
+            "session_id": sessionID,
+            "turn_id": turnID,
+            "cwd": context.root.path,
+            "hook_event_name": "Stop",
+            "last_assistant_message": exact,
+        ]
+        let stopInput = String(
+            decoding: try JSONSerialization.data(withJSONObject: stopObject, options: [.sortedKeys]),
+            as: UTF8.self
+        )
+
+        let stop = runCodexHook(
+            context: context,
+            subcommand: "stop",
+            standardInput: stopInput,
+            extraEnvironment: launchEnvironment
+        )
+
+        XCTAssertFalse(stop.timedOut, stop.stderr)
+        XCTAssertEqual(stop.status, 0, stop.stderr)
+        let requests = agentReportCaptureRequests(in: context)
+        let request = try XCTUnwrap(requests.last)
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(request["provider"] as? String, "codex")
+        XCTAssertEqual(request["workspace_id"] as? String, context.workspaceId)
+        XCTAssertEqual(request["surface_id"] as? String, context.surfaceId)
+        XCTAssertEqual(request["session_id"] as? String, sessionID)
+        XCTAssertEqual(request["turn_id"] as? String, turnID)
+        XCTAssertEqual(request["completion_kind"] as? String, "primaryStop")
+        XCTAssertEqual(request["raw_final_reply"] as? String, exact)
+
+        let nonPrivateTransport = context.state.snapshot().filter { line in
+            self.jsonObject(line)?["method"] as? String != "agent.report.capture"
+        }
+        XCTAssertFalse(
+            nonPrivateTransport.contains { $0.contains(privateTail) },
+            "Exact-only tail must not enter Feed, notifications, resume metadata, or status commands."
+        )
+        let hookRecord = try readAgentHookSession(
+            sessionID,
+            agent: "codex",
+            context: context
+        )
+        XCTAssertFalse(String(describing: hookRecord).contains(privateTail))
+    }
+
+    func testCodexNullRawStopQueuesTranscriptRecoveryWithoutPreviewSubstitution() throws {
+        let context = try makeClaudeHookContext(name: "codex-private-transcript-report")
+        defer { context.cleanup() }
+        startAgentHookMockServerAccepting(context: context, connectionLimit: 32)
+        let sessionID = "synthetic-transcript-report-session"
+        let turnID = "synthetic-transcript-report-turn"
+        let transcriptURL = context.root.appendingPathComponent("synthetic-rollout.jsonl")
+        try [
+            #"{"type":"session_meta","payload":{"id":"\#(sessionID)"}}"#,
+            #"{"type":"turn_context","payload":{"turn_id":"\#(turnID)"}}"#,
+            #"{"type":"event_msg","payload":{"type":"turn_complete","turn_id":"\#(turnID)"}}"#,
+        ].joined(separator: "\n").appending("\n").write(
+            to: transcriptURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        let launchEnvironment = codexLaunchEnvironment(context: context, sessionId: sessionID)
+        let prompt = runCodexHook(
+            context: context,
+            subcommand: "prompt-submit",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"\#(turnID)","cwd":"\#(context.root.path)","transcript_path":"\#(transcriptURL.path)","hook_event_name":"UserPromptSubmit"}"#,
+            extraEnvironment: launchEnvironment
+        )
+        XCTAssertFalse(prompt.timedOut, prompt.stderr)
+        XCTAssertEqual(prompt.status, 0, prompt.stderr)
+
+        let stop = runCodexHook(
+            context: context,
+            subcommand: "stop",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"\#(turnID)","cwd":"\#(context.root.path)","transcript_path":"\#(transcriptURL.path)","hook_event_name":"Stop","last_assistant_message":null}"#,
+            extraEnvironment: launchEnvironment
+        )
+
+        XCTAssertFalse(stop.timedOut, stop.stderr)
+        XCTAssertEqual(stop.status, 0, stop.stderr)
+        let request = try XCTUnwrap(agentReportCaptureRequests(in: context).last)
+        XCTAssertEqual(request["transcript_path"] as? String, transcriptURL.path)
+        XCTAssertNil(request["raw_final_reply"])
+    }
+
+    func testCodexStopDoesNotCaptureThroughSoleSurfaceFallback() throws {
+        let context = try makeClaudeHookContext(name: "codex-private-no-fallback")
+        defer { context.cleanup() }
+        startAgentHookMockServerAccepting(context: context, connectionLimit: 16)
+
+        let stop = runCodexHook(
+            context: context,
+            subcommand: "stop",
+            standardInput: #"{"session_id":"unbound-session","turn_id":"unbound-turn","cwd":"\#(context.root.path)","hook_event_name":"Stop","last_assistant_message":"must not capture"}"#,
+            extraEnvironment: ["CMUX_SURFACE_ID": ""]
+        )
+
+        XCTAssertFalse(stop.timedOut, stop.stderr)
+        XCTAssertEqual(stop.status, 0, stop.stderr)
+        XCTAssertTrue(
+            context.state.commands.contains { self.jsonObject($0)?["method"] as? String == "feed.push" },
+            "Existing generic telemetry may keep its fallback route."
+        )
+        XCTAssertTrue(
+            agentReportCaptureRequests(in: context).isEmpty,
+            "Private report capture must not use focused/default/sole-surface fallback."
+        )
+    }
+
+    func testCodexPromptFallbackCannotLaunderStoredSurfaceIntoStopCapture() throws {
+        let context = try makeClaudeHookContext(name: "codex-private-no-persisted-fallback")
+        defer { context.cleanup() }
+        startAgentHookMockServerAccepting(context: context, connectionLimit: 32)
+        let sessionID = "synthetic-fallback-persistence-session"
+        let turnID = "synthetic-fallback-persistence-turn"
+        let environment = codexLaunchEnvironment(context: context, sessionId: sessionID).merging([
+            "CMUX_SURFACE_ID": "",
+        ], uniquingKeysWith: { _, new in new })
+
+        let prompt = runCodexHook(
+            context: context,
+            subcommand: "prompt-submit",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"\#(turnID)","cwd":"\#(context.root.path)","hook_event_name":"UserPromptSubmit"}"#,
+            extraEnvironment: environment
+        )
+        XCTAssertFalse(prompt.timedOut, prompt.stderr)
+        XCTAssertEqual(prompt.status, 0, prompt.stderr)
+        let fallbackStoreURL = context.root.appendingPathComponent("codex-hook-sessions.json")
+        let fallbackStore = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: fallbackStoreURL)) as? [String: Any]
+        )
+        let activeBySurface = fallbackStore["activeSessionsBySurface"] as? [String: Any]
+        XCTAssertNil(activeBySurface?[context.surfaceId])
+
+        let beforeStop = agentReportCaptureRequests(in: context).count
+        let stop = runCodexHook(
+            context: context,
+            subcommand: "stop",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"\#(turnID)","cwd":"\#(context.root.path)","hook_event_name":"Stop","last_assistant_message":"must not capture"}"#,
+            extraEnvironment: environment
+        )
+
+        XCTAssertFalse(stop.timedOut, stop.stderr)
+        XCTAssertEqual(stop.status, 0, stop.stderr)
+        XCTAssertEqual(agentReportCaptureRequests(in: context).count, beforeStop)
+    }
+
+    func testCodexSubagentStopTelemetryNeverEntersPrivateCapture() throws {
+        let context = try makeClaudeHookContext(name: "codex-private-subagent-stop")
+        defer { context.cleanup() }
+        startAgentHookMockServerAccepting(context: context, connectionLimit: 16)
+
+        let result = runCodexHook(
+            context: context,
+            subcommand: "subagent-stop",
+            standardInput: #"{"session_id":"parent-session","turn_id":"child-turn","cwd":"\#(context.root.path)","hook_event_name":"SubagentStop","last_assistant_message":"child result"}"#
+        )
+
+        XCTAssertFalse(result.timedOut, result.stderr)
+        XCTAssertEqual(result.status, 0, result.stderr)
+        XCTAssertTrue(agentReportCaptureRequests(in: context).isEmpty)
+    }
+
+    func testPrivateCaptureRejectsNestedStopWhenNotificationSuppressionIsDisabled() throws {
+        let context = try makeClaudeHookContext(name: "codex-private-nested-pref-off")
+        defer { context.cleanup() }
+        startAgentHookMockServerAccepting(context: context, connectionLimit: 32)
+        let sessionID = "synthetic-nested-pref-off-session"
+        let environment = codexLaunchEnvironment(context: context, sessionId: sessionID).merging([
+            "CMUX_SUPPRESS_SUBAGENT_NOTIFICATIONS": "0",
+        ], uniquingKeysWith: { _, new in new })
+
+        _ = runCodexHook(
+            context: context,
+            subcommand: "prompt-submit",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"parent-turn","cwd":"\#(context.root.path)","hook_event_name":"UserPromptSubmit"}"#,
+            extraEnvironment: environment
+        )
+        _ = runCodexHook(
+            context: context,
+            subcommand: "prompt-submit",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"child-turn","cwd":"\#(context.root.path)","hook_event_name":"UserPromptSubmit"}"#,
+            extraEnvironment: environment
+        )
+        let beforeStop = agentReportCaptureRequests(in: context).count
+        let stop = runCodexHook(
+            context: context,
+            subcommand: "stop",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"child-turn","cwd":"\#(context.root.path)","hook_event_name":"Stop","last_assistant_message":"child result"}"#,
+            extraEnvironment: environment
+        )
+
+        XCTAssertFalse(stop.timedOut, stop.stderr)
+        XCTAssertEqual(stop.status, 0, stop.stderr)
+        XCTAssertEqual(
+            agentReportCaptureRequests(in: context).count,
+            beforeStop,
+            "Private isolation must not inherit the user-visible notification suppression preference."
+        )
+    }
+
+    func testPrivateCaptureRejectsManagedSubagentWhenNotificationSuppressionIsDisabled() throws {
+        let context = try makeClaudeHookContext(name: "codex-private-managed-pref-off")
+        defer { context.cleanup() }
+        startAgentHookMockServerAccepting(context: context, connectionLimit: 16)
+        let sessionID = "synthetic-managed-pref-off-session"
+        let environment = codexLaunchEnvironment(context: context, sessionId: sessionID).merging([
+            "CMUX_SUPPRESS_SUBAGENT_NOTIFICATIONS": "0",
+            "CMUX_AGENT_MANAGED_SUBAGENT": "1",
+        ], uniquingKeysWith: { _, new in new })
+
+        let stop = runCodexHook(
+            context: context,
+            subcommand: "stop",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"child-turn","cwd":"\#(context.root.path)","hook_event_name":"Stop","last_assistant_message":"child result"}"#,
+            extraEnvironment: environment
+        )
+
+        XCTAssertFalse(stop.timedOut, stop.stderr)
+        XCTAssertEqual(stop.status, 0, stop.stderr)
+        XCTAssertTrue(agentReportCaptureRequests(in: context).isEmpty)
+    }
+
+    func testPrivateCaptureFailsClosedWhenNestedStopLifecycleWriteFails() throws {
+        let context = try makeClaudeHookContext(name: "codex-private-stop-write-failure")
+        defer { context.cleanup() }
+        startAgentHookMockServerAccepting(context: context, connectionLimit: 32)
+        let sessionID = "synthetic-stop-write-failure-session"
+        let environment = codexLaunchEnvironment(context: context, sessionId: sessionID)
+
+        let parentPrompt = runCodexHook(
+            context: context,
+            subcommand: "prompt-submit",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"parent-turn","cwd":"\#(context.root.path)","hook_event_name":"UserPromptSubmit"}"#,
+            extraEnvironment: environment
+        )
+        XCTAssertEqual(parentPrompt.status, 0, parentPrompt.stderr)
+        let childPrompt = runCodexHook(
+            context: context,
+            subcommand: "prompt-submit",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"child-turn","cwd":"\#(context.root.path)","hook_event_name":"UserPromptSubmit"}"#,
+            extraEnvironment: environment
+        )
+        XCTAssertEqual(childPrompt.status, 0, childPrompt.stderr)
+
+        let lockURL = context.root.appendingPathComponent("codex-hook-sessions.json.lock")
+        try? FileManager.default.removeItem(at: lockURL)
+        try FileManager.default.createDirectory(at: lockURL, withIntermediateDirectories: false)
+        let beforeStop = agentReportCaptureRequests(in: context).count
+        let stop = runCodexHook(
+            context: context,
+            subcommand: "stop",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"child-turn","cwd":"\#(context.root.path)","hook_event_name":"Stop","last_assistant_message":"child result"}"#,
+            extraEnvironment: environment
+        )
+
+        XCTAssertFalse(stop.timedOut, stop.stderr)
+        XCTAssertEqual(stop.status, 0, stop.stderr)
+        XCTAssertEqual(
+            agentReportCaptureRequests(in: context).count,
+            beforeStop,
+            "A failed lifecycle mutation must never be treated as primary capture proof."
+        )
+    }
+
+    func testPrivateCaptureFailsClosedWhenPromptLifecycleWriteFails() throws {
+        let context = try makeClaudeHookContext(name: "codex-private-prompt-write-failure")
+        defer { context.cleanup() }
+        startAgentHookMockServerAccepting(context: context, connectionLimit: 32)
+        let sessionID = "synthetic-prompt-write-failure-session"
+        let turnID = "synthetic-prompt-write-failure-turn"
+        let environment = codexLaunchEnvironment(context: context, sessionId: sessionID)
+        let lockURL = context.root.appendingPathComponent("codex-hook-sessions.json.lock")
+        try FileManager.default.createDirectory(at: lockURL, withIntermediateDirectories: false)
+
+        let prompt = runCodexHook(
+            context: context,
+            subcommand: "prompt-submit",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"\#(turnID)","cwd":"\#(context.root.path)","hook_event_name":"UserPromptSubmit"}"#,
+            extraEnvironment: environment
+        )
+        XCTAssertFalse(prompt.timedOut, prompt.stderr)
+        XCTAssertEqual(prompt.status, 0, prompt.stderr)
+
+        try FileManager.default.removeItem(at: lockURL)
+        let beforeStop = agentReportCaptureRequests(in: context).count
+        let stop = runCodexHook(
+            context: context,
+            subcommand: "stop",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"\#(turnID)","cwd":"\#(context.root.path)","hook_event_name":"Stop","last_assistant_message":"must not capture"}"#,
+            extraEnvironment: environment
+        )
+
+        XCTAssertFalse(stop.timedOut, stop.stderr)
+        XCTAssertEqual(stop.status, 0, stop.stderr)
+        XCTAssertEqual(agentReportCaptureRequests(in: context).count, beforeStop)
+    }
+
+    func testManagedChildPromptCannotReplaceParentPrivateCaptureBoundary() throws {
+        let context = try makeClaudeHookContext(name: "codex-private-managed-prompt-boundary")
+        defer { context.cleanup() }
+        startAgentHookMockServerAccepting(context: context, connectionLimit: 48)
+        let parentSessionID = "synthetic-primary-boundary-session"
+        let childSessionID = "synthetic-managed-child-boundary-session"
+        let parentTurnID = "parent-turn"
+        let childTurnID = "child-turn"
+        let parentEnvironment = codexLaunchEnvironment(context: context, sessionId: parentSessionID)
+        let childEnvironment = codexLaunchEnvironment(context: context, sessionId: childSessionID).merging([
+            "CMUX_AGENT_MANAGED_SUBAGENT": "1",
+            "CMUX_SUPPRESS_SUBAGENT_NOTIFICATIONS": "0",
+        ], uniquingKeysWith: { _, new in new })
+
+        let parentPrompt = runCodexHook(
+            context: context,
+            subcommand: "prompt-submit",
+            standardInput: #"{"session_id":"\#(parentSessionID)","turn_id":"\#(parentTurnID)","cwd":"\#(context.root.path)","hook_event_name":"UserPromptSubmit"}"#,
+            extraEnvironment: parentEnvironment
+        )
+        XCTAssertEqual(parentPrompt.status, 0, parentPrompt.stderr)
+        let childPrompt = runCodexHook(
+            context: context,
+            subcommand: "prompt-submit",
+            standardInput: #"{"session_id":"\#(childSessionID)","turn_id":"\#(childTurnID)","cwd":"\#(context.root.path)","hook_event_name":"UserPromptSubmit"}"#,
+            extraEnvironment: childEnvironment
+        )
+        XCTAssertEqual(childPrompt.status, 0, childPrompt.stderr)
+
+        let stateURL = context.root.appendingPathComponent("codex-hook-sessions.json")
+        let state = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: stateURL)) as? [String: Any]
+        )
+        let activeBySurface = try XCTUnwrap(state["activeSessionsBySurface"] as? [String: Any])
+        let activeBoundary = try XCTUnwrap(activeBySurface[context.surfaceId] as? [String: Any])
+        XCTAssertEqual(activeBoundary["sessionId"] as? String, parentSessionID)
+        XCTAssertEqual(activeBoundary["turnId"] as? String, parentTurnID)
+
+        let childStop = runCodexHook(
+            context: context,
+            subcommand: "stop",
+            standardInput: #"{"session_id":"\#(childSessionID)","turn_id":"\#(childTurnID)","cwd":"\#(context.root.path)","hook_event_name":"Stop","last_assistant_message":"child result"}"#,
+            extraEnvironment: childEnvironment
+        )
+        XCTAssertEqual(childStop.status, 0, childStop.stderr)
+        XCTAssertTrue(agentReportCaptureRequests(in: context).isEmpty)
+
+        let parentStop = runCodexHook(
+            context: context,
+            subcommand: "stop",
+            standardInput: #"{"session_id":"\#(parentSessionID)","turn_id":"\#(parentTurnID)","cwd":"\#(context.root.path)","hook_event_name":"Stop","last_assistant_message":"parent result"}"#,
+            extraEnvironment: parentEnvironment
+        )
+        XCTAssertEqual(parentStop.status, 0, parentStop.stderr)
+        let requests = agentReportCaptureRequests(in: context)
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?["session_id"] as? String, parentSessionID)
+        XCTAssertEqual(requests.first?["turn_id"] as? String, parentTurnID)
+    }
+
     func testCodexPromptSubmitDoesNotRefreshTerminalLastTurnDiffBaseline() throws {
         let context = try makeClaudeHookContext(name: "codex-prompt-baseline")
         defer { context.cleanup() }
@@ -746,6 +1133,8 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
             )
         case "feed.push":
             return v2Response(id: id, ok: true, result: [:])
+        case "agent.report.capture":
+            return v2Response(id: id, ok: true, result: ["status": "queued"])
         case "surface.resume.set":
             return v2Response(id: id, ok: true, result: ["resume_binding": [:]])
         case "surface.resume.clear":
@@ -1756,6 +2145,10 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
             childStopCommands.contains { $0.hasPrefix("notify_target") || $0.hasPrefix("set_status codex ") },
             "Nested Codex Stop should not notify or mark the parent idle, saw \(childStopCommands)"
         )
+        XCTAssertFalse(
+            childStopCommands.contains { self.jsonObject($0)?["method"] as? String == "agent.report.capture" },
+            "Nested Codex Stop must not enter private report capture, saw \(childStopCommands)"
+        )
 
         let parentStopStart = context.state.commands.count
         let parentStop = runCodexHook(
@@ -1778,6 +2171,11 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         XCTAssertTrue(
             parentStopCommands.contains { $0.hasPrefix("set_status codex ") && $0.contains(" Idle ") },
             "Parent Codex Stop should mark Codex idle, saw \(parentStopCommands)"
+        )
+        XCTAssertEqual(
+            parentStopCommands.filter { self.jsonObject($0)?["method"] as? String == "agent.report.capture" }.count,
+            1,
+            "Accepted primary Stop must use exactly one private capture request."
         )
     }
 
@@ -3021,6 +3419,10 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
             staleStopCommands.contains { $0.hasPrefix("notify_target") || $0.hasPrefix("set_status codex ") },
             "A stale Stop from an older turn must not notify or mark the newer active turn idle, saw \(staleStopCommands)"
         )
+        XCTAssertFalse(
+            staleStopCommands.contains { self.jsonObject($0)?["method"] as? String == "agent.report.capture" },
+            "A stale older Stop must not enter private report capture."
+        )
 
         let currentStopStart = context.state.commands.count
         let currentStop = runCodexHook(
@@ -3100,6 +3502,10 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         XCTAssertFalse(
             lateStopCommands.contains { $0.hasPrefix("notify_target") || $0.hasPrefix("set_status codex ") },
             "A late stale Stop from an older turn must not duplicate the newer turn completion, saw \(lateStopCommands)"
+        )
+        XCTAssertFalse(
+            lateStopCommands.contains { self.jsonObject($0)?["method"] as? String == "agent.report.capture" },
+            "A late older Stop must not replace the captured newer turn."
         )
     }
 
@@ -3289,6 +3695,10 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         XCTAssertFalse(
             context.state.commands.contains { $0.hasPrefix("notify_target") || $0.hasPrefix("set_status codex ") },
             "Managed subagent Stop should not notify or clobber visible status, saw \(context.state.commands)"
+        )
+        XCTAssertFalse(
+            context.state.commands.contains { self.jsonObject($0)?["method"] as? String == "agent.report.capture" },
+            "Managed subagent Stop must not enter private report capture."
         )
     }
 
@@ -8775,6 +9185,8 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
             return surfaceListResponse(id: id, surfaceId: context.surfaceId)
         case "feed.push":
             return v2Response(id: id, ok: true, result: [:])
+        case "agent.report.capture":
+            return v2Response(id: id, ok: true, result: ["status": "queued"])
         case "surface.resume.set":
             return v2Response(id: id, ok: true, result: ["resume_binding": [:]])
         case "surface.resume.clear":
@@ -8855,6 +9267,27 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         let state = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: stateURL)) as? [String: Any])
         let sessions = try XCTUnwrap(state["sessions"] as? [String: Any])
         return try XCTUnwrap(sessions[sessionId] as? [String: Any])
+    }
+
+    private func readAgentHookSession(
+        _ sessionID: String,
+        agent: String,
+        context: ClaudeHookContext
+    ) throws -> [String: Any] {
+        let stateURL = context.root.appendingPathComponent("\(agent)-hook-sessions.json")
+        let state = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: stateURL)) as? [String: Any])
+        let sessions = try XCTUnwrap(state["sessions"] as? [String: Any])
+        return try XCTUnwrap(sessions[sessionID] as? [String: Any])
+    }
+
+    private func agentReportCaptureRequests(in context: ClaudeHookContext) -> [[String: Any]] {
+        context.state.snapshot().compactMap { line in
+            guard let payload = jsonObject(line),
+                  payload["method"] as? String == "agent.report.capture" else {
+                return nil
+            }
+            return payload["params"] as? [String: Any]
+        }
     }
 
     private func feedPushEvents(in context: ClaudeHookContext) -> [[String: Any]] {

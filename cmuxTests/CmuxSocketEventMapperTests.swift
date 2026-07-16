@@ -9,6 +9,18 @@ import Testing
 @Suite(.serialized)
 struct CmuxSocketEventMapperTests {
     @Test
+    func privateAgentReportCaptureDoesNotPublishSocketDomainEvent() {
+        CmuxEventBus.shared.resetForTesting()
+        defer { CmuxEventBus.shared.resetForTesting() }
+        let command = #"{"id":1,"method":"agent.report.capture","params":{"raw_final_reply":"PRIVATE-EVENT-BUS-SENTINEL"}}"#
+        let response = #"{"id":1,"ok":true,"result":{"status":"queued"}}"#
+
+        CmuxSocketEventMapper.publish(command: command, response: response)
+
+        #expect(CmuxEventBus.shared.retainedSnapshot().isEmpty)
+    }
+
+    @Test
     func paneResizeEventDistinguishesAppliedFromRemoteRequested() {
         CmuxEventBus.shared.resetForTesting()
         defer { CmuxEventBus.shared.resetForTesting() }

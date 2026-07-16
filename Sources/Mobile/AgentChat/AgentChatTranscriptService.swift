@@ -24,6 +24,9 @@ final class AgentChatTranscriptService {
     /// failures don't rescan the filesystem during tool storms.
     private var failedResolutions: Set<String> = []
     private var endedListability = AgentChatEndedTranscriptListabilityCache()
+    /// Slice-A lifecycle seam. The injected closure invalidates only private,
+    /// in-memory report state; it never receives report content.
+    private var invalidateAgentReportSurface: @MainActor (UUID) -> Void = { _ in }
 
     /// Creates the service with a hook-store-backed registry.
     ///
@@ -164,6 +167,7 @@ final class AgentChatTranscriptService {
         switch event.hookEventName {
         case .sessionStart, .userPromptSubmit:
             failedResolutions.remove(record.sessionID)
+            invalidateAgentReport(record.surfaceID)
         default:
             break
         }
@@ -272,6 +276,7 @@ final class AgentChatTranscriptService {
         workspaceID: String?,
         workingDirectory: String?
     ) {
+        invalidateAgentReport(registry.record(sessionID: sessionID)?.surfaceID)
         registry.noteResumeInitiated(
             sessionID: sessionID,
             source: source,
@@ -279,6 +284,18 @@ final class AgentChatTranscriptService {
             workspaceID: workspaceID,
             workingDirectory: workingDirectory
         )
+        invalidateAgentReport(surfaceID)
+    }
+
+    /// Installs the private report lifecycle invalidator during app
+    /// composition. The callback carries only an opaque runtime surface ID.
+    ///
+    /// - Parameter invalidator: Main-actor callback that invalidates in-flight
+    ///   capture for a surface without receiving report or transcript content.
+    func setAgentReportSurfaceInvalidator(
+        _ invalidator: @escaping @MainActor (UUID) -> Void
+    ) {
+        invalidateAgentReportSurface = invalidator
     }
 
     /// Re-stamps a session's stored workspace id to the workspace its surface
@@ -439,7 +456,16 @@ final class AgentChatTranscriptService {
         return completedAt
     }
 
+    /// Reconciles transcript/UI lifecycle and invalidates private capture when
+    /// a session moves between surfaces.
+    ///
+    /// Both the former and new surface generations change so a suspended
+    /// transcript read cannot commit after a resume or rebind.
     private func handleRecordChange(_ record: AgentChatSessionRecord, previous: AgentChatSessionRecord?) {
+        if previous?.surfaceID != record.surfaceID {
+            invalidateAgentReport(previous?.surfaceID)
+            invalidateAgentReport(record.surfaceID)
+        }
         let endedRecordIsListable: Bool
         if record.state == .ended {
             endedRecordIsListable = record.agentKind == .codex
@@ -481,7 +507,9 @@ final class AgentChatTranscriptService {
         }
     }
 
+    /// Tears down one removed session and invalidates its former capture surface.
     private func handleRecordRemoval(_ record: AgentChatSessionRecord) {
+        invalidateAgentReport(record.surfaceID)
         proseStreamer.turnEnded(sessionID: record.sessionID)
         if let tailer = tailers.removeValue(forKey: record.sessionID) {
             Task { await tailer.stop() }
@@ -490,6 +518,12 @@ final class AgentChatTranscriptService {
         endedListability.remove(sessionID: record.sessionID)
         guard hasEventSubscribers() else { return }
         emit(frame: ChatSessionEventFrame(sessionID: record.sessionID, event: .sessionRemoved(version: record.version)))
+    }
+
+    /// Converts content-free registry identity into the store lifecycle seam.
+    private func invalidateAgentReport(_ surfaceID: String?) {
+        guard let surfaceID, let runtimeSurfaceID = UUID(uuidString: surfaceID) else { return }
+        invalidateAgentReportSurface(runtimeSurfaceID)
     }
 
     private func emit(frame: ChatSessionEventFrame) {

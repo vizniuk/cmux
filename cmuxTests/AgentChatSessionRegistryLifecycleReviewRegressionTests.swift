@@ -11,6 +11,80 @@ import Testing
 
 struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
     @MainActor
+    @Test func promptAndResumeLifecycleInvalidateOnlyBoundReportSurfaces() {
+        let registry = AgentChatSessionRegistry()
+        let service = AgentChatTranscriptService(registry: registry)
+        let workspaceID = UUID().uuidString
+        let originalSurfaceID = UUID()
+        let resumedSurfaceID = UUID()
+        let sessionID = "synthetic-report-lifecycle-session"
+        var invalidated: [UUID] = []
+        service.setAgentReportSurfaceInvalidator { invalidated.append($0) }
+
+        service.noteHookEvent(WorkstreamEvent(
+            sessionId: sessionID,
+            hookEventName: .userPromptSubmit,
+            source: "codex",
+            workspaceId: workspaceID,
+            surfaceId: originalSurfaceID.uuidString
+        ))
+        service.noteResumeInitiated(
+            sessionID: sessionID,
+            source: "codex",
+            surfaceID: resumedSurfaceID.uuidString,
+            workspaceID: workspaceID,
+            workingDirectory: nil
+        )
+
+        #expect(invalidated.contains(originalSurfaceID))
+        #expect(invalidated.contains(resumedSurfaceID))
+    }
+
+    @Test func exactCodexRecoveryReadsOffMainAndIgnoresIncompleteTrailingFragment() async throws {
+        let home = try temporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let sessionID = "synthetic-recovery-session"
+        let turnID = "synthetic-recovery-turn"
+        let exact = "  # Exact\n\n日本語 and Markdown  \n"
+        let transcriptURL = home.appendingPathComponent("synthetic-rollout.jsonl")
+        let lines: [[String: Any]] = [
+            ["type": "session_meta", "payload": ["id": sessionID]],
+            ["type": "turn_context", "payload": ["turn_id": turnID]],
+            ["type": "response_item", "payload": [
+                "type": "reasoning",
+                "summary": [["type": "summary_text", "text": "excluded reasoning"]],
+            ]],
+            ["type": "response_item", "payload": [
+                "type": "message",
+                "role": "assistant",
+                "content": [["type": "output_text", "text": exact]],
+                "internal_chat_message_metadata_passthrough": ["turn_id": turnID],
+            ]],
+            ["type": "event_msg", "payload": ["type": "turn_complete", "turn_id": turnID]],
+        ]
+        let complete = try lines.map { object in
+            String(
+                decoding: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+                as: UTF8.self
+            )
+        }.joined(separator: "\n") + "\n"
+        try (complete + #"{"type":"response_item","payload":{"type":"message""#).write(
+            to: transcriptURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        let resolver = AgentChatTranscriptResolver(homeDirectory: home, environment: [:])
+
+        let recovered = await resolver.recoverCodexFinalReply(
+            recordedPath: transcriptURL.path,
+            sessionID: sessionID,
+            turnID: turnID
+        )
+
+        #expect(recovered == exact)
+    }
+
+    @MainActor
     @Test func relaunchOnlyPlaceholderCannotBecomeResumeSessionIdentity() {
         #expect(!AgentChatTranscriptService.isValidResumeSessionID(""))
         #expect(!AgentChatTranscriptService.isValidResumeSessionID("  \n"))

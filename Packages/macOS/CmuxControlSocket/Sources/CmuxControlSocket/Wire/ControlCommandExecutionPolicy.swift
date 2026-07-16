@@ -83,6 +83,9 @@ public enum ControlCommandExecutionPolicy: Sendable, Equatable {
         "auth.begin_sign_in",
         "auth.sign_out",
         "feedback.submit",
+        // Private exact-report capture parses on the socket worker and only
+        // hops to the main actor for an immutable live-topology snapshot.
+        "agent.report.capture",
         "feed.push",
         "feed.permission.reply",
         "feed.question.reply",
