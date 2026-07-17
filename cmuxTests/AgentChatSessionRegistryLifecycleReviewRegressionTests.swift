@@ -1,5 +1,6 @@
 import CMUXAgentLaunch
 import CmuxAgentChat
+import Darwin
 import Foundation
 import Testing
 
@@ -46,7 +47,13 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
         let sessionID = "synthetic-recovery-session"
         let turnID = "synthetic-recovery-turn"
         let exact = "  # Exact\n\n日本語 and Markdown  \n"
-        let transcriptURL = home.appendingPathComponent("synthetic-rollout.jsonl")
+        let transcriptURL = home
+            .appendingPathComponent(".codex/sessions/2026/07/17", isDirectory: true)
+            .appendingPathComponent("synthetic-rollout.jsonl")
+        try FileManager.default.createDirectory(
+            at: transcriptURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
         let lines: [[String: Any]] = [
             ["type": "session_meta", "payload": ["id": sessionID]],
             ["type": "turn_context", "payload": ["turn_id": turnID]],
@@ -57,6 +64,7 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
             ["type": "response_item", "payload": [
                 "type": "message",
                 "role": "assistant",
+                "phase": "final_answer",
                 "content": [["type": "output_text", "text": exact]],
                 "internal_chat_message_metadata_passthrough": ["turn_id": turnID],
             ]],
@@ -82,6 +90,84 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
         )
 
         #expect(recovered == exact)
+    }
+
+    @Test func codexReportPathValidationRejectsUntrustedAndNonRegularTargets() async throws {
+        let home = try temporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let sessionsRoot = home.appendingPathComponent(".codex/sessions", isDirectory: true)
+        let nestedDirectory = sessionsRoot.appendingPathComponent("2026/07/17", isDirectory: true)
+        let outsideDirectory = home.appendingPathComponent("outside", isDirectory: true)
+        let siblingDirectory = home.appendingPathComponent(".codex/sessions-escape", isDirectory: true)
+        try FileManager.default.createDirectory(at: nestedDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outsideDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: siblingDirectory, withIntermediateDirectories: true)
+
+        let valid = nestedDirectory.appendingPathComponent("rollout-valid.jsonl")
+        let outside = outsideDirectory.appendingPathComponent("rollout-outside.jsonl")
+        let sibling = siblingDirectory.appendingPathComponent("rollout-sibling.jsonl")
+        let wrongExtension = nestedDirectory.appendingPathComponent("rollout-wrong.txt")
+        for url in [valid, outside, sibling, wrongExtension] {
+            try "{}\n".write(to: url, atomically: true, encoding: .utf8)
+        }
+
+        let insideSymlink = nestedDirectory.appendingPathComponent("rollout-inside-link.jsonl")
+        let escapeSymlink = nestedDirectory.appendingPathComponent("rollout-escape-link.jsonl")
+        try FileManager.default.createSymbolicLink(at: insideSymlink, withDestinationURL: valid)
+        try FileManager.default.createSymbolicLink(at: escapeSymlink, withDestinationURL: outside)
+
+        let directoryTarget = nestedDirectory.appendingPathComponent("rollout-directory.jsonl", isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryTarget, withIntermediateDirectories: true)
+        let fifoTarget = nestedDirectory.appendingPathComponent("rollout-fifo.jsonl")
+        #expect(Darwin.mkfifo(fifoTarget.path, S_IRUSR | S_IWUSR) == 0)
+
+        let resolver = AgentChatTranscriptResolver(homeDirectory: home, environment: [:])
+        let noFallbackSession = "session-with-no-filename-match"
+        #expect(
+            resolver.codexTranscriptPath(recordedPath: valid.path, sessionID: noFallbackSession)
+                == valid.resolvingSymlinksInPath().path
+        )
+        #expect(
+            resolver.codexTranscriptPath(recordedPath: insideSymlink.path, sessionID: noFallbackSession)
+                == valid.resolvingSymlinksInPath().path
+        )
+        #expect(resolver.codexTranscriptPath(recordedPath: outside.path, sessionID: noFallbackSession) == nil)
+        #expect(resolver.codexTranscriptPath(recordedPath: sibling.path, sessionID: noFallbackSession) == nil)
+        #expect(resolver.codexTranscriptPath(recordedPath: escapeSymlink.path, sessionID: noFallbackSession) == nil)
+        #expect(resolver.codexTranscriptPath(recordedPath: directoryTarget.path, sessionID: noFallbackSession) == nil)
+        #expect(resolver.codexTranscriptPath(recordedPath: fifoTarget.path, sessionID: noFallbackSession) == nil)
+        #expect(resolver.codexTranscriptPath(recordedPath: wrongExtension.path, sessionID: noFallbackSession) == nil)
+        #expect(
+            resolver.codexTranscriptPath(
+                recordedPath: sessionsRoot.path + "/../../outside/rollout-outside.jsonl",
+                sessionID: noFallbackSession
+            ) == nil
+        )
+        #expect(
+            resolver.codexTranscriptPath(
+                recordedPath: nestedDirectory.appendingPathComponent("missing.jsonl").path,
+                sessionID: noFallbackSession
+            ) == nil
+        )
+
+        let wrongMetadata = nestedDirectory.appendingPathComponent("rollout-wrong-metadata.jsonl")
+        try [
+            #"{"type":"session_meta","payload":{"id":"different-session"}}"#,
+            #"{"type":"turn_context","payload":{"turn_id":"expected-turn"}}"#,
+            #"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"wrong session"}],"internal_chat_message_metadata_passthrough":{"turn_id":"expected-turn"}}}"#,
+            #"{"type":"event_msg","payload":{"type":"turn_complete","turn_id":"expected-turn"}}"#,
+        ].joined(separator: "\n").appending("\n").write(
+            to: wrongMetadata,
+            atomically: true,
+            encoding: .utf8
+        )
+        #expect(
+            await resolver.recoverCodexFinalReply(
+                recordedPath: wrongMetadata.path,
+                sessionID: "expected-session",
+                turnID: "expected-turn"
+            ) == nil
+        )
     }
 
     @MainActor

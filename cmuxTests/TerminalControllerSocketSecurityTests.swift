@@ -832,6 +832,126 @@ final class TerminalControllerSocketSecurityTests {
         #expect(report.captureSource == .rawHook)
     }
 
+    @Test func queuedLifecycleCleanupCannotCommitAfterPromptOrResumeTransition() async throws {
+        for lifecycle in ["prompt", "resume"] {
+            let socketPath = makeSocketPath("report-\(lifecycle)")
+            let home = FileManager.default.temporaryDirectory
+                .appendingPathComponent("cmux-report-lifecycle-\(lifecycle)-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+
+            let tabManager = TabManager()
+            let workspace = tabManager.addWorkspace(select: true)
+            let panel = try #require(workspace.focusedTerminalPanel)
+            let sessionID = "synthetic-\(lifecycle)-lifecycle-session"
+            let turnID = "synthetic-\(lifecycle)-lifecycle-turn"
+            let transcriptURL = home
+                .appendingPathComponent(".codex/sessions/2026/07/17", isDirectory: true)
+                .appendingPathComponent("rollout-\(sessionID).jsonl")
+            try FileManager.default.createDirectory(
+                at: transcriptURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try "{}\n".write(to: transcriptURL, atomically: true, encoding: .utf8)
+            let storeDirectory = home.appendingPathComponent(".cmuxterm", isDirectory: true)
+            try FileManager.default.createDirectory(at: storeDirectory, withIntermediateDirectories: true)
+            let hookStorePayload: [String: Any] = [
+                "sessions": [
+                    sessionID: [
+                        "workspaceId": workspace.id.uuidString,
+                        "surfaceId": panel.id.uuidString,
+                        "transcriptPath": transcriptURL.path,
+                        "lastPromptTurnId": turnID,
+                        "updatedAt": 100.0,
+                    ],
+                ],
+                "activeSessionsBySurface": [
+                    panel.id.uuidString: [
+                        "sessionId": sessionID,
+                        "turnId": turnID,
+                        "updatedAt": 100.0,
+                    ],
+                ],
+            ]
+            try JSONSerialization.data(withJSONObject: hookStorePayload, options: [.sortedKeys])
+                .write(to: storeDirectory.appendingPathComponent("codex-hook-sessions.json"))
+
+            let recovery = SuspendedEndpointAgentReportRecovery(reply: "late private report")
+            let invalidationGate = QueuedAgentReportInvalidationGate()
+            let registry = AgentChatSessionRegistry(
+                hookStore: AgentChatHookSessionStore(homeDirectory: home)
+            )
+            let service = AgentChatTranscriptService(
+                registry: registry,
+                resolver: AgentChatTranscriptResolver(homeDirectory: home, environment: [:])
+            )
+            let store = AgentReportCaptureStore(policy: .enabled, transcriptRecovery: recovery)
+            service.setAgentReportSurfaceInvalidator { surfaceID in
+                Task {
+                    await invalidationGate.enqueue(surfaceID: surfaceID, store: store)
+                }
+            }
+
+            let controller = TerminalController.shared
+            controller.agentChatTranscriptService = service
+            controller.agentReportCaptureStore = store
+            controller.start(tabManager: tabManager, socketPath: socketPath, accessMode: .allowAll)
+            try waitForSocket(at: socketPath)
+            let results = AsyncStream<AgentReportCaptureResult> { continuation in
+                controller.agentReportCaptureResultObserverForTesting = { continuation.yield($0) }
+            }
+            var resultIterator = results.makeAsyncIterator()
+            let envelope = try await sendV2RequestAsync(
+                method: "agent.report.capture",
+                params: [
+                    "provider": "codex",
+                    "workspace_id": workspace.id.uuidString,
+                    "surface_id": panel.id.uuidString,
+                    "session_id": sessionID,
+                    "turn_id": turnID,
+                    "completion_kind": "primaryStop",
+                    "completion_timestamp": 100.0,
+                    "transcript_path": transcriptURL.path,
+                ],
+                to: socketPath
+            )
+            #expect(envelope["ok"] as? Bool == true)
+            await recovery.waitUntilRecoveryStarted()
+
+            if lifecycle == "prompt" {
+                service.noteHookEvent(WorkstreamEvent(
+                    sessionId: sessionID,
+                    hookEventName: .userPromptSubmit,
+                    source: "codex",
+                    workspaceId: workspace.id.uuidString,
+                    surfaceId: panel.id.uuidString,
+                    transcriptPath: transcriptURL.path
+                ))
+            } else {
+                service.noteResumeInitiated(
+                    sessionID: sessionID,
+                    source: "codex",
+                    surfaceID: panel.id.uuidString,
+                    workspaceID: workspace.id.uuidString,
+                    workingDirectory: home.path
+                )
+            }
+            await invalidationGate.waitUntilQueued()
+            await recovery.resumeRecovery()
+
+            #expect(await resultIterator.next() == .rejected(.inaccessibleSurface))
+            #expect(await store.latestReport(runtimeSurfaceID: panel.id) == nil)
+
+            await invalidationGate.release()
+            controller.agentReportCaptureResultObserverForTesting = nil
+            controller.agentChatTranscriptService = nil
+            controller.agentReportCaptureStore = nil
+            if tabManager.tabs.contains(where: { $0.id == workspace.id }) {
+                tabManager.closeWorkspace(workspace)
+            }
+            try? FileManager.default.removeItem(at: home)
+        }
+    }
+
     @Test func testWorkspaceWorkerMethodRejectsWindowAliasInsteadOfDefaultWindowFallback() async throws {
         let socketPath = makeSocketPath("alias-worker")
         let tabManager = TabManager()
@@ -2037,6 +2157,73 @@ final class TerminalControllerSocketSecurityTests {
             code: Int(errno),
             userInfo: [NSLocalizedDescriptionKey: "\(operation) failed: \(String(cString: strerror(errno)))"]
         )
+    }
+}
+
+private actor SuspendedEndpointAgentReportRecovery: AgentReportTranscriptRecovering {
+    private let reply: String
+    private var recoveryStarted = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var recoveryContinuation: CheckedContinuation<String?, Never>?
+
+    init(reply: String) {
+        self.reply = reply
+    }
+
+    func isPrimaryCodexSession(recordedPath: String?, sessionID: String) async -> Bool {
+        true
+    }
+
+    func recoverCodexFinalReply(
+        recordedPath: String?,
+        sessionID: String,
+        turnID: String
+    ) async -> String? {
+        recoveryStarted = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        return await withCheckedContinuation { recoveryContinuation = $0 }
+    }
+
+    func waitUntilRecoveryStarted() async {
+        if recoveryStarted { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func resumeRecovery() {
+        recoveryContinuation?.resume(returning: reply)
+        recoveryContinuation = nil
+    }
+}
+
+private actor QueuedAgentReportInvalidationGate {
+    private var queuedCount = 0
+    private var queuedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var isReleased = false
+
+    func enqueue(surfaceID: UUID, store: AgentReportCaptureStore) async {
+        queuedCount += 1
+        let waiters = queuedWaiters
+        queuedWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        if !isReleased {
+            await withCheckedContinuation { releaseWaiters.append($0) }
+        }
+        await store.invalidatePendingCapture(runtimeSurfaceID: surfaceID)
+    }
+
+    func waitUntilQueued() async {
+        if queuedCount > 0 { return }
+        await withCheckedContinuation { queuedWaiters.append($0) }
+    }
+
+    func release() {
+        isReleased = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 }
 

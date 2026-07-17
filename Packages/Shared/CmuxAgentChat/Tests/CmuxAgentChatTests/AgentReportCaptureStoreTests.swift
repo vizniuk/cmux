@@ -282,6 +282,62 @@ struct AgentReportCaptureStoreTests {
         #expect(await store.latestReport(runtimeSurfaceID: surfaceID)?.finalReply == "completed")
     }
 
+    @Test("diagnostic descriptions disclose no identifiers or report properties")
+    func diagnosticDescriptionsAreInvariantAcrossPrivateValues() {
+        let shortRequest = request(raw: "private")
+        let longRequest = AgentReportCaptureRequest(
+            provider: .codex,
+            workspaceID: UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")!,
+            runtimeSurfaceID: UUID(uuidString: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")!,
+            agentSessionID: "87654321-private-session",
+            turnID: "12345678-private-turn",
+            completionKind: .primaryStop,
+            transcriptPath: "/private/transcript/path.jsonl",
+            rawFinalReply: String(repeating: "secret", count: 10_000),
+            completionTimestamp: Date(timeIntervalSince1970: 999)
+        )
+        let shortTarget = target()
+        let longTarget = AgentReportCaptureTarget(
+            workspaceID: longRequest.workspaceID,
+            runtimeSurfaceID: longRequest.runtimeSurfaceID,
+            stableSurfaceID: UUID(),
+            agentSessionID: longRequest.agentSessionID,
+            turnID: longRequest.turnID,
+            transcriptPath: longRequest.transcriptPath
+        )
+        let shortIdentity = shortRequest.duplicateIdentity
+        let longIdentity = longRequest.duplicateIdentity
+        let shortReport = report(request: shortRequest, target: shortTarget, reply: "private")
+        let longReport = report(
+            request: longRequest,
+            target: longTarget,
+            reply: String(repeating: "secret", count: 10_000)
+        )
+
+        let descriptions = [
+            shortRequest.description, shortRequest.debugDescription,
+            shortTarget.description, shortTarget.debugDescription,
+            shortIdentity.description, shortIdentity.debugDescription,
+            shortReport.description, shortReport.debugDescription,
+        ]
+        for description in descriptions {
+            #expect(!description.contains("session-1"))
+            #expect(!description.contains("session"))
+            #expect(!description.contains("turn-1"))
+            #expect(!description.contains("turn"))
+            #expect(!description.contains("private"))
+            #expect(!description.contains("7"))
+        }
+        #expect(shortRequest.description == longRequest.description)
+        #expect(shortRequest.debugDescription == longRequest.debugDescription)
+        #expect(shortTarget.description == longTarget.description)
+        #expect(shortTarget.debugDescription == longTarget.debugDescription)
+        #expect(shortIdentity.description == longIdentity.description)
+        #expect(shortIdentity.debugDescription == longIdentity.debugDescription)
+        #expect(shortReport.description == longReport.description)
+        #expect(shortReport.debugDescription == longReport.debugDescription)
+    }
+
     private func request(
         raw: String?,
         turnID: String = "turn-1",
@@ -313,6 +369,28 @@ struct AgentReportCaptureStoreTests {
             agentSessionID: sessionID,
             turnID: turnID,
             transcriptPath: "/synthetic/session-1.jsonl"
+        )
+    }
+
+    private func report(
+        request: AgentReportCaptureRequest,
+        target: AgentReportCaptureTarget,
+        reply: String
+    ) -> AgentReport {
+        AgentReport(
+            provider: request.provider,
+            runtimeSurfaceID: request.runtimeSurfaceID,
+            stableSurfaceID: target.stableSurfaceID,
+            workspaceID: request.workspaceID,
+            agentSessionID: request.agentSessionID,
+            turnID: request.turnID,
+            completionKind: request.completionKind,
+            finalReply: reply,
+            captureSource: .rawHook,
+            capturedAt: Date(timeIntervalSince1970: 1),
+            promptTimestamp: nil,
+            completionTimestamp: request.completionTimestamp,
+            duplicateIdentity: request.duplicateIdentity
         )
     }
 }
@@ -375,7 +453,12 @@ struct CodexFinalReplyExtractorTests {
         var lines = [
             jsonLine(type: "session_meta", payload: ["id": "session-1"]),
             jsonLine(type: "turn_context", payload: ["turn_id": "turn-1"]),
-            messageLine(role: "assistant", text: "stream candidate", turnID: "turn-1"),
+            messageLine(
+                role: "assistant",
+                text: "stream candidate",
+                turnID: "turn-1",
+                phase: "commentary"
+            ),
         ]
         lines.append(jsonLine(type: "event_msg", payload: [
             "type": "task_complete",
@@ -420,12 +503,51 @@ struct CodexFinalReplyExtractorTests {
             jsonLine(type: "response_item", payload: [
                 "type": "message",
                 "role": "assistant",
+                "phase": "final_answer",
                 "content": [
                     ["type": "output_text", "text": "first"],
                     ["type": "output_text", "text": "second"],
                 ],
                 "internal_chat_message_metadata_passthrough": ["turn_id": "turn-1"],
             ]),
+            jsonLine(type: "event_msg", payload: ["type": "turn_complete", "turn_id": "turn-1"]),
+        ]
+
+        #expect(extractor.extract(lines: lines, sessionID: "session-1", turnID: "turn-1") == nil)
+    }
+
+    @Test("response-item fallback requires an authoritative final-answer phase")
+    func fallbackPhaseMustBeFinalAnswer() {
+        for phase in [nil, "commentary", "analysis", "intermediate", "unknown"] as [String?] {
+            let lines = completedTurnLines(final: "must not capture", phase: phase)
+            #expect(extractor.extract(lines: lines, sessionID: "session-1", turnID: "turn-1") == nil)
+        }
+        let final = completedTurnLines(final: "exact final", phase: "final_answer")
+        #expect(extractor.extract(lines: final, sessionID: "session-1", turnID: "turn-1") == "exact final")
+    }
+
+    @Test("multiple final-answer response items are ambiguous without terminal text")
+    func multipleFinalAnswerCandidatesAreRejected() {
+        let lines = [
+            jsonLine(type: "session_meta", payload: ["id": "session-1"]),
+            jsonLine(type: "turn_context", payload: ["turn_id": "turn-1"]),
+            messageLine(role: "assistant", text: "first final", turnID: "turn-1"),
+            messageLine(role: "assistant", text: "second final", turnID: "turn-1"),
+            jsonLine(type: "event_msg", payload: ["type": "turn_complete", "turn_id": "turn-1"]),
+        ]
+
+        #expect(extractor.extract(lines: lines, sessionID: "session-1", turnID: "turn-1") == nil)
+    }
+
+    @Test("nested sidechain metadata cannot authorize final-answer fallback")
+    func nestedSidechainSessionIsRejected() {
+        let lines = [
+            jsonLine(type: "session_meta", payload: [
+                "id": "session-1",
+                "source": ["subagent": ["thread_id": "child"]],
+            ]),
+            jsonLine(type: "turn_context", payload: ["turn_id": "turn-1"]),
+            messageLine(role: "assistant", text: "child final", turnID: "turn-1"),
             jsonLine(type: "event_msg", payload: ["type": "turn_complete", "turn_id": "turn-1"]),
         ]
 
@@ -443,22 +565,31 @@ struct CodexFinalReplyExtractorTests {
         )
     }
 
-    private func completedTurnLines(final: String) -> [String] {
+    private func completedTurnLines(final: String, phase: String? = "final_answer") -> [String] {
         [
             jsonLine(type: "session_meta", payload: ["id": "session-1"]),
             jsonLine(type: "turn_context", payload: ["turn_id": "turn-1"]),
-            messageLine(role: "assistant", text: final, turnID: "turn-1"),
+            messageLine(role: "assistant", text: final, turnID: "turn-1", phase: phase),
             jsonLine(type: "event_msg", payload: ["type": "turn_complete", "turn_id": "turn-1"]),
         ]
     }
 
-    private func messageLine(role: String, text: String, turnID: String) -> String {
-        jsonLine(type: "response_item", payload: [
+    private func messageLine(
+        role: String,
+        text: String,
+        turnID: String,
+        phase: String? = "final_answer"
+    ) -> String {
+        var payload: [String: Any] = [
             "type": "message",
             "role": role,
             "content": [["type": role == "assistant" ? "output_text" : "input_text", "text": text]],
             "internal_chat_message_metadata_passthrough": ["turn_id": turnID],
-        ])
+        ]
+        if let phase {
+            payload["phase"] = phase
+        }
+        return jsonLine(type: "response_item", payload: payload)
     }
 
     private func jsonLine(type: String, payload: [String: Any]) -> String {

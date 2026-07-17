@@ -364,8 +364,16 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         XCTAssertEqual(activeBoundary["sessionId"] as? String, sessionID)
         XCTAssertEqual(activeBoundary["turnId"] as? String, turnID)
 
+        let privatePrefix = "PRIVATE-EXACT-PREFIX-SENTINEL"
+        let privateMiddle = "PRIVATE-EXACT-MIDDLE-SENTINEL"
         let privateTail = "PRIVATE-EXACT-TAIL-SENTINEL"
-        let exact = "  ## Synthetic report\n\n日本語 ✅\n" + String(repeating: "exact-markdown-", count: 1_400) + privateTail + "  \n"
+        let exact = privatePrefix
+            + "  ## Synthetic report\n\n日本語 ✅\n"
+            + String(repeating: "near-prefix-", count: 4)
+            + privateMiddle
+            + String(repeating: "exact-markdown-", count: 1_400)
+            + privateTail
+            + "  \n"
         XCTAssertGreaterThan(exact.count, 16_384)
         let stopObject: [String: Any] = [
             "session_id": sessionID,
@@ -398,20 +406,43 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         XCTAssertEqual(request["turn_id"] as? String, turnID)
         XCTAssertEqual(request["completion_kind"] as? String, "primaryStop")
         XCTAssertEqual(request["raw_final_reply"] as? String, exact)
+        let privateRequest = String(describing: request)
+        XCTAssertTrue(privateRequest.contains(privatePrefix))
+        XCTAssertTrue(privateRequest.contains(privateMiddle))
+        XCTAssertTrue(privateRequest.contains(privateTail))
 
         let nonPrivateTransport = context.state.snapshot().filter { line in
             self.jsonObject(line)?["method"] as? String != "agent.report.capture"
         }
-        XCTAssertFalse(
-            nonPrivateTransport.contains { $0.contains(privateTail) },
-            "Exact-only tail must not enter Feed, notifications, resume metadata, or status commands."
-        )
+        for sentinel in [privatePrefix, privateMiddle, privateTail] {
+            XCTAssertFalse(
+                nonPrivateTransport.contains { $0.contains(sentinel) },
+                "Private report content must not enter Feed, notifications, resume metadata, fingerprints, or status commands: \(sentinel)"
+            )
+        }
+        let feedFrames = nonPrivateTransport.filter {
+            self.jsonObject($0)?["method"] as? String == "feed.push"
+        }
+        let notificationCommands = nonPrivateTransport.filter {
+            $0.hasPrefix("notify_target_async ")
+        }
+        XCTAssertFalse(feedFrames.isEmpty)
+        XCTAssertFalse(notificationCommands.isEmpty)
+        for sentinel in [privatePrefix, privateMiddle, privateTail] {
+            XCTAssertFalse(feedFrames.contains { $0.contains(sentinel) })
+            XCTAssertFalse(notificationCommands.contains { $0.contains(sentinel) })
+        }
         let hookRecord = try readAgentHookSession(
             sessionID,
             agent: "codex",
             context: context
         )
-        XCTAssertFalse(String(describing: hookRecord).contains(privateTail))
+        let persistedRecord = String(describing: hookRecord)
+        for sentinel in [privatePrefix, privateMiddle, privateTail] {
+            XCTAssertFalse(persistedRecord.contains(sentinel))
+        }
+        XCTAssertNil(hookRecord["lastEmittedNotificationFingerprint"])
+        XCTAssertNil(hookRecord["recentEmittedNotificationFingerprints"])
     }
 
     func testCodexNullRawStopQueuesTranscriptRecoveryWithoutPreviewSubstitution() throws {
