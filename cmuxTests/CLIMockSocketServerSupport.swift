@@ -94,6 +94,12 @@ extension CLINotifyProcessIntegrationRegressionTests {
     private final class DeterministicMockSocketServer: @unchecked Sendable {
         private let lock = NSLock()
         private let group = DispatchGroup()
+        private let handlerGroup = DispatchGroup()
+        private let handlerQueue = DispatchQueue(
+            label: "com.cmux.tests.cli-mock-socket.handler",
+            qos: .userInitiated,
+            attributes: .concurrent
+        )
         private let listenerFD: Int32
         private let expectedConnections: Int
         private let state: MockSocketServerState
@@ -108,6 +114,8 @@ extension CLINotifyProcessIntegrationRegressionTests {
         private var framedRequests = 0
         private var attemptedResponses = 0
         private var completedResponses = 0
+        private var activeHandlers = 0
+        private var activeClientFDs = Set<Int32>()
         private var observedMethods: [String] = []
         private var lastStage = "created"
         private var terminalFailure: String?
@@ -174,25 +182,23 @@ extension CLINotifyProcessIntegrationRegressionTests {
             defer { lock.unlock() }
             let reachedConnectionCount = acceptedConnections == expectedConnections
                 && handledConnections == expectedConnections
-            let reachedTerminalFrame = !strictConnectionCount
-                && terminalCompletionObserved
-                && acceptedConnections == handledConnections
             return terminalFailure == nil
-                && (reachedConnectionCount || reachedTerminalFrame)
+                && reachedConnectionCount
+                && activeHandlers == 0
                 && acceptLoopFinished
         }
 
         private func runAcceptLoop() {
             guard listenerFD >= 0 else {
                 finishAcceptLoop()
-                fulfillHandled()
+                fulfillHandledIfCompleteOrFailed()
                 return
             }
 
             while true {
                 lock.lock()
                 let shouldStop = isStopping
-                    || (!strictConnectionCount && terminalCompletionObserved)
+                    || terminalFailure != nil
                     || acceptedConnections >= expectedConnections
                 lock.unlock()
                 if shouldStop { break }
@@ -211,9 +217,8 @@ extension CLINotifyProcessIntegrationRegressionTests {
                     if isStoppingSnapshot {
                         break
                     }
-                    if Self.isListenerClosedAcceptErrno(acceptErrno), !strictConnectionCount {
+                    if Self.isListenerClosedAcceptErrno(acceptErrno) {
                         markListenerExternallyClosed()
-                        recordTerminalCompletion(stage: "listener.closed")
                     } else {
                         recordTerminalFailure(stage: "accept", detail: "errno=\(acceptErrno)")
                     }
@@ -221,11 +226,12 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 }
 
                 recordAcceptedConnection()
-                handleConnection(clientFD)
+                startConnectionHandler(clientFD)
             }
 
             finishAcceptLoop()
-            fulfillHandled()
+            handlerGroup.wait()
+            fulfillHandledIfCompleteOrFailed()
         }
 
         private var isStoppingSnapshot: Bool {
@@ -234,8 +240,20 @@ extension CLINotifyProcessIntegrationRegressionTests {
             return isStopping
         }
 
+        private func startConnectionHandler(_ clientFD: Int32) {
+            registerClientFD(clientFD)
+            recordHandlerStarted()
+            handlerGroup.enter()
+            handlerQueue.async {
+                self.handleConnection(clientFD)
+                self.recordHandlerFinished()
+                self.handlerGroup.leave()
+            }
+        }
+
         private func handleConnection(_ clientFD: Int32) {
             defer {
+                unregisterClientFD(clientFD)
                 Darwin.close(clientFD)
                 recordHandledConnection()
             }
@@ -252,9 +270,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
                     return
                 }
                 if count == 0 {
-                    if !strictConnectionCount, acceptedConnectionsSnapshot > 0 {
-                        recordTerminalCompletion(stage: "connection.eof")
-                    }
+                    recordStage("connection.eof")
                     return
                 }
                 pending.append(buffer, count: count)
@@ -275,7 +291,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
                     }
 
                     if Self.isOneWayFeedTelemetry(line) {
-                        recordTerminalCompletion(stage: "request.one-way-feed")
+                        recordStage("request.one-way-feed")
                         continue
                     }
 
@@ -314,10 +330,6 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 return true
             } catch {
                 let errorCode = (error as NSError).code
-                if !strictConnectionCount, Self.isClientClosedDuringResponse(errnoValue: errorCode) {
-                    recordTerminalCompletion(stage: "response.client-closed")
-                    return false
-                }
                 recordTerminalFailure(stage: "response.write", detail: "errno=\(errorCode)")
                 return false
             }
@@ -333,6 +345,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
             if shouldClose {
                 closeListener()
             }
+            shutdownActiveClientConnections()
         }
 
         private func closeListener() {
@@ -354,10 +367,15 @@ extension CLINotifyProcessIntegrationRegressionTests {
             lock.unlock()
         }
 
-        private func fulfillHandled() {
+        private func fulfillHandledIfCompleteOrFailed() {
             let expectation: XCTestExpectation?
             lock.lock()
-            if didFulfill {
+            let shouldFulfill = terminalFailure != nil
+                || (acceptedConnections == expectedConnections
+                    && handledConnections == expectedConnections
+                    && activeHandlers == 0
+                    && acceptLoopFinished)
+            if didFulfill || !shouldFulfill {
                 expectation = nil
             } else {
                 didFulfill = true
@@ -372,8 +390,6 @@ extension CLINotifyProcessIntegrationRegressionTests {
             acceptLoopFinished = true
             if terminalFailure == nil,
                !isStopping,
-               !terminalCompletionObserved,
-               strictConnectionCount,
                acceptedConnections != expectedConnections {
                 terminalFailure = "connection-count"
                 lastStage = "connection-count"
@@ -394,6 +410,41 @@ extension CLINotifyProcessIntegrationRegressionTests {
             handledConnections += 1
             lastStage = "connection.closed"
             lock.unlock()
+        }
+
+        private func recordHandlerStarted() {
+            lock.lock()
+            activeHandlers += 1
+            lastStage = "handler.started"
+            lock.unlock()
+        }
+
+        private func recordHandlerFinished() {
+            lock.lock()
+            activeHandlers -= 1
+            lastStage = "handler.finished"
+            lock.unlock()
+        }
+
+        private func registerClientFD(_ clientFD: Int32) {
+            lock.lock()
+            activeClientFDs.insert(clientFD)
+            lock.unlock()
+        }
+
+        private func unregisterClientFD(_ clientFD: Int32) {
+            lock.lock()
+            activeClientFDs.remove(clientFD)
+            lock.unlock()
+        }
+
+        private func shutdownActiveClientConnections() {
+            lock.lock()
+            let fds = Array(activeClientFDs)
+            lock.unlock()
+            for fd in fds {
+                _ = Darwin.shutdown(fd, SHUT_RDWR)
+            }
         }
 
         private func recordFramedRequest(method: String) {
@@ -451,6 +502,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 "expectedConnections=\(expectedConnections)",
                 "acceptedConnections=\(acceptedConnections)",
                 "handledConnections=\(handledConnections)",
+                "activeHandlers=\(activeHandlers)",
                 "framedRequests=\(framedRequests)",
                 "methods=[\(methods)]",
                 "responses=\(completedResponses)/\(attemptedResponses)",
@@ -488,18 +540,8 @@ extension CLINotifyProcessIntegrationRegressionTests {
             return waitTimeout.doubleValue == 0
         }
 
-        private static func isClientClosedDuringResponse(errnoValue: Int) -> Bool {
-            errnoValue == EPIPE || errnoValue == ECONNRESET || errnoValue == ENOTCONN
-        }
-
         private static func isListenerClosedAcceptErrno(_ errnoValue: Int32) -> Bool {
             errnoValue == EBADF || errnoValue == EINVAL || errnoValue == ENOTSOCK || errnoValue == ECONNABORTED
-        }
-
-        private var acceptedConnectionsSnapshot: Int {
-            lock.lock()
-            defer { lock.unlock() }
-            return acceptedConnections
         }
     }
 

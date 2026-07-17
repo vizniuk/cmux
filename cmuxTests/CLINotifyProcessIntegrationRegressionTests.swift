@@ -790,7 +790,7 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         standardInput: String,
         extraEnvironment: [String: String] = [:]
     ) -> ProcessRunResult {
-        let serverHandled = startMockServer(listenerFD: context.listenerFD, state: context.state, connectionCount: 4) { line in
+        let serverHandled = startMockServer(listenerFD: context.listenerFD, state: context.state, connectionCount: 2) { line in
             guard let payload = self.jsonObject(line) else {
                 return "OK"
             }
@@ -8806,7 +8806,7 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         standardInput: String,
         extraEnvironment: [String: String] = [:]
     ) -> ProcessRunResult {
-        let serverHandled = startMockServer(listenerFD: context.listenerFD, state: context.state, connectionCount: 4) { line in
+        let serverHandled = startMockServer(listenerFD: context.listenerFD, state: context.state, connectionCount: 2) { line in
             guard let payload = self.jsonObject(line) else {
                 return "OK"
             }
