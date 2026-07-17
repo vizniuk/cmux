@@ -1,5 +1,6 @@
 import XCTest
 import Darwin
+import Dispatch
 
 extension CLINotifyProcessIntegrationRegressionTests {
     func testMockSocketServerWaitsForAllExpectedConnectionsAndDoesNotLeakWorker() throws {
@@ -269,20 +270,39 @@ extension CLINotifyProcessIntegrationRegressionTests {
         }
 
         let state = MockSocketServerState()
+        let feedObserved = DispatchSemaphore(value: 0)
         let serverHandled = startMockServer(
             listenerFD: listenerFD,
             state: state,
-            connectionCount: 2
+            connectionCount: 2,
+            fulfillWhen: { line in
+                if self.jsonObject(line)?["method"] as? String == "feed.push" {
+                    feedObserved.signal()
+                }
+                return false
+            }
         ) { line in
             self.claudeStyleResponse(line: line, surfaceId: "surface-feed-first")
         }
 
         let feedFD = try cliMockConnect(socketPath: socketPath)
+        var feedFDOpen = true
+        defer {
+            if feedFDOpen {
+                Darwin.close(feedFD)
+            }
+        }
         try cliMockWriteAll(Data(oneWayFeedPushLine().utf8), to: feedFD)
-        Darwin.close(feedFD)
+        XCTAssertEqual(
+            feedObserved.wait(timeout: .now() + 2),
+            .success,
+            "Feed frame must be observed before the control connection starts."
+        )
 
         let controlFD = try cliMockConnect(socketPath: socketPath)
         defer { Darwin.close(controlFD) }
+        Darwin.close(feedFD)
+        feedFDOpen = false
 
         try cliMockWriteAll(Data(surfaceListLine(id: "feed-first-list").utf8), to: controlFD)
         let surfaceListResponse = try cliMockReadResponse(from: controlFD)
@@ -294,6 +314,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
 
         Darwin.shutdown(controlFD, SHUT_RDWR)
         XCTAssertEqual(XCTWaiter().wait(for: [serverHandled], timeout: 2), .completed)
+        XCTAssertEqual(observedMethods(in: state).first, "feed.push")
         assertClaudeStyleMethodContract(in: state)
     }
 
