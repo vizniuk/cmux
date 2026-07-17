@@ -5,7 +5,8 @@ import Foundation
 ///
 /// Extraction fails closed unless the rollout proves the exact primary
 /// session, requested turn, and terminal completion. Reasoning, tool, user,
-/// sidechain, and subagent records are never candidates.
+/// sidechain, and subagent records are never candidates. Structured assistant
+/// fallback is accepted only when Codex marks it `phase == "final_answer"`.
 public struct CodexFinalReplyExtractor: Sendable {
     /// Creates an exact Codex final-reply extractor.
     public init() {}
@@ -54,6 +55,7 @@ public struct CodexFinalReplyExtractor: Sendable {
         var sawMatchingSession = false
         var currentTurnID: String?
         var responseItemCandidate: String?
+        var responseItemCandidateCount = 0
         var terminalCandidate: String?
         var sawTerminalTurn = false
 
@@ -76,6 +78,7 @@ public struct CodexFinalReplyExtractor: Sendable {
                 currentTurnID = Self.turnID(from: payload)
                 if currentTurnID == turnID {
                     responseItemCandidate = nil
+                    responseItemCandidateCount = 0
                     terminalCandidate = nil
                     sawTerminalTurn = false
                 }
@@ -83,7 +86,8 @@ public struct CodexFinalReplyExtractor: Sendable {
             case "response_item":
                 guard sawMatchingSession,
                       payload?["type"]?.string == "message",
-                      payload?["role"]?.string == "assistant" else {
+                      payload?["role"]?.string == "assistant",
+                      payload?["phase"]?.string == "final_answer" else {
                     continue
                 }
                 let itemTurnID = Self.responseItemTurnID(from: payload) ?? currentTurnID
@@ -97,6 +101,7 @@ public struct CodexFinalReplyExtractor: Sendable {
                 // available, joining would invent separators, so fail closed.
                 guard texts.count == 1, let candidate = texts.first else { continue }
                 if !candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    responseItemCandidateCount += 1
                     responseItemCandidate = candidate
                 }
 
@@ -123,7 +128,11 @@ public struct CodexFinalReplyExtractor: Sendable {
         }
 
         guard sawMatchingSession, sawTerminalTurn else { return nil }
-        return terminalCandidate ?? responseItemCandidate
+        if let terminalCandidate {
+            return terminalCandidate
+        }
+        guard responseItemCandidateCount == 1 else { return nil }
+        return responseItemCandidate
     }
 
     /// Reads provider turn identity across supported rollout field spellings.

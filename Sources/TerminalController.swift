@@ -5647,7 +5647,9 @@ class TerminalController {
     /// This deliberately performs no focused, default, or sole-surface
     /// fallback. It captures panel identity before the off-main hook-store read
     /// and rechecks the same manager/workspace/panel instance afterward so a
-    /// close, replacement, or rebind fails closed.
+    /// close, replacement, or rebind fails closed. The service's process-local
+    /// lifecycle token is sampled on both sides of the registry suspension and
+    /// carried into the target for the report actor's post-recovery comparison.
     ///
     /// - Parameter request: Request whose full identity tuple must match.
     /// - Returns: Fresh authoritative target, or `nil` on any mismatch.
@@ -5663,14 +5665,18 @@ class TerminalController {
               let workspace = targetManager.tabs.first(where: { $0.id == request.workspaceID }),
               workspace.surfaceIdFromPanelId(request.runtimeSurfaceID) != nil,
               let terminalPanel = workspace.panels[request.runtimeSurfaceID] as? TerminalPanel,
-              let registry = agentChatTranscriptService?.registry,
-              let binding = await registry.agentReportCaptureBinding(
+              let service = agentChatTranscriptService else {
+            return nil
+        }
+        let lifecycleToken = service.agentReportLifecycleToken(for: request.runtimeSurfaceID)
+        guard let binding = await service.registry.agentReportCaptureBinding(
                   workspaceID: request.workspaceID.uuidString,
                   surfaceID: request.runtimeSurfaceID.uuidString,
                   sessionID: request.agentSessionID,
                   turnID: request.turnID,
                   requestedTranscriptPath: request.transcriptPath
               ),
+              service.agentReportLifecycleToken(for: request.runtimeSurfaceID) == lifecycleToken,
               let currentManager = AppDelegate.shared?.tabManagerFor(tabId: request.workspaceID)
                 ?? (targetManager.tabs.contains(where: { $0.id == request.workspaceID })
                     ? targetManager
@@ -5687,6 +5693,7 @@ class TerminalController {
             stableSurfaceID: terminalPanel.stableSurfaceId,
             agentSessionID: request.agentSessionID,
             turnID: request.turnID,
+            lifecycleToken: lifecycleToken,
             transcriptPath: binding.transcriptPath
         )
     }
@@ -5696,6 +5703,11 @@ class TerminalController {
     /// - Parameter runtimeSurfaceID: Exact process-local closed surface.
     @MainActor
     func purgeAgentReport(runtimeSurfaceID: UUID) {
+        // Revoke commit authority synchronously. The actor purge remains
+        // asynchronous cleanup and is not the stale-capture correctness gate.
+        agentChatTranscriptService?.invalidateAgentReportSurfaceLifecycle(
+            runtimeSurfaceID: runtimeSurfaceID
+        )
         guard let store = agentReportCaptureStore else { return }
         Task { await store.purge(runtimeSurfaceID: runtimeSurfaceID) }
     }

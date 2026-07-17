@@ -15,10 +15,9 @@ public struct AgentReportDuplicateIdentity: Sendable, Codable, Equatable, Hashab
     /// The completion boundary represented by the event.
     public let completionKind: AgentReportCompletionKind
 
-    /// A content-free diagnostic description with shortened opaque IDs.
+    /// A content-free diagnostic description with no opaque identifiers.
     public var description: String {
         "AgentReportDuplicateIdentity(provider: \(provider.rawValue), "
-            + "session: \(agentSessionID.prefix(8)), turn: \(turnID.prefix(8)), "
             + "completion: \(completionKind.rawValue))"
     }
 

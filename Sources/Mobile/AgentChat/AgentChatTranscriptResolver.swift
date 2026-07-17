@@ -3,9 +3,9 @@ import Foundation
 
 /// Resolves the transcript JSONL path for an agent session.
 ///
-/// Preference order: the hook store's recorded `transcriptPath`, then the
-/// agent-specific conventional location (claude: encoded-cwd project dir;
-/// codex: rollout filename containing the session id).
+/// Preference order for ordinary chat history is the hook store's recorded
+/// `transcriptPath`, then the agent-specific conventional location. Private
+/// Codex report reads apply a stricter root-contained resolver below.
 struct AgentChatTranscriptResolver: Sendable {
     private let homeDirectory: URL
     /// Config-dir root for Claude (`$CLAUDE_CONFIG_DIR` or `~/.claude`).
@@ -15,13 +15,11 @@ struct AgentChatTranscriptResolver: Sendable {
 
     /// Creates a resolver.
     ///
-    /// The derived-path fallbacks honor the agents' own config-dir env
+    /// The derived-path fallbacks honor the app process's config-dir env
     /// overrides so a user who relocates their config (e.g. `CLAUDE_CONFIG_DIR`
     /// or `CODEX_HOME`, including via a launcher/subrouter) still has transcripts
-    /// resolved. The PRIMARY source remains the hook-recorded absolute
-    /// `transcriptPath`, which already encodes any custom dir; this only fixes
-    /// the fallback used when no path was recorded (e.g. a codex session resumed
-    /// out-of-band, resolved by scanning the sessions dir).
+    /// resolved. For private report capture, `CODEX_HOME` is app-authoritative;
+    /// a hook-recorded path never supplies or expands the allowed root.
     ///
     /// - Parameters:
     ///   - homeDirectory: Injectable home directory for tests.
@@ -71,23 +69,23 @@ struct AgentChatTranscriptResolver: Sendable {
         }
     }
 
-    /// Resolves a Codex rollout from an already validated recorded path, then
-    /// from the conventional session-id filename. This method performs file
-    /// I/O and must be called off the main actor.
+    /// Resolves a Codex rollout only inside the app-authoritative sessions root.
+    /// This method performs file I/O and must be called off the main actor,
+    /// immediately before opening the returned path.
     ///
-    /// The conventional fallback remains session-specific; it never scans for
-    /// an arbitrary newest transcript and therefore cannot cross sessions.
+    /// Candidate and root symlinks are resolved before component-wise
+    /// containment is checked. The resolved candidate must be a regular JSONL
+    /// file. The conventional fallback remains session-specific; it never
+    /// selects an arbitrary newest transcript.
     ///
     /// - Parameters:
-    ///   - recordedPath: Session-validated hook path, when available.
+    ///   - recordedPath: Untrusted hook path to validate, when available.
     ///   - sessionID: Exact Codex session used by the fallback filename scan.
     /// - Returns: Existing exact-session rollout path, or `nil`.
     func codexTranscriptPath(recordedPath: String?, sessionID: String) -> String? {
-        if let recordedPath {
-            let expanded = (recordedPath as NSString).expandingTildeInPath
-            if FileManager.default.fileExists(atPath: expanded) {
-                return expanded
-            }
+        if let recordedPath,
+           let validated = validatedCodexTranscriptPath(recordedPath) {
+            return validated
         }
         return codexFallbackPath(sessionID: sessionID)
     }
@@ -131,21 +129,59 @@ struct AgentChatTranscriptResolver: Sendable {
     /// the session id.
     private func codexFallbackPath(sessionID: String) -> String? {
         let fileManager = FileManager.default
-        let root = codexConfigRoot
-            .appendingPathComponent("sessions", isDirectory: true)
+        let root = canonicalCodexSessionsRoot
         guard let enumerator = fileManager.enumerator(
             at: root,
-            includingPropertiesForKeys: nil,
+            includingPropertiesForKeys: [.isRegularFileKey],
             options: [.skipsHiddenFiles]
         ) else { return nil }
         let needle = sessionID.lowercased()
         for case let url as URL in enumerator {
             guard url.pathExtension == "jsonl" else { continue }
-            if url.lastPathComponent.lowercased().contains(needle) {
-                return url.path
+            if url.lastPathComponent.lowercased().contains(needle),
+               let validated = validatedCodexTranscriptPath(url.path) {
+                return validated
             }
         }
         return nil
+    }
+
+    /// Canonical root authorized by app configuration, never by hook payload.
+    private var canonicalCodexSessionsRoot: URL {
+        codexConfigRoot
+            .appendingPathComponent("sessions", isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+    }
+
+    /// Canonicalizes and validates one untrusted transcript candidate.
+    ///
+    /// Symlinks that resolve inside the configured sessions root are accepted;
+    /// escapes, missing targets, directories, devices, and FIFOs fail closed.
+    private func validatedCodexTranscriptPath(_ path: String) -> String? {
+        let expanded = (path as NSString).expandingTildeInPath
+        guard (expanded as NSString).isAbsolutePath else { return nil }
+
+        let unresolved = URL(fileURLWithPath: expanded, isDirectory: false).standardizedFileURL
+        let candidate = unresolved.resolvingSymlinksInPath()
+        let root = canonicalCodexSessionsRoot
+        guard unresolved.pathExtension.lowercased() == "jsonl",
+              candidate.pathExtension.lowercased() == "jsonl" else {
+            return nil
+        }
+
+        let rootComponents = root.pathComponents
+        let candidateComponents = candidate.pathComponents
+        guard candidateComponents.count > rootComponents.count,
+              candidateComponents.starts(with: rootComponents) else {
+            return nil
+        }
+
+        guard let values = try? candidate.resourceValues(forKeys: [.isRegularFileKey]),
+              values.isRegularFile == true else {
+            return nil
+        }
+        return candidate.path
     }
 }
 
@@ -153,7 +189,8 @@ extension AgentChatTranscriptResolver: AgentReportTranscriptRecovering {
     /// Proves primary-session metadata using off-main streaming JSONL I/O.
     ///
     /// - Parameters:
-    ///   - recordedPath: Session-validated hook path, when available.
+    ///   - recordedPath: Untrusted hook path, accepted only after canonical
+    ///     root containment and regular-file validation.
     ///   - sessionID: Exact Codex session expected in rollout metadata.
     /// - Returns: `true` only for a matching primary rollout.
     func isPrimaryCodexSession(
@@ -178,7 +215,8 @@ extension AgentChatTranscriptResolver: AgentReportTranscriptRecovering {
     /// Recovers exact final assistant text using off-main streaming JSONL I/O.
     ///
     /// - Parameters:
-    ///   - recordedPath: Session-validated hook path, when available.
+    ///   - recordedPath: Untrusted hook path, accepted only after canonical
+    ///     root containment and regular-file validation.
     ///   - sessionID: Exact Codex session expected in rollout metadata.
     ///   - turnID: Exact terminal turn to extract.
     /// - Returns: Unmodified final assistant text, or `nil` if unprovable.

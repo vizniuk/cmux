@@ -8,7 +8,9 @@ import Foundation
 final class AgentChatSessionRegistry {
     /// Content-free transcript binding proven for an exact active capture tuple.
     struct AgentReportCaptureBinding: Sendable {
-        /// Session-validated transcript path, when the hook recorded one.
+        /// Hook-recorded transcript candidate. This routing equality does not
+        /// authorize a read; the off-main resolver independently enforces the
+        /// app-authoritative Codex root and regular-file policy.
         let transcriptPath: String?
     }
 
@@ -269,8 +271,8 @@ final class AgentChatSessionRegistry {
     ///   - surfaceID: Exact live runtime surface claimed by the request.
     ///   - sessionID: Exact provider session claimed by the request.
     ///   - turnID: Exact provider turn claimed by the request.
-    ///   - requestedTranscriptPath: Hook-supplied path to compare with the
-    ///     authoritative session record, when present.
+    ///   - requestedTranscriptPath: Hook-supplied path to compare syntactically
+    ///     with the lifecycle record, when present. Equality cannot authorize I/O.
     /// - Returns: A content-free validated binding, or `nil` on any mismatch.
     func agentReportCaptureBinding(
         workspaceID: String,
@@ -356,7 +358,9 @@ final class AgentChatSessionRegistry {
         return left == right
     }
 
-    /// Normalizes a recorded path only for equality; it never reads content.
+    /// Normalizes a recorded path only for routing equality; it never grants
+    /// filesystem authority. Canonical containment is enforced off-main by
+    /// ``AgentChatTranscriptResolver`` immediately before a private read.
     private static func normalizedPath(_ value: String) -> String {
         URL(fileURLWithPath: (value as NSString).expandingTildeInPath).standardizedFileURL.path
     }

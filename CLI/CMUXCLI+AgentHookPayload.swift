@@ -14,6 +14,7 @@ extension CMUXCLI {
             return ClaudeHookParsedInput(
                 rawObject: nil,
                 object: nil,
+                rawFinalReply: nil,
                 rawFallback: fallback,
                 sessionId: nil,
                 turnId: nil,
@@ -26,10 +27,14 @@ extension CMUXCLI {
         let turnId = firstString(in: object, keys: ["turn_id", "turnId"])
         let cwd = extractClaudeHookCWD(from: object)
         let transcriptPath = extractHookTranscriptPath(from: object)
+        // Extract the exact value before compactClaudeHookObject applies any
+        // preview budget. Only the private report socket path may consume it.
+        let rawFinalReply = object["last_assistant_message"] as? String
         let compactObject = compactClaudeHookObject(object)
         return ClaudeHookParsedInput(
             rawObject: object,
             object: compactObject,
+            rawFinalReply: rawFinalReply,
             rawFallback: nil,
             sessionId: sessionId,
             turnId: turnId,

@@ -50,8 +50,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
     /// A content-free diagnostic description.
     public var description: String {
         "AgentReport(provider: \(provider.rawValue), "
-            + "session: \(agentSessionID.prefix(8)), turn: \(turnID.prefix(8)), "
-            + "source: \(captureSource.rawValue), characters: \(finalReply.count))"
+            + "source: \(captureSource.rawValue), completion: \(completionKind.rawValue))"
     }
 
     /// A content-free diagnostic description.

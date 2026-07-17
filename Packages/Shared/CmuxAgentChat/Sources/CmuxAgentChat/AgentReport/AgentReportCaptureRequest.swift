@@ -25,8 +25,9 @@ public struct AgentReportCaptureRequest: Sendable, Equatable, CustomStringConver
     /// Accepted completion boundary.
     public let completionKind: AgentReportCompletionKind
 
-    /// Hook-recorded transcript path, when supplied. The app validates this
-    /// against the exact session binding before any transcript read.
+    /// Hook-recorded transcript path, when supplied. Registry equality is only
+    /// a routing check; the off-main reader independently requires canonical
+    /// containment under the app-authoritative Codex sessions root.
     public let transcriptPath: String?
 
     /// Unmodified raw completion field, when supplied. Never log this value.
@@ -51,8 +52,7 @@ public struct AgentReportCaptureRequest: Sendable, Equatable, CustomStringConver
     /// A content-free diagnostic description.
     public var description: String {
         "AgentReportCaptureRequest(provider: \(provider.rawValue), "
-            + "session: \(agentSessionID.prefix(8)), turn: \(turnID.prefix(8)), "
-            + "hasRawReply: \(rawFinalReply != nil))"
+            + "completion: \(completionKind.rawValue))"
     }
 
     /// A content-free diagnostic description.

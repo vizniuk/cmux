@@ -24,9 +24,12 @@ final class AgentChatTranscriptService {
     /// failures don't rescan the filesystem during tool storms.
     private var failedResolutions: Set<String> = []
     private var endedListability = AgentChatEndedTranscriptListabilityCache()
-    /// Slice-A lifecycle seam. The injected closure invalidates only private,
-    /// in-memory report state; it never receives report content.
+    /// Slice-A cleanup seam. The injected closure invalidates only private,
+    /// in-memory report state; correctness is enforced by the synchronous
+    /// lifecycle token below rather than callback scheduling order.
     private var invalidateAgentReportSurface: @MainActor (UUID) -> Void = { _ in }
+    /// Opaque commit authority for each exact runtime surface lifecycle.
+    private var agentReportLifecycleTokenBySurfaceID: [UUID: UUID] = [:]
 
     /// Creates the service with a hook-store-backed registry.
     ///
@@ -287,8 +290,9 @@ final class AgentChatTranscriptService {
         invalidateAgentReport(surfaceID)
     }
 
-    /// Installs the private report lifecycle invalidator during app
-    /// composition. The callback carries only an opaque runtime surface ID.
+    /// Installs asynchronous actor cleanup during app composition. The
+    /// callback carries only an opaque runtime surface ID; callers must use the
+    /// synchronous lifecycle-token methods for correctness.
     ///
     /// - Parameter invalidator: Main-actor callback that invalidates in-flight
     ///   capture for a surface without receiving report or transcript content.
@@ -296,6 +300,34 @@ final class AgentChatTranscriptService {
         _ invalidator: @escaping @MainActor (UUID) -> Void
     ) {
         invalidateAgentReportSurface = invalidator
+    }
+
+    /// Returns the current opaque lifecycle authority for an exact surface.
+    ///
+    /// The token is process-local and lazily established on the main actor. It
+    /// contains no provider identity or report-derived information.
+    ///
+    /// - Parameter runtimeSurfaceID: Exact live runtime surface.
+    /// - Returns: Current non-persistent lifecycle token.
+    func agentReportLifecycleToken(for runtimeSurfaceID: UUID) -> UUID {
+        if let token = agentReportLifecycleTokenBySurfaceID[runtimeSurfaceID] {
+            return token
+        }
+        let token = UUID()
+        agentReportLifecycleTokenBySurfaceID[runtimeSurfaceID] = token
+        return token
+    }
+
+    /// Synchronously revokes commit authority before scheduling actor cleanup.
+    ///
+    /// Prompt, close, resume, and rebind paths call this on the main actor. A
+    /// suspended capture therefore observes a different token even if queued
+    /// cleanup has not reached the report-store actor yet.
+    ///
+    /// - Parameter runtimeSurfaceID: Surface lifecycle being invalidated.
+    func invalidateAgentReportSurfaceLifecycle(runtimeSurfaceID: UUID) {
+        agentReportLifecycleTokenBySurfaceID[runtimeSurfaceID] = UUID()
+        invalidateAgentReportSurface(runtimeSurfaceID)
     }
 
     /// Re-stamps a session's stored workspace id to the workspace its surface
@@ -456,11 +488,11 @@ final class AgentChatTranscriptService {
         return completedAt
     }
 
-    /// Reconciles transcript/UI lifecycle and invalidates private capture when
-    /// a session moves between surfaces.
+    /// Reconciles transcript/UI lifecycle and revokes private capture when a
+    /// session moves between surfaces.
     ///
-    /// Both the former and new surface generations change so a suspended
-    /// transcript read cannot commit after a resume or rebind.
+    /// Both the former and new surface tokens change synchronously so a
+    /// suspended transcript read cannot commit after a resume or rebind.
     private func handleRecordChange(_ record: AgentChatSessionRecord, previous: AgentChatSessionRecord?) {
         if previous?.surfaceID != record.surfaceID {
             invalidateAgentReport(previous?.surfaceID)
@@ -520,10 +552,11 @@ final class AgentChatTranscriptService {
         emit(frame: ChatSessionEventFrame(sessionID: record.sessionID, event: .sessionRemoved(version: record.version)))
     }
 
-    /// Converts content-free registry identity into the store lifecycle seam.
+    /// Converts content-free registry identity into synchronous lifecycle
+    /// revocation followed by best-effort actor cleanup.
     private func invalidateAgentReport(_ surfaceID: String?) {
         guard let surfaceID, let runtimeSurfaceID = UUID(uuidString: surfaceID) else { return }
-        invalidateAgentReportSurface(runtimeSurfaceID)
+        invalidateAgentReportSurfaceLifecycle(runtimeSurfaceID: runtimeSurfaceID)
     }
 
     private func emit(frame: ChatSessionEventFrame) {

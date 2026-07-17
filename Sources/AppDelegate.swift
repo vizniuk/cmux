@@ -2071,6 +2071,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         TerminalController.shared.agentChatTranscriptService = agentChatTranscriptService
         TerminalController.shared.agentReportCaptureStore = agentReportCaptureStore
         agentChatTranscriptService.setAgentReportSurfaceInvalidator { [agentReportCaptureStore] surfaceID in
+            // Cleanup may queue, but lifecycle authority was already revoked
+            // synchronously by AgentChatTranscriptService on the main actor.
             Task { await agentReportCaptureStore.invalidatePendingCapture(runtimeSurfaceID: surfaceID) }
         }
         auth.start()

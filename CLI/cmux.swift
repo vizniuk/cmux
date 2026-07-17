@@ -50,6 +50,9 @@ struct NotificationInfo {
 struct ClaudeHookParsedInput {
     let rawObject: [String: Any]?
     let object: [String: Any]?
+    /// Exact raw completion text reserved for the private report-capture path.
+    /// Generic hook fanout must never inspect or serialize this value.
+    let rawFinalReply: String?
     let rawFallback: String?
     let sessionId: String?
     let turnId: String?
@@ -31297,7 +31300,12 @@ export default CMUXSessionRestore;
                     env: env
                 )
             }()
-            let lastMsg = claudeAssistantMessageFromHookPayload(input.object)
+            // Codex Stop output is private report material. Preserve existing
+            // preview behavior for other providers, but make every non-private
+            // Codex completion surface use content-free status text.
+            let lastMsg = def.name == "codex"
+                ? nil
+                : claudeAssistantMessageFromHookPayload(input.object)
             let projectName: String? = {
                 guard let cwd, !cwd.isEmpty else { return nil }
                 return URL(fileURLWithPath: NSString(string: cwd).expandingTildeInPath).lastPathComponent
@@ -32135,9 +32143,10 @@ export default CMUXSessionRestore;
     /// Sends exact Codex completion material only through the private capture
     /// socket method. Callers must already have passed the primary Stop,
     /// nested/subagent, stale-turn, and exact-target acceptance boundary.
-    /// The raw reply is read only from `rawObject`; compact preview data is
-    /// deliberately excluded, and no report text is sent through Feed or
-    /// notification methods.
+    /// The raw reply was extracted before compact preview construction;
+    /// compact preview data is deliberately excluded. The generic Codex Stop
+    /// path independently redacts assistant content before Feed, notification,
+    /// dedupe, and hook-store fanout.
     ///
     /// - Parameters:
     ///   - client: Existing authorized local socket client.
@@ -32168,10 +32177,9 @@ export default CMUXSessionRestore;
         if let transcriptPath {
             params["transcript_path"] = transcriptPath
         }
-        if let rawFinalReply = parsedInput.rawObject?["last_assistant_message"] as? String,
+        if let rawFinalReply = parsedInput.rawFinalReply,
            !rawFinalReply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            // Preserve the raw hook string exactly. Preview compaction lives on
-            // parsedInput.object and is never consulted for this value.
+            // Preserve the pre-compaction hook string exactly.
             params["raw_final_reply"] = rawFinalReply
         }
         _ = try? client.sendV2(method: "agent.report.capture", params: params)
@@ -32186,6 +32194,7 @@ export default CMUXSessionRestore;
         transcriptPath: String?
     ) -> [String: Any]? {
         var context: [String: Any] = [:]
+        let redactsPrivateCodexStop = source == "codex" && hookEventName == "Stop"
 
         if let rawContext = rawObject?["context"] as? [String: Any] {
             mergeFeedContext(&context, feedContext(from: rawContext))
@@ -32207,15 +32216,17 @@ export default CMUXSessionRestore;
                 value: firstString(in: rawObject, keys: ["permissionMode", "permission_mode"]),
                 maxLength: 80
             )
-            setFeedContext(
-                &context,
-                key: "assistantPreamble",
-                value: firstString(
-                    in: rawObject,
-                    keys: ["assistantPreamble", "assistant_preamble", "last_assistant_message", "lastAssistantMessage"]
-                ),
-                maxLength: 1_000
-            )
+            if !redactsPrivateCodexStop {
+                setFeedContext(
+                    &context,
+                    key: "assistantPreamble",
+                    value: firstString(
+                        in: rawObject,
+                        keys: ["assistantPreamble", "assistant_preamble", "last_assistant_message", "lastAssistantMessage"]
+                    ),
+                    maxLength: 1_000
+                )
+            }
         }
 
         if source == "claude",
@@ -32233,6 +32244,13 @@ export default CMUXSessionRestore;
         }
         if let toolContext = feedToolContext(toolName: toolName, toolInput: toolInput) {
             mergeFeedContext(&context, toolContext)
+        }
+
+        // A nested context object may also carry an assistant preamble. Remove
+        // it last so no compact prefix of a Codex Stop report can escape via
+        // generic Feed telemetry.
+        if redactsPrivateCodexStop {
+            context.removeValue(forKey: "assistantPreamble")
         }
 
         return context.isEmpty ? nil : context

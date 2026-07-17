@@ -6,9 +6,10 @@ import Foundation
 /// The actor owns both enablement and retention so disabling is an atomic
 /// purge. It serializes validation, receipt ordering, and commit so duplicate
 /// or late completions cannot race. Transcript recovery may suspend for
-/// off-main file I/O; policy and per-surface lifecycle generations force a
-/// fresh validation after that suspension. It performs no persistence and
-/// exposes no observation surface in Slice A.
+/// off-main file I/O; policy, actor-owned cleanup generations, and an
+/// app-authoritative opaque lifecycle token force fresh validation after that
+/// suspension. It performs no persistence and exposes no observation surface
+/// in Slice A.
 ///
 /// Exact reply text exists only in this actor's process memory. It must never
 /// be forwarded to Feed, notifications, logs, analytics, crash reporting,
@@ -96,10 +97,11 @@ public actor AgentReportCaptureStore {
     /// Validates and captures one exact final report.
     ///
     /// Transcript recovery is entered only after the enabled policy and exact
-    /// target tuple pass. Policy and per-surface lifecycle generations prevent
-    /// in-flight recovery from committing after disable, close, or rebind. A
-    /// production caller supplies `revalidateTarget` so topology and hook-store
-    /// identity are proven again immediately before commit.
+    /// target tuple pass. Policy and actor generations provide atomic cleanup;
+    /// the synchronously advanced target lifecycle token is the correctness
+    /// barrier for prompt, close, resume, and rebind ordering. A production
+    /// caller supplies `revalidateTarget` so topology, hook-store identity, and
+    /// that token are proven again immediately before commit.
     ///
     /// - Parameters:
     ///   - request: Private capture request from the accepted hook boundary.
@@ -178,6 +180,9 @@ public actor AgentReportCaptureStore {
         }
         guard Self.identitiesMatch(request: request, target: currentTarget) else {
             return .rejected(.identityMismatch)
+        }
+        guard currentTarget.lifecycleToken == target.lifecycleToken else {
+            return .rejected(.inaccessibleSurface)
         }
         if let existing = latestByRuntimeSurfaceID[request.runtimeSurfaceID] {
             if existing.duplicateIdentity == identity {
