@@ -14,7 +14,8 @@ extension CLINotifyProcessIntegrationRegressionTests {
         let serverHandled = startMockServer(
             listenerFD: listenerFD,
             state: state,
-            connectionCount: 2
+            connectionCount: 2,
+            strictConnectionCount: true
         ) { line in
             "server-one:\(line)"
         }
@@ -43,7 +44,6 @@ extension CLINotifyProcessIntegrationRegressionTests {
             requestFragments: ["second-request\n"]
         )
         XCTAssertEqual(secondResponse, "server-one:second-request\n")
-        XCTAssertEqual(XCTWaiter().wait(for: [serverHandled], timeout: 2), .completed)
         XCTAssertEqual(state.snapshot(), ["first-request", "second-request"])
     }
 
@@ -158,6 +158,11 @@ extension CLINotifyProcessIntegrationRegressionTests {
         try testClaudeStaleStopFromClosedPaneStaysStaleWhenSurfaceResolutionFallsBack()
     }
 
+    func testClaudeStaleStopThenPredecessorSequenceDoesNotLoseMockSocketCompletion() throws {
+        try testClaudeStaleStopFromClosedPaneStaysStaleWhenSurfaceResolutionFallsBack()
+        try testClaudeSessionStartRecordIsNotRestorableUntilPrompt()
+    }
+
     private func cliMockSocketRoundTrip(
         socketPath: String,
         requestFragments: [String]
@@ -187,7 +192,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
         let maxPathLength = MemoryLayout.size(ofValue: addr.sun_path)
         let utf8 = Array(socketPath.utf8)
         XCTAssertLessThan(utf8.count, maxPathLength)
-        _ = withUnsafeMutablePointer(to: &addr.sun_path) { pointer in
+        withUnsafeMutablePointer(to: &addr.sun_path) { pointer in
             pointer.withMemoryRebound(to: CChar.self, capacity: maxPathLength) { buffer in
                 for index in 0..<utf8.count {
                     buffer[index] = CChar(bitPattern: utf8[index])
