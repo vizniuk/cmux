@@ -153,6 +153,156 @@ extension CLINotifyProcessIntegrationRegressionTests {
         XCTAssertEqual(state.snapshot(), ["clear_notifications --tab=workspace:1 --panel=surface:1"])
     }
 
+    func testOneWayFeedDoesNotCompleteServerBeforeControlConnection() throws {
+        let socketPath = makeSocketPath("feed-not-terminal")
+        let listenerFD = try bindUnixSocket(at: socketPath)
+        defer {
+            Darwin.close(listenerFD)
+            unlink(socketPath)
+        }
+
+        let state = MockSocketServerState()
+        let serverHandled = startMockServer(
+            listenerFD: listenerFD,
+            state: state,
+            connectionCount: 2
+        ) { line in
+            self.claudeStyleResponse(line: line, surfaceId: "surface-feed-not-terminal")
+        }
+
+        let feedFD = try cliMockConnect(socketPath: socketPath)
+        try cliMockWriteAll(Data(oneWayFeedPushLine().utf8), to: feedFD)
+        Darwin.close(feedFD)
+
+        let earlyResult = XCTWaiter().wait(for: [serverHandled], timeout: 0.25)
+        if earlyResult == .completed {
+            XCTFail("One-way feed.push completed the whole mock server before the expected control connection was accepted.")
+            return
+        }
+        XCTAssertEqual(earlyResult, .timedOut)
+
+        let controlResponse = try cliMockSocketRoundTrip(
+            socketPath: socketPath,
+            requestFragments: [surfaceListLine(id: "control-after-feed")]
+        )
+        XCTAssertTrue(controlResponse.contains(#""id":"control-after-feed""#), controlResponse)
+        XCTAssertEqual(observedMethods(in: state), ["feed.push", "surface.list"])
+    }
+
+    func testEOFOnOneConnectionDoesNotCompleteServerBeforeExpectedConnectionCount() throws {
+        let socketPath = makeSocketPath("eof-not-terminal")
+        let listenerFD = try bindUnixSocket(at: socketPath)
+        defer {
+            Darwin.close(listenerFD)
+            unlink(socketPath)
+        }
+
+        let state = MockSocketServerState()
+        let serverHandled = startMockServer(
+            listenerFD: listenerFD,
+            state: state,
+            connectionCount: 2
+        ) { line in
+            "ack:\(line)"
+        }
+
+        Darwin.close(try cliMockConnect(socketPath: socketPath))
+
+        let earlyResult = XCTWaiter().wait(for: [serverHandled], timeout: 0.25)
+        if earlyResult == .completed {
+            XCTFail("EOF on the first accepted connection completed the whole mock server before the expected second connection.")
+            return
+        }
+        XCTAssertEqual(earlyResult, .timedOut)
+
+        let response = try cliMockSocketRoundTrip(
+            socketPath: socketPath,
+            requestFragments: ["second-request\n"]
+        )
+        XCTAssertEqual(response, "ack:second-request\n")
+        XCTAssertEqual(state.snapshot(), ["second-request"])
+    }
+
+    func testClaudeStyleTwoConnectionProtocolCompletesAfterBothHandlersFinish() throws {
+        let socketPath = makeSocketPath("claude-two")
+        let listenerFD = try bindUnixSocket(at: socketPath)
+        defer {
+            Darwin.close(listenerFD)
+            unlink(socketPath)
+        }
+
+        let state = MockSocketServerState()
+        let serverHandled = startMockServer(
+            listenerFD: listenerFD,
+            state: state,
+            connectionCount: 2
+        ) { line in
+            self.claudeStyleResponse(line: line, surfaceId: "surface-claude-two")
+        }
+
+        let controlFD = try cliMockConnect(socketPath: socketPath)
+        defer { Darwin.close(controlFD) }
+
+        try cliMockWriteAll(Data(surfaceListLine(id: "surface-list").utf8), to: controlFD)
+        let surfaceListResponse = try cliMockReadResponse(from: controlFD)
+        XCTAssertTrue(surfaceListResponse.contains(#""id":"surface-list""#), surfaceListResponse)
+
+        let feedFD = try cliMockConnect(socketPath: socketPath)
+        try cliMockWriteAll(Data(oneWayFeedPushLine().utf8), to: feedFD)
+        Darwin.close(feedFD)
+
+        try cliMockWriteAll(Data(surfaceResumeSetLine(id: "resume-set").utf8), to: controlFD)
+        let resumeResponse = try cliMockReadResponse(from: controlFD)
+        XCTAssertTrue(resumeResponse.contains(#""id":"resume-set""#), resumeResponse)
+
+        Darwin.shutdown(controlFD, SHUT_RDWR)
+        XCTAssertEqual(XCTWaiter().wait(for: [serverHandled], timeout: 2), .completed)
+        XCTAssertEqual(observedMethods(in: state), ["surface.list", "feed.push", "surface.resume.set"])
+    }
+
+    func testClaudeStyleTwoConnectionProtocolCompletesWhenFeedArrivesFirst() throws {
+        let socketPath = makeSocketPath("claude-feed-first")
+        let listenerFD = try bindUnixSocket(at: socketPath)
+        defer {
+            Darwin.close(listenerFD)
+            unlink(socketPath)
+        }
+
+        let state = MockSocketServerState()
+        let serverHandled = startMockServer(
+            listenerFD: listenerFD,
+            state: state,
+            connectionCount: 2
+        ) { line in
+            self.claudeStyleResponse(line: line, surfaceId: "surface-feed-first")
+        }
+
+        let feedFD = try cliMockConnect(socketPath: socketPath)
+        try cliMockWriteAll(Data(oneWayFeedPushLine().utf8), to: feedFD)
+        Darwin.close(feedFD)
+
+        let feedOnlyResult = XCTWaiter().wait(for: [serverHandled], timeout: 0.25)
+        if feedOnlyResult == .completed {
+            XCTFail("Server completed after the feed connection only; the control connection had not run response-requiring work.")
+            return
+        }
+        XCTAssertEqual(feedOnlyResult, .timedOut)
+
+        let controlFD = try cliMockConnect(socketPath: socketPath)
+        defer { Darwin.close(controlFD) }
+
+        try cliMockWriteAll(Data(surfaceListLine(id: "feed-first-list").utf8), to: controlFD)
+        let surfaceListResponse = try cliMockReadResponse(from: controlFD)
+        XCTAssertTrue(surfaceListResponse.contains(#""id":"feed-first-list""#), surfaceListResponse)
+
+        try cliMockWriteAll(Data(surfaceResumeSetLine(id: "feed-first-resume").utf8), to: controlFD)
+        let resumeResponse = try cliMockReadResponse(from: controlFD)
+        XCTAssertTrue(resumeResponse.contains(#""id":"feed-first-resume""#), resumeResponse)
+
+        Darwin.shutdown(controlFD, SHUT_RDWR)
+        XCTAssertEqual(observedMethods(in: state), ["feed.push", "surface.list", "surface.resume.set"])
+    }
+
     func testClaudePredecessorThenStaleStopSequenceDoesNotLoseMockSocketCompletion() throws {
         try testClaudeSessionStartRecordIsNotRestorableUntilPrompt()
         try testClaudeStaleStopFromClosedPaneStaysStaleWhenSurfaceResolutionFallsBack()
@@ -179,9 +329,22 @@ extension CLINotifyProcessIntegrationRegressionTests {
         requestFragments: [String],
         expectedResponseLineCount: Int
     ) throws -> String {
+        let clientFD = try cliMockConnect(socketPath: socketPath)
+        defer { Darwin.close(clientFD) }
+
+        for fragment in requestFragments {
+            try cliMockWriteAll(Data(fragment.utf8), to: clientFD)
+        }
+
+        return try cliMockReadResponse(
+            from: clientFD,
+            expectedResponseLineCount: expectedResponseLineCount
+        )
+    }
+
+    private func cliMockConnect(socketPath: String) throws -> Int32 {
         let clientFD = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         XCTAssertGreaterThanOrEqual(clientFD, 0)
-        defer { Darwin.close(clientFD) }
 
         var timeout = timeval(tv_sec: 2, tv_usec: 0)
         setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
@@ -206,12 +369,20 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 Darwin.connect(clientFD, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        XCTAssertEqual(connectResult, 0)
-
-        for fragment in requestFragments {
-            try cliMockWriteAll(Data(fragment.utf8), to: clientFD)
+        guard connectResult == 0 else {
+            let connectErrno = errno
+            Darwin.close(clientFD)
+            throw NSError(domain: "cmux.tests.mock-socket", code: Int(connectErrno), userInfo: [
+                NSLocalizedDescriptionKey: "failed to connect to mock socket",
+            ])
         }
+        return clientFD
+    }
 
+    private func cliMockReadResponse(
+        from clientFD: Int32,
+        expectedResponseLineCount: Int = 1
+    ) throws -> String {
         var response = Data()
         var responseLines = 0
         var buffer = [UInt8](repeating: 0, count: 4096)
@@ -251,5 +422,48 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 }
             }
         }
+    }
+
+    private func claudeStyleResponse(line: String, surfaceId: String) -> String {
+        guard let payload = jsonObject(line) else {
+            return "OK"
+        }
+        guard let id = payload["id"] as? String, let method = payload["method"] as? String else {
+            return malformedRequestResponse(id: payload["id"] as? String, raw: line)
+        }
+        switch method {
+        case "surface.list":
+            return surfaceListResponse(id: id, surfaceId: surfaceId)
+        case "surface.resume.set":
+            return v2Response(id: id, ok: true, result: ["resume_binding": [:]])
+        default:
+            return v2Response(
+                id: id,
+                ok: false,
+                error: ["code": "unexpected_method", "message": "unexpected method: \(method)"]
+            )
+        }
+    }
+
+    private func observedMethods(in state: MockSocketServerState) -> [String] {
+        state.snapshot().map { line in
+            guard let payload = jsonObject(line),
+                  let method = payload["method"] as? String else {
+                return "non-json"
+            }
+            return method
+        }
+    }
+
+    private func surfaceListLine(id: String) -> String {
+        #"{"id":"\#(id)","version":1,"method":"surface.list","params":{}}"# + "\n"
+    }
+
+    private func surfaceResumeSetLine(id: String) -> String {
+        #"{"id":"\#(id)","version":1,"method":"surface.resume.set","params":{"sessionId":"synthetic-session"}}"# + "\n"
+    }
+
+    private func oneWayFeedPushLine() -> String {
+        #"{"version":1,"method":"feed.push","params":{"wait_timeout_seconds":0,"hook_event_name":"SyntheticHook"}}"# + "\n"
     }
 }
