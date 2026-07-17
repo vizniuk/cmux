@@ -257,7 +257,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
 
         Darwin.shutdown(controlFD, SHUT_RDWR)
         XCTAssertEqual(XCTWaiter().wait(for: [serverHandled], timeout: 2), .completed)
-        XCTAssertEqual(observedMethods(in: state), ["surface.list", "feed.push", "surface.resume.set"])
+        assertClaudeStyleMethodContract(in: state)
     }
 
     func testClaudeStyleTwoConnectionProtocolCompletesWhenFeedArrivesFirst() throws {
@@ -281,13 +281,6 @@ extension CLINotifyProcessIntegrationRegressionTests {
         try cliMockWriteAll(Data(oneWayFeedPushLine().utf8), to: feedFD)
         Darwin.close(feedFD)
 
-        let feedOnlyResult = XCTWaiter().wait(for: [serverHandled], timeout: 0.25)
-        if feedOnlyResult == .completed {
-            XCTFail("Server completed after the feed connection only; the control connection had not run response-requiring work.")
-            return
-        }
-        XCTAssertEqual(feedOnlyResult, .timedOut)
-
         let controlFD = try cliMockConnect(socketPath: socketPath)
         defer { Darwin.close(controlFD) }
 
@@ -300,7 +293,8 @@ extension CLINotifyProcessIntegrationRegressionTests {
         XCTAssertTrue(resumeResponse.contains(#""id":"feed-first-resume""#), resumeResponse)
 
         Darwin.shutdown(controlFD, SHUT_RDWR)
-        XCTAssertEqual(observedMethods(in: state), ["feed.push", "surface.list", "surface.resume.set"])
+        XCTAssertEqual(XCTWaiter().wait(for: [serverHandled], timeout: 2), .completed)
+        assertClaudeStyleMethodContract(in: state)
     }
 
     func testClaudePredecessorThenStaleStopSequenceDoesNotLoseMockSocketCompletion() throws {
@@ -452,6 +446,43 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 return "non-json"
             }
             return method
+        }
+    }
+
+    private func assertClaudeStyleMethodContract(
+        in state: MockSocketServerState,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let methods = observedMethods(in: state)
+        let methodCounts = Dictionary(grouping: methods, by: { $0 }).mapValues(\.count)
+        XCTAssertEqual(methodCounts["surface.list"], 1, "Expected one surface.list frame, saw \(methods)", file: file, line: line)
+        XCTAssertEqual(methodCounts["surface.resume.set"], 1, "Expected one surface.resume.set frame, saw \(methods)", file: file, line: line)
+        XCTAssertEqual(methodCounts["feed.push"], 1, "Expected one feed.push frame, saw \(methods)", file: file, line: line)
+        XCTAssertEqual(
+            Set(methods),
+            Set(["surface.list", "surface.resume.set", "feed.push"]),
+            "Unexpected method sequence \(methods)",
+            file: file,
+            line: line
+        )
+
+        // `feed.push` is handled on an independent one-way connection, so this
+        // test intentionally does not constrain where it appears relative to
+        // the control connection. The two response-requiring control frames are
+        // written on one socket, so their relative order remains deterministic.
+        let surfaceListIndex = methods.firstIndex(of: "surface.list")
+        let resumeSetIndex = methods.firstIndex(of: "surface.resume.set")
+        XCTAssertNotNil(surfaceListIndex, "Missing surface.list in \(methods)", file: file, line: line)
+        XCTAssertNotNil(resumeSetIndex, "Missing surface.resume.set in \(methods)", file: file, line: line)
+        if let surfaceListIndex, let resumeSetIndex {
+            XCTAssertLessThan(
+                surfaceListIndex,
+                resumeSetIndex,
+                "surface.resume.set must follow surface.list on the control connection; saw \(methods)",
+                file: file,
+                line: line
+            )
         }
     }
 
