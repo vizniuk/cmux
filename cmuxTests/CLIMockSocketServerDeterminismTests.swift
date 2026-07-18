@@ -410,6 +410,177 @@ extension CLINotifyProcessIntegrationRegressionTests {
         assertClaudeStyleMethodContract(in: state)
     }
 
+    func testConcurrentMockSocketServersRemainIsolatedWhileHandlersOverlap() throws {
+        let socketPathA = makeSocketPath("concurrent-isolation-a")
+        let socketPathB = makeSocketPath("concurrent-isolation-b")
+        XCTAssertNotEqual(socketPathA, socketPathB)
+
+        let listenerFDA = try bindUnixSocket(at: socketPathA)
+        let listenerFDB = try bindUnixSocket(at: socketPathB)
+        defer {
+            Darwin.close(listenerFDA)
+            Darwin.close(listenerFDB)
+            unlink(socketPathA)
+            unlink(socketPathB)
+        }
+
+        let stateA = MockSocketServerState()
+        let stateB = MockSocketServerState()
+        let handlerAEntered = DispatchSemaphore(value: 0)
+        let handlerBEntered = DispatchSemaphore(value: 0)
+        let releaseOverlappingHandlers = DispatchSemaphore(value: 0)
+
+        let serverA = startMockServerObservingTraffic(
+            listenerFD: listenerFDA,
+            state: stateA,
+            requiredConnections: 1
+        ) { line in
+            guard let payload = self.jsonObject(line),
+                  let id = payload["id"] as? String,
+                  let method = payload["method"] as? String else {
+                XCTFail("Server A received a malformed isolation request")
+                return self.malformedRequestResponse(id: self.jsonObject(line)?["id"] as? String, raw: line)
+            }
+            guard id == "server-a-1", method == "isolation.alpha" else {
+                XCTFail("Server A received an unexpected isolation identifier or method")
+                return self.v2Response(
+                    id: id,
+                    ok: false,
+                    error: ["code": "unrecognized_method", "message": "unexpected isolation request"]
+                )
+            }
+
+            handlerAEntered.signal()
+            guard releaseOverlappingHandlers.wait(timeout: .now() + 2) == .success else {
+                XCTFail("Server A handler was not released after both handlers overlapped")
+                return self.v2Response(
+                    id: id,
+                    ok: false,
+                    error: ["code": "barrier_timeout", "message": "isolation barrier timed out"]
+                )
+            }
+            return self.v2Response(id: id, ok: true, result: ["server": "a"])
+        }
+
+        let serverB = startMockServerObservingTraffic(
+            listenerFD: listenerFDB,
+            state: stateB,
+            requiredConnections: 2
+        ) { line in
+            guard let payload = self.jsonObject(line),
+                  let id = payload["id"] as? String,
+                  let method = payload["method"] as? String else {
+                XCTFail("Server B received a malformed isolation request")
+                return self.malformedRequestResponse(id: self.jsonObject(line)?["id"] as? String, raw: line)
+            }
+
+            switch (id, method) {
+            case ("server-b-1", "isolation.beta.first"):
+                handlerBEntered.signal()
+                guard releaseOverlappingHandlers.wait(timeout: .now() + 2) == .success else {
+                    XCTFail("Server B handler was not released after both handlers overlapped")
+                    return self.v2Response(
+                        id: id,
+                        ok: false,
+                        error: ["code": "barrier_timeout", "message": "isolation barrier timed out"]
+                    )
+                }
+                return self.v2Response(id: id, ok: true, result: ["server": "b", "sequence": 1])
+            case ("server-b-2", "isolation.beta.second"):
+                return self.v2Response(id: id, ok: true, result: ["server": "b", "sequence": 2])
+            default:
+                XCTFail("Server B received an unexpected isolation identifier or method")
+                return self.v2Response(
+                    id: id,
+                    ok: false,
+                    error: ["code": "unrecognized_method", "message": "unexpected isolation request"]
+                )
+            }
+        }
+
+        let clientACompleted = expectation(description: "server A client completed")
+        let firstClientBCompleted = expectation(description: "server B first client completed")
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { clientACompleted.fulfill() }
+            do {
+                let response = try self.cliMockSocketRoundTrip(
+                    socketPath: socketPathA,
+                    requestFragments: [#"{"id":"server-a-1","version":1,"method":"isolation.alpha","params":{}}"# + "\n"]
+                )
+                XCTAssertTrue(response.contains(#""id":"server-a-1""#), response)
+            } catch {
+                XCTFail("Server A client failed: \(error.localizedDescription)")
+            }
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { firstClientBCompleted.fulfill() }
+            do {
+                let response = try self.cliMockSocketRoundTrip(
+                    socketPath: socketPathB,
+                    requestFragments: [#"{"id":"server-b-1","version":1,"method":"isolation.beta.first","params":{}}"# + "\n"]
+                )
+                XCTAssertTrue(response.contains(#""id":"server-b-1""#), response)
+            } catch {
+                XCTFail("Server B first client failed: \(error.localizedDescription)")
+            }
+        }
+
+        let handlerAOverlapResult = handlerAEntered.wait(timeout: .now() + 2)
+        let handlerBOverlapResult = handlerBEntered.wait(timeout: .now() + 2)
+        releaseOverlappingHandlers.signal()
+        releaseOverlappingHandlers.signal()
+        XCTAssertEqual(handlerAOverlapResult, .success, "Server A handler must enter the overlap barrier")
+        XCTAssertEqual(handlerBOverlapResult, .success, "Server B handler must enter before either handler is released")
+        wait(for: [clientACompleted, firstClientBCompleted], timeout: 2)
+
+        let snapshotA = serverA.shutdownAndWait()
+        XCTAssertGreaterThanOrEqual(fcntl(listenerFDA, F_GETFD), 0, "Server A must not close the caller-owned listener")
+        XCTAssertGreaterThanOrEqual(fcntl(listenerFDB, F_GETFD), 0, "Server A shutdown must not close server B's caller-owned listener")
+
+        let secondResponseB = try cliMockSocketRoundTrip(
+            socketPath: socketPathB,
+            requestFragments: [#"{"id":"server-b-2","version":1,"method":"isolation.beta.second","params":{}}"# + "\n"]
+        )
+        XCTAssertTrue(secondResponseB.contains(#""id":"server-b-2""#), secondResponseB)
+        let snapshotB = serverB.shutdownAndWait()
+        XCTAssertGreaterThanOrEqual(fcntl(listenerFDB, F_GETFD), 0, "Server B must not close the caller-owned listener")
+
+        XCTAssertEqual(snapshotA.expectedConnections, 1, snapshotA.diagnostics)
+        XCTAssertEqual(snapshotA.optionalConnections, 0, snapshotA.diagnostics)
+        XCTAssertEqual(snapshotA.acceptedConnections, 1, snapshotA.diagnostics)
+        XCTAssertEqual(snapshotA.handledConnections, 1, snapshotA.diagnostics)
+        XCTAssertEqual(snapshotA.activeHandlers, 0, snapshotA.diagnostics)
+        XCTAssertEqual(snapshotA.framedRequests, 1, snapshotA.diagnostics)
+        XCTAssertEqual(snapshotA.methods, ["isolation.alpha"], snapshotA.diagnostics)
+        XCTAssertEqual(snapshotA.methodCounts, ["isolation.alpha": 1], snapshotA.diagnostics)
+        XCTAssertEqual(snapshotA.attemptedResponses, 1, snapshotA.diagnostics)
+        XCTAssertEqual(snapshotA.completedResponses, 1, snapshotA.diagnostics)
+        XCTAssertNil(snapshotA.terminalFailure, snapshotA.diagnostics)
+        XCTAssertTrue(snapshotA.listenerClosed, snapshotA.diagnostics)
+        XCTAssertTrue(snapshotA.acceptLoopFinished, snapshotA.diagnostics)
+
+        XCTAssertEqual(snapshotB.expectedConnections, 2, snapshotB.diagnostics)
+        XCTAssertEqual(snapshotB.optionalConnections, 0, snapshotB.diagnostics)
+        XCTAssertEqual(snapshotB.acceptedConnections, 2, snapshotB.diagnostics)
+        XCTAssertEqual(snapshotB.handledConnections, 2, snapshotB.diagnostics)
+        XCTAssertEqual(snapshotB.activeHandlers, 0, snapshotB.diagnostics)
+        XCTAssertEqual(snapshotB.framedRequests, 2, snapshotB.diagnostics)
+        XCTAssertEqual(snapshotB.methods, ["isolation.beta.first", "isolation.beta.second"], snapshotB.diagnostics)
+        XCTAssertEqual(snapshotB.methodCounts, ["isolation.beta.first": 1, "isolation.beta.second": 1], snapshotB.diagnostics)
+        XCTAssertEqual(snapshotB.attemptedResponses, 2, snapshotB.diagnostics)
+        XCTAssertEqual(snapshotB.completedResponses, 2, snapshotB.diagnostics)
+        XCTAssertNil(snapshotB.terminalFailure, snapshotB.diagnostics)
+        XCTAssertTrue(snapshotB.listenerClosed, snapshotB.diagnostics)
+        XCTAssertTrue(snapshotB.acceptLoopFinished, snapshotB.diagnostics)
+
+        let requestsA = stateA.snapshot().compactMap(jsonObject)
+        let requestsB = stateB.snapshot().compactMap(jsonObject)
+        XCTAssertEqual(requestsA.compactMap { $0["id"] as? String }, ["server-a-1"])
+        XCTAssertEqual(requestsA.compactMap { $0["method"] as? String }, ["isolation.alpha"])
+        XCTAssertEqual(requestsB.compactMap { $0["id"] as? String }, ["server-b-1", "server-b-2"])
+        XCTAssertEqual(requestsB.compactMap { $0["method"] as? String }, ["isolation.beta.first", "isolation.beta.second"])
+    }
+
     func testClaudePredecessorThenStaleStopSequenceDoesNotLoseMockSocketCompletion() throws {
         try testClaudeSessionStartRecordIsNotRestorableUntilPrompt()
         try testClaudeStaleStopFromClosedPaneStaysStaleWhenSurfaceResolutionFallsBack()
