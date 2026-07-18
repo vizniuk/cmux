@@ -38,13 +38,31 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         defer { context.cleanup() }
 
         let sessionId = "startup-only-session"
-        let start = runClaudeHook(
+        let scenarioServer = startMockServerObservingTraffic(
+            listenerFD: context.listenerFD,
+            state: context.state,
+            requiredConnections: 4
+        ) { line in
+            self.agentHookMockResponse(line: line, context: context)
+        }
+
+        let startCommandOffset = context.state.snapshot().count
+        let start = runClaudeHookProcess(
             context: context,
             arguments: ["hooks", "claude", "session-start"],
             standardInput: #"{"session_id":"\#(sessionId)","source":"startup","cwd":"\#(context.root.path)","transcript_path":"\#(context.root.path)/projects/startup-only-session.jsonl","hook_event_name":"SessionStart"}"#
         )
         XCTAssertFalse(start.timedOut, start.stderr)
         XCTAssertEqual(start.status, 0, start.stderr)
+        let startMethods = context.state.snapshot()
+            .dropFirst(startCommandOffset)
+            .compactMap { jsonObject($0)?["method"] as? String }
+        let startMethodCounts = Dictionary(grouping: startMethods, by: { $0 }).mapValues(\.count)
+        XCTAssertEqual(
+            startMethodCounts,
+            ["surface.list": 2, "feed.push": 1],
+            "Startup SessionStart should resolve routing through control frames and emit exactly one Feed frame before UserPromptSubmit; methods \(startMethods)"
+        )
 
         var record = try readClaudeHookSession(sessionId, context: context)
         XCTAssertEqual(
@@ -57,13 +75,26 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
             "\(context.root.path)/projects/startup-only-session.jsonl"
         )
 
-        let prompt = runClaudeHook(
+        let promptCommandOffset = context.state.snapshot().count
+        let prompt = runClaudeHookProcess(
             context: context,
             arguments: ["hooks", "claude", "prompt-submit"],
             standardInput: #"{"session_id":"\#(sessionId)","turn_id":"turn-1","cwd":"\#(context.root.path)","transcript_path":"\#(context.root.path)/projects/startup-only-session.jsonl","hook_event_name":"UserPromptSubmit"}"#
         )
         XCTAssertFalse(prompt.timedOut, prompt.stderr)
         XCTAssertEqual(prompt.status, 0, prompt.stderr)
+        let promptMethods = context.state.snapshot()
+            .dropFirst(promptCommandOffset)
+            .compactMap { jsonObject($0)?["method"] as? String }
+        let promptMethodCounts = Dictionary(grouping: promptMethods, by: { $0 }).mapValues(\.count)
+        XCTAssertEqual(
+            promptMethodCounts,
+            ["surface.list": 2, "feed.push": 1, "surface.resume.set": 1],
+            "UserPromptSubmit after a startup-only SessionStart should resolve routing, publish resume state, and emit exactly one Feed frame; methods \(promptMethods)"
+        )
+        let scenarioSnapshot = scenarioServer.shutdownAndWait(recordIncomplete: true)
+        XCTAssertEqual(scenarioSnapshot.acceptedConnections, 4, scenarioSnapshot.diagnostics)
+        XCTAssertEqual(scenarioSnapshot.handledConnections, 4, scenarioSnapshot.diagnostics)
 
         record = try readClaudeHookSession(sessionId, context: context)
         XCTAssertEqual(
@@ -7689,11 +7720,8 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         let sessionId = "codex-invalid-mapped-session"
 
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        var listenerClosed = false
         defer {
-            if !listenerClosed {
-                Darwin.close(listenerFD)
-            }
+            Darwin.close(listenerFD)
             unlink(socketPath)
             try? FileManager.default.removeItem(at: root)
         }
@@ -7715,7 +7743,12 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         ]
         try JSONSerialization.data(withJSONObject: store, options: [.prettyPrinted]).write(to: storeURL, options: .atomic)
 
-        let serverHandled = startMockServer(listenerFD: listenerFD, state: state) { line in
+        let server = startMockServerObservingTraffic(
+            listenerFD: listenerFD,
+            state: state,
+            requiredConnections: 0
+        ) { line in
+            XCTFail("Invalid mapped workspace must not open the mock socket; method \(self.jsonObject(line)?["method"] as? String ?? "non-json")")
             guard let payload = self.jsonObject(line) else {
                 return line.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{")
                     ? self.malformedRequestResponse(raw: line)
@@ -7750,12 +7783,11 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
             timeout: 5
         )
 
-        Darwin.close(listenerFD)
-        listenerClosed = true
-        wait(for: [serverHandled], timeout: 5)
+        let snapshot = server.shutdownAndWait()
         XCTAssertFalse(result.timedOut, result.stderr)
         XCTAssertEqual(result.status, 0, result.stderr)
         XCTAssertEqual(result.stdout, "{}\n")
+        XCTAssertEqual(snapshot.acceptedConnections, 0, snapshot.diagnostics)
         XCTAssertFalse(
             state.commands.contains { $0.contains("set_status codex Running") || $0.contains("notify_target_async") },
             "Invalid mapped workspace must not mutate the selected workspace, saw \(state.commands)"
@@ -8804,27 +8836,29 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         context: ClaudeHookContext,
         arguments: [String],
         standardInput: String,
+        expectedConnections: Int = 2,
         extraEnvironment: [String: String] = [:]
     ) -> ProcessRunResult {
-        let serverHandled = startMockServer(listenerFD: context.listenerFD, state: context.state, connectionCount: 2) { line in
-            guard let payload = self.jsonObject(line) else {
-                return "OK"
-            }
-            guard let id = payload["id"] as? String, let method = payload["method"] as? String else {
-                return self.malformedRequestResponse(id: payload["id"] as? String, raw: line)
-            }
-            switch method {
-            case "surface.list":
-                return self.surfaceListResponse(id: id, surfaceId: context.surfaceId)
-            case "feed.push":
-                return self.v2Response(id: id, ok: true, result: [:])
-            case "surface.resume.clear":
-                return self.v2Response(id: id, ok: true, result: ["cleared": true])
-            default:
-                return self.v2Response(id: id, ok: false, error: ["code": "unrecognized_method", "message": "unexpected method: \(method)"])
-            }
+        let serverHandled = startMockServer(listenerFD: context.listenerFD, state: context.state, connectionCount: expectedConnections) { line in
+            self.agentHookMockResponse(line: line, context: context)
         }
 
+        let result = runClaudeHookProcess(
+            context: context,
+            arguments: arguments,
+            standardInput: standardInput,
+            extraEnvironment: extraEnvironment
+        )
+        wait(for: [serverHandled], timeout: 5)
+        return result
+    }
+
+    private func runClaudeHookProcess(
+        context: ClaudeHookContext,
+        arguments: [String],
+        standardInput: String,
+        extraEnvironment: [String: String] = [:]
+    ) -> ProcessRunResult {
         var environment = [
             "HOME": context.root.path,
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
@@ -8846,7 +8880,6 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
             standardInput: standardInput,
             timeout: 5
         )
-        wait(for: [serverHandled], timeout: 5)
         return result
     }
 

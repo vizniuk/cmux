@@ -581,8 +581,22 @@ extension CLINotifyProcessIntegrationRegressionTests {
             "CMUX_CLI_SENTRY_DISABLED": "1",
         ]
 
+        startDetachedMockServer(listenerFD: listenerFD, state: state, connectionCount: 128) { line in
+            guard let payload = self.jsonObject(line) else { return "OK" }
+            guard let id = payload["id"] as? String, let method = payload["method"] as? String else {
+                return self.malformedRequestResponse(id: payload["id"] as? String, raw: line)
+            }
+            switch method {
+            case "surface.list":
+                return self.surfaceListResponse(id: id, surfaceId: surfaceId)
+            case "feed.push":
+                return self.v2Response(id: id, ok: true, result: [:])
+            default:
+                return self.v2Response(id: id, ok: true, result: [:])
+            }
+        }
+
         func runHermesHook(_ subcommand: String, input: String) -> ProcessRunResult {
-            let serverHandled = startAgentHookMockServer(listenerFD: listenerFD, state: state, surfaceId: surfaceId, connectionCount: 4)
             let result = runProcess(
                 executablePath: cliPath,
                 arguments: ["hooks", "hermes-agent", subcommand],
@@ -590,7 +604,6 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 standardInput: input,
                 timeout: 5
             )
-            wait(for: [serverHandled], timeout: 5)
             return result
         }
 
@@ -731,23 +744,29 @@ extension CLINotifyProcessIntegrationRegressionTests {
             "CMUX_CLI_SENTRY_DISABLED": "1",
         ]
 
-        func runHermesHook(_ subcommand: String, input: String) -> ProcessRunResult {
-            let serverHandled = startMockServer(listenerFD: listenerFD, state: state) { line in
-                guard let payload = self.jsonObject(line) else {
-                    return "OK"
-                }
-                guard let id = payload["id"] as? String, let method = payload["method"] as? String else {
-                    return self.malformedRequestResponse(id: payload["id"] as? String, raw: line)
-                }
-                switch method {
-                case "surface.list":
-                    return self.surfaceListResponse(id: id, surfaceId: surfaceId)
-                case "feed.push":
-                    return self.v2Response(id: id, ok: true, result: [:])
-                default:
-                    return self.v2Response(id: id, ok: false, error: ["code": "unrecognized_method", "message": "unexpected method: \(method)"])
-                }
+        let server = startMockServerObservingTraffic(
+            listenerFD: listenerFD,
+            state: state,
+            requiredConnections: 0,
+            optionalConnections: 128
+        ) { line in
+            guard let payload = self.jsonObject(line) else {
+                return "OK"
             }
+            guard let id = payload["id"] as? String, let method = payload["method"] as? String else {
+                return self.malformedRequestResponse(id: payload["id"] as? String, raw: line)
+            }
+            switch method {
+            case "surface.list":
+                return self.surfaceListResponse(id: id, surfaceId: surfaceId)
+            case "feed.push":
+                return self.v2Response(id: id, ok: true, result: [:])
+            default:
+                return self.v2Response(id: id, ok: false, error: ["code": "unrecognized_method", "message": "unexpected method: \(method)"])
+            }
+        }
+
+        func runHermesHook(_ subcommand: String, input: String) -> ProcessRunResult {
             let result = runProcess(
                 executablePath: cliPath,
                 arguments: ["hooks", "hermes-agent", subcommand],
@@ -755,7 +774,6 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 standardInput: input,
                 timeout: 5
             )
-            wait(for: [serverHandled], timeout: 5)
             return result
         }
 
@@ -845,6 +863,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
             try storedHermesSessionIfPresent(),
             "Hermes on_session_finalize is a true teardown and must consume the restore record"
         )
+        _ = server.shutdownAndWait()
     }
 
     func testAntigravityHookInstallUsesNativeHooksJSONShape() throws {
@@ -1147,11 +1166,30 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 unlink(socketPath)
                 try? FileManager.default.removeItem(at: root)
             }
-            let serverHandled = startMockServer(listenerFD: listenerFD, state: state) { line in
-                guard let payload = self.jsonObject(line), let id = payload["id"] as? String else {
-                    return self.malformedRequestResponse(raw: line)
+            let expectsFeed = tool != "fs_read"
+            let server: MockSocketServerHandle?
+            let serverHandled: XCTestExpectation?
+            if expectsFeed {
+                server = nil
+                serverHandled = startMockServer(listenerFD: listenerFD, state: state) { line in
+                    guard let payload = self.jsonObject(line), let id = payload["id"] as? String else {
+                        return self.malformedRequestResponse(raw: line)
+                    }
+                    return self.v2Response(id: id, ok: true, result: ["status": "acknowledged"])
                 }
-                return self.v2Response(id: id, ok: true, result: ["status": "acknowledged"])
+            } else {
+                server = startMockServerObservingTraffic(
+                    listenerFD: listenerFD,
+                    state: state,
+                    requiredConnections: 0
+                ) { line in
+                    XCTFail("Kiro read-only suppression should not open the mock socket; method \(self.jsonObject(line)?["method"] as? String ?? "non-json")")
+                    guard let payload = self.jsonObject(line), let id = payload["id"] as? String else {
+                        return self.malformedRequestResponse(raw: line)
+                    }
+                    return self.v2Response(id: id, ok: true, result: ["status": "acknowledged"])
+                }
+                serverHandled = nil
             }
             let result = runProcess(
                 executablePath: cliPath,
@@ -1173,11 +1211,13 @@ extension CLINotifyProcessIntegrationRegressionTests {
             XCTAssertFalse(result.timedOut, "\(tool): \(result.stderr)")
             XCTAssertEqual(result.status, 0, "\(tool): \(result.stderr)")
             XCTAssertEqual(result.stdout, "{}\n", "\(tool) stdout")
-            // A non-suppressed event sends one feed.push, so wait for the
-            // server to record it (generous timeout to avoid flaking on the
-            // socket/process round-trip under CI load). A suppressed event
-            // sends nothing, so this wait simply times out silently.
-            _ = XCTWaiter().wait(for: [serverHandled], timeout: 5)
+            if let serverHandled {
+                wait(for: [serverHandled], timeout: 5)
+            }
+            if let server {
+                let snapshot = server.shutdownAndWait()
+                XCTAssertEqual(snapshot.acceptedConnections, 0, snapshot.diagnostics)
+            }
             return state.commands.filter { $0.contains("feed.push") }.count
         }
 
@@ -1937,35 +1977,41 @@ extension CLINotifyProcessIntegrationRegressionTests {
             "GROK_HOME": grokHome.path,
         ]
 
-        func runGrokHook(_ subcommand: String, input: String, surfaceId: String) -> ProcessRunResult {
-            let serverHandled = startMockServer(listenerFD: listenerFD, state: state) { line in
-                guard let payload = self.jsonObject(line) else {
-                    return "OK"
-                }
-                guard let id = payload["id"] as? String, let method = payload["method"] as? String else {
-                    return self.malformedRequestResponse(id: payload["id"] as? String, raw: line)
-                }
-                switch method {
-                case "surface.list":
-                    return self.v2Response(
-                        id: id,
-                        ok: true,
-                        result: [
-                            "surfaces": surfaceIds.enumerated().map { index, listedSurfaceId in
-                                [
-                                    "id": listedSurfaceId,
-                                    "ref": "surface:\(index + 1)",
-                                    "focused": listedSurfaceId == surfaceId,
-                                ] as [String: Any]
-                            },
-                        ]
-                    )
-                case "feed.push":
-                    return self.v2Response(id: id, ok: true, result: [:])
-                default:
-                    return self.v2Response(id: id, ok: false, error: ["code": "unrecognized_method", "message": "unexpected method: \(method)"])
-                }
+        let server = startMockServerObservingTraffic(
+            listenerFD: listenerFD,
+            state: state,
+            requiredConnections: 0,
+            optionalConnections: 128
+        ) { line in
+            guard let payload = self.jsonObject(line) else {
+                return "OK"
             }
+            guard let id = payload["id"] as? String, let method = payload["method"] as? String else {
+                return self.malformedRequestResponse(id: payload["id"] as? String, raw: line)
+            }
+            switch method {
+            case "surface.list":
+                return self.v2Response(
+                    id: id,
+                    ok: true,
+                    result: [
+                        "surfaces": surfaceIds.enumerated().map { index, listedSurfaceId in
+                            [
+                                "id": listedSurfaceId,
+                                "ref": "surface:\(index + 1)",
+                                "focused": false,
+                            ] as [String: Any]
+                        },
+                    ]
+                )
+            case "feed.push":
+                return self.v2Response(id: id, ok: true, result: [:])
+            default:
+                return self.v2Response(id: id, ok: false, error: ["code": "unrecognized_method", "message": "unexpected method: \(method)"])
+            }
+        }
+
+        func runGrokHook(_ subcommand: String, input: String, surfaceId: String) -> ProcessRunResult {
             var environment = baseEnvironment
             environment["CMUX_SURFACE_ID"] = surfaceId
             let result = runProcess(
@@ -1975,7 +2021,6 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 standardInput: input,
                 timeout: 5
             )
-            wait(for: [serverHandled], timeout: 5)
             return result
         }
 
@@ -2082,6 +2127,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 "Internal Grok Notification after Stop fallback must not double-notify thread \(thread.index), saw \(notificationCommands)"
             )
         }
+        _ = server.shutdownAndWait()
     }
 
     func testGrokStopNotificationFallsBackWhenTranscriptCwdIsUnavailable() throws {

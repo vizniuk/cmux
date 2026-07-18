@@ -88,20 +88,66 @@ extension CMUXOpenCommandTests {
 }
 
 extension CLINotifyProcessIntegrationRegressionTests {
+    struct MockSocketServerSnapshot: Sendable {
+        let expectedConnections: Int
+        let optionalConnections: Int
+        let acceptedConnections: Int
+        let handledConnections: Int
+        let activeHandlers: Int
+        let framedRequests: Int
+        let methods: [String]
+        let methodCounts: [String: Int]
+        let attemptedResponses: Int
+        let completedResponses: Int
+        let terminalFailure: String?
+        let listenerClosed: Bool
+        let acceptLoopFinished: Bool
+        let diagnostics: String
+    }
+
+    final class MockSocketServerHandle: @unchecked Sendable {
+        private let server: DeterministicMockSocketServer
+
+        fileprivate init(server: DeterministicMockSocketServer) {
+            self.server = server
+        }
+
+        @discardableResult
+        func shutdownAndWait(
+            recordIncomplete: Bool = true,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) -> MockSocketServerSnapshot {
+            server.shutdownAndWait(recordIncomplete: recordIncomplete, file: file, line: line)
+        }
+
+        func snapshot() -> MockSocketServerSnapshot {
+            server.snapshot()
+        }
+    }
+
     // Protects a test-owned DispatchGroup and duplicated listener FD lifecycle
     // driven by blocking Darwin socket calls on a background queue. The caller's
     // listener remains reusable while this object owns and joins its accept loop.
-    private final class DeterministicMockSocketServer: @unchecked Sendable {
+    fileprivate final class DeterministicMockSocketServer: @unchecked Sendable {
         private let lock = NSLock()
         private let group = DispatchGroup()
         private let handlerGroup = DispatchGroup()
+        private let acceptQueue = DispatchQueue(
+            label: "com.cmux.tests.cli-mock-socket.accept",
+            qos: .userInitiated
+        )
         private let handlerQueue = DispatchQueue(
             label: "com.cmux.tests.cli-mock-socket.handler",
             qos: .userInitiated,
             attributes: .concurrent
         )
+        // The server owns exactly one duplicated listener descriptor. The test
+        // retains ownership of the original descriptor returned by bindUnixSocket.
         private let listenerFD: Int32
         private let expectedConnections: Int
+        private let optionalConnections: Int
+        private let stopAfterAllowedConnections: Bool
         private let state: MockSocketServerState
         private let strictConnectionCount: Bool
         private let fulfillWhen: (@Sendable (String) -> Bool)?
@@ -117,6 +163,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
         private var activeHandlers = 0
         private var activeClientFDs = Set<Int32>()
         private var observedMethods: [String] = []
+        private var observedMethodCounts: [String: Int] = [:]
         private var lastStage = "created"
         private var terminalFailure: String?
         private var terminalCompletionObserved = false
@@ -128,6 +175,8 @@ extension CLINotifyProcessIntegrationRegressionTests {
         init(
             listenerFD: Int32,
             expectedConnections: Int,
+            optionalConnections: Int = 0,
+            stopAfterAllowedConnections: Bool = true,
             state: MockSocketServerState,
             strictConnectionCount: Bool,
             handled: XCTestExpectation?,
@@ -145,7 +194,9 @@ extension CLINotifyProcessIntegrationRegressionTests {
             }
 
             self.listenerFD = duplicatedListenerFD
-            self.expectedConnections = max(1, expectedConnections)
+            self.expectedConnections = max(0, expectedConnections)
+            self.optionalConnections = max(0, optionalConnections)
+            self.stopAfterAllowedConnections = stopAfterAllowedConnections
             self.state = state
             self.strictConnectionCount = strictConnectionCount
             self.handled = handled
@@ -160,28 +211,32 @@ extension CLINotifyProcessIntegrationRegressionTests {
 
         func start() {
             group.enter()
-            DispatchQueue.global(qos: .userInitiated).async {
+            acceptQueue.async {
                 self.runAcceptLoop()
                 self.group.leave()
             }
         }
 
-        func shutdownAndWait(recordIncomplete: Bool, file: StaticString = #filePath, line: UInt = #line) {
+        @discardableResult
+        func shutdownAndWait(recordIncomplete: Bool, file: StaticString = #filePath, line: UInt = #line) -> MockSocketServerSnapshot {
             requestStop(stage: "teardown")
             if group.wait(timeout: .now() + 2) == .timedOut {
                 XCTFail("cli mock socket teardown timeout; \(safeDiagnostics())", file: file, line: line)
-                return
+                return snapshot()
             }
             if recordIncomplete && !isComplete {
                 XCTFail("cli mock socket incomplete at teardown; \(safeDiagnostics())", file: file, line: line)
             }
+            return snapshot()
         }
 
         private var isComplete: Bool {
             lock.lock()
             defer { lock.unlock() }
-            let reachedConnectionCount = acceptedConnections == expectedConnections
-                && handledConnections == expectedConnections
+            let allowedConnections = maximumAllowedConnections
+            let reachedConnectionCount = acceptedConnections >= expectedConnections
+                && acceptedConnections <= allowedConnections
+                && handledConnections == acceptedConnections
             return terminalFailure == nil
                 && reachedConnectionCount
                 && activeHandlers == 0
@@ -197,9 +252,12 @@ extension CLINotifyProcessIntegrationRegressionTests {
 
             while true {
                 lock.lock()
+                let stopBoundaryConnections = expectedConnections + optionalConnections
+                let reachedAllowedConnectionCount = stopAfterAllowedConnections
+                    && acceptedConnections >= stopBoundaryConnections
                 let shouldStop = isStopping
                     || terminalFailure != nil
-                    || acceptedConnections >= expectedConnections
+                    || reachedAllowedConnectionCount
                 lock.unlock()
                 if shouldStop { break }
 
@@ -226,6 +284,16 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 }
 
                 recordAcceptedConnection()
+                let acceptedNow = acceptedConnectionsSnapshot
+                let allowedConnections = maximumAllowedConnections
+                if acceptedNow > allowedConnections {
+                    recordTerminalFailure(
+                        stage: "connection-count",
+                        detail: "accepted=\(acceptedNow)>allowed=\(allowedConnections)"
+                    )
+                    Darwin.close(clientFD)
+                    break
+                }
                 startConnectionHandler(clientFD)
             }
 
@@ -234,10 +302,20 @@ extension CLINotifyProcessIntegrationRegressionTests {
             fulfillHandledIfCompleteOrFailed()
         }
 
+        private var acceptedConnectionsSnapshot: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return acceptedConnections
+        }
+
         private var isStoppingSnapshot: Bool {
             lock.lock()
             defer { lock.unlock() }
             return isStopping
+        }
+
+        private var maximumAllowedConnections: Int {
+            strictConnectionCount ? expectedConnections + optionalConnections : Int.max
         }
 
         private func startConnectionHandler(_ clientFD: Int32) {
@@ -248,6 +326,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 self.handleConnection(clientFD)
                 self.recordHandlerFinished()
                 self.handlerGroup.leave()
+                self.fulfillHandledIfCompleteOrFailed()
             }
         }
 
@@ -291,7 +370,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
                     }
 
                     if Self.isOneWayFeedTelemetry(line) {
-                        recordStage("request.one-way-feed")
+                        recordStage("request.one-way")
                         continue
                     }
 
@@ -357,7 +436,10 @@ extension CLINotifyProcessIntegrationRegressionTests {
             lock.unlock()
 
             guard shouldClose else { return }
-            _ = Darwin.shutdown(listenerFD, SHUT_RDWR)
+            // Do not call shutdown() on the duplicated listener. A duplicated
+            // descriptor references the same socket as the caller-owned listener,
+            // so shutdown would poison subsequent prompt-owned servers that reuse
+            // the original listener inside one test.
             Darwin.close(listenerFD)
         }
 
@@ -370,11 +452,12 @@ extension CLINotifyProcessIntegrationRegressionTests {
         private func fulfillHandledIfCompleteOrFailed() {
             let expectation: XCTestExpectation?
             lock.lock()
+            let allowedConnections = maximumAllowedConnections
             let shouldFulfill = terminalFailure != nil
-                || (acceptedConnections == expectedConnections
-                    && handledConnections == expectedConnections
-                    && activeHandlers == 0
-                    && acceptLoopFinished)
+                || (acceptedConnections >= expectedConnections
+                    && acceptedConnections <= allowedConnections
+                    && handledConnections == acceptedConnections
+                    && activeHandlers == 0)
             if didFulfill || !shouldFulfill {
                 expectation = nil
             } else {
@@ -388,11 +471,12 @@ extension CLINotifyProcessIntegrationRegressionTests {
         private func finishAcceptLoop() {
             lock.lock()
             acceptLoopFinished = true
-            if terminalFailure == nil,
-               !isStopping,
-               acceptedConnections != expectedConnections {
-                terminalFailure = "connection-count"
-                lastStage = "connection-count"
+            if terminalFailure == nil {
+                let allowedConnections = maximumAllowedConnections
+                if acceptedConnections < expectedConnections || acceptedConnections > allowedConnections {
+                    terminalFailure = "connection-count"
+                    lastStage = "connection-count"
+                }
             }
             lock.unlock()
             closeListener()
@@ -451,6 +535,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
             lock.lock()
             framedRequests += 1
             observedMethods.append(method)
+            observedMethodCounts[method, default: 0] += 1
             lastStage = "request.framed"
             lock.unlock()
         }
@@ -477,8 +562,10 @@ extension CLINotifyProcessIntegrationRegressionTests {
 
         private func recordTerminalFailure(stage: String, detail: String) {
             lock.lock()
-            terminalFailure = "\(stage):\(detail)"
-            lastStage = stage
+            if terminalFailure == nil {
+                terminalFailure = "\(stage):\(detail)"
+                lastStage = stage
+            }
             lock.unlock()
         }
 
@@ -495,11 +582,40 @@ extension CLINotifyProcessIntegrationRegressionTests {
         /// names only so failing hook tests cannot leak private user content.
         private func safeDiagnostics() -> String {
             lock.lock()
+            let summary = safeDiagnosticsLocked()
+            lock.unlock()
+            return summary
+        }
+
+        func snapshot() -> MockSocketServerSnapshot {
+            lock.lock()
+            let snapshot = MockSocketServerSnapshot(
+                expectedConnections: expectedConnections,
+                optionalConnections: optionalConnections,
+                acceptedConnections: acceptedConnections,
+                handledConnections: handledConnections,
+                activeHandlers: activeHandlers,
+                framedRequests: framedRequests,
+                methods: observedMethods,
+                methodCounts: observedMethodCounts,
+                attemptedResponses: attemptedResponses,
+                completedResponses: completedResponses,
+                terminalFailure: terminalFailure,
+                listenerClosed: listenerClosed,
+                acceptLoopFinished: acceptLoopFinished,
+                diagnostics: safeDiagnosticsLocked()
+            )
+            lock.unlock()
+            return snapshot
+        }
+
+        private func safeDiagnosticsLocked() -> String {
             let elapsed = Date().timeIntervalSince(startedAt)
             let methods = observedMethods.joined(separator: ",")
-            let summary = [
+            return [
                 "stage=\(lastStage)",
                 "expectedConnections=\(expectedConnections)",
+                "optionalConnections=\(optionalConnections)",
                 "acceptedConnections=\(acceptedConnections)",
                 "handledConnections=\(handledConnections)",
                 "activeHandlers=\(activeHandlers)",
@@ -513,8 +629,6 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 "terminalFailure=\(terminalFailure ?? "none")",
                 "elapsed=\(String(format: "%.3f", elapsed))s",
             ].joined(separator: " ")
-            lock.unlock()
-            return summary
         }
 
         private static func safeMethodName(from line: String) -> String {
@@ -576,6 +690,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
         let server = DeterministicMockSocketServer(
             listenerFD: listenerFD,
             expectedConnections: connectionCount,
+            stopAfterAllowedConnections: false,
             state: state,
             strictConnectionCount: strictConnectionCount,
             handled: handled,
@@ -589,6 +704,40 @@ extension CLINotifyProcessIntegrationRegressionTests {
         return handled
     }
 
+    /// Starts a mock socket whose success is decided at explicit shutdown rather
+    /// than by the first accepted connection. This is the harness boundary used
+    /// when a CLI path may legally send no traffic, may optionally send a Feed
+    /// frame, or must prove from method counters that a method never appeared.
+    /// The accept loop stays open until shutdown so zero-traffic tests observe
+    /// unexpected socket traffic while the child is running. Diagnostics expose
+    /// method names and lifecycle counters only; request bodies stay out of the
+    /// snapshot and teardown messages.
+    func startMockServerObservingTraffic(
+        listenerFD: Int32,
+        state: MockSocketServerState,
+        requiredConnections: Int,
+        optionalConnections: Int = 0,
+        handler: @escaping @Sendable (String) -> String?
+    ) -> MockSocketServerHandle {
+        let server = DeterministicMockSocketServer(
+            listenerFD: listenerFD,
+            expectedConnections: requiredConnections,
+            optionalConnections: optionalConnections,
+            stopAfterAllowedConnections: false,
+            state: state,
+            strictConnectionCount: true,
+            handled: nil,
+            fulfillWhen: nil,
+            handler: handler
+        )
+        server.start()
+        let handle = MockSocketServerHandle(server: server)
+        addTeardownBlock {
+            handle.shutdownAndWait(recordIncomplete: true)
+        }
+        return handle
+    }
+
     func startDetachedMockServer(
         listenerFD: Int32,
         state: MockSocketServerState,
@@ -598,6 +747,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
         let server = DeterministicMockSocketServer(
             listenerFD: listenerFD,
             expectedConnections: connectionCount,
+            stopAfterAllowedConnections: false,
             state: state,
             strictConnectionCount: false,
             handled: nil,
