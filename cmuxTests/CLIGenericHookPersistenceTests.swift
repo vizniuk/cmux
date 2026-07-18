@@ -581,7 +581,11 @@ extension CLINotifyProcessIntegrationRegressionTests {
             "CMUX_CLI_SENTRY_DISABLED": "1",
         ]
 
-        startDetachedMockServer(listenerFD: listenerFD, state: state, connectionCount: 128) { line in
+        let server = startMockServerObservingTraffic(
+            listenerFD: listenerFD,
+            state: state,
+            requiredConnections: 5
+        ) { line in
             guard let payload = self.jsonObject(line) else { return "OK" }
             guard let id = payload["id"] as? String, let method = payload["method"] as? String else {
                 return self.malformedRequestResponse(id: payload["id"] as? String, raw: line)
@@ -589,10 +593,17 @@ extension CLINotifyProcessIntegrationRegressionTests {
             switch method {
             case "surface.list":
                 return self.surfaceListResponse(id: id, surfaceId: surfaceId)
-            case "feed.push":
-                return self.v2Response(id: id, ok: true, result: [:])
+            case "system.top":
+                return self.v2Response(id: id, ok: true, result: ["windows": []])
+            case "surface.resume.set":
+                return self.v2Response(id: id, ok: true, result: ["resume_binding": [:]])
             default:
-                return self.v2Response(id: id, ok: true, result: [:])
+                XCTFail("Hermes extra-payload scenario received unexpected method \(method)")
+                return self.v2Response(
+                    id: id,
+                    ok: false,
+                    error: ["code": "unrecognized_method", "message": "unexpected method: \(method)"]
+                )
             }
         }
 
@@ -703,6 +714,30 @@ extension CLINotifyProcessIntegrationRegressionTests {
         XCTAssertNil(responseSession["lastBody"])
         XCTAssertNil(responseSession["lastNotificationStatus"])
         XCTAssertEqual(responseSession["runtimeStatus"] as? String, "running")
+
+        let snapshot = server.shutdownAndWait()
+        XCTAssertEqual(snapshot.expectedConnections, 5, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.optionalConnections, 0, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.acceptedConnections, 5, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.handledConnections, 5, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.activeHandlers, 0, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.framedRequests, 33, snapshot.diagnostics)
+        XCTAssertEqual(
+            snapshot.methodCounts,
+            [
+                "surface.list": 12,
+                "system.top": 4,
+                "surface.resume.set": 3,
+                "feed.push": 1,
+                "non-json": 13,
+            ],
+            snapshot.diagnostics
+        )
+        XCTAssertEqual(snapshot.attemptedResponses, 32, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.completedResponses, snapshot.attemptedResponses, snapshot.diagnostics)
+        XCTAssertNil(snapshot.terminalFailure, snapshot.diagnostics)
+        XCTAssertTrue(snapshot.listenerClosed, snapshot.diagnostics)
+        XCTAssertTrue(snapshot.acceptLoopFinished, snapshot.diagnostics)
     }
 
     func testHermesAgentSessionEndIsTurnBoundaryButFinalizeTearsDown() throws {
@@ -747,8 +782,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
         let server = startMockServerObservingTraffic(
             listenerFD: listenerFD,
             state: state,
-            requiredConnections: 0,
-            optionalConnections: 128
+            requiredConnections: 6
         ) { line in
             guard let payload = self.jsonObject(line) else {
                 return "OK"
@@ -759,9 +793,14 @@ extension CLINotifyProcessIntegrationRegressionTests {
             switch method {
             case "surface.list":
                 return self.surfaceListResponse(id: id, surfaceId: surfaceId)
-            case "feed.push":
-                return self.v2Response(id: id, ok: true, result: [:])
+            case "system.top":
+                return self.v2Response(id: id, ok: true, result: ["windows": []])
+            case "surface.resume.set":
+                return self.v2Response(id: id, ok: true, result: ["resume_binding": [:]])
+            case "surface.resume.clear":
+                return self.v2Response(id: id, ok: true, result: ["cleared": true])
             default:
+                XCTFail("Hermes SessionEnd/Finalize scenario received unexpected method \(method)")
                 return self.v2Response(id: id, ok: false, error: ["code": "unrecognized_method", "message": "unexpected method: \(method)"])
             }
         }
@@ -863,7 +902,30 @@ extension CLINotifyProcessIntegrationRegressionTests {
             try storedHermesSessionIfPresent(),
             "Hermes on_session_finalize is a true teardown and must consume the restore record"
         )
-        _ = server.shutdownAndWait()
+        let snapshot = server.shutdownAndWait()
+        XCTAssertEqual(snapshot.expectedConnections, 6, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.optionalConnections, 0, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.acceptedConnections, 6, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.handledConnections, 6, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.activeHandlers, 0, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.framedRequests, 24, snapshot.diagnostics)
+        XCTAssertEqual(
+            snapshot.methodCounts,
+            [
+                "surface.list": 10,
+                "system.top": 2,
+                "surface.resume.set": 2,
+                "surface.resume.clear": 1,
+                "feed.push": 2,
+                "non-json": 7,
+            ],
+            snapshot.diagnostics
+        )
+        XCTAssertEqual(snapshot.attemptedResponses, 22, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.completedResponses, snapshot.attemptedResponses, snapshot.diagnostics)
+        XCTAssertNil(snapshot.terminalFailure, snapshot.diagnostics)
+        XCTAssertTrue(snapshot.listenerClosed, snapshot.diagnostics)
+        XCTAssertTrue(snapshot.acceptLoopFinished, snapshot.diagnostics)
     }
 
     func testAntigravityHookInstallUsesNativeHooksJSONShape() throws {
@@ -1980,8 +2042,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
         let server = startMockServerObservingTraffic(
             listenerFD: listenerFD,
             state: state,
-            requiredConnections: 0,
-            optionalConnections: 128
+            requiredConnections: 20
         ) { line in
             guard let payload = self.jsonObject(line) else {
                 return "OK"
@@ -2004,9 +2065,18 @@ extension CLINotifyProcessIntegrationRegressionTests {
                         },
                     ]
                 )
-            case "feed.push":
-                return self.v2Response(id: id, ok: true, result: [:])
+            case "system.top":
+                return self.v2Response(id: id, ok: true, result: ["windows": []])
+            case "surface.resume.set":
+                return self.v2Response(id: id, ok: true, result: ["resume_binding": [:]])
+            case "workspace.set_auto_title":
+                return self.v2Response(
+                    id: id,
+                    ok: true,
+                    result: ["enabled": false, "workspace_user_owned": false]
+                )
             default:
+                XCTFail("Grok concurrent-thread scenario received unexpected method \(method)")
                 return self.v2Response(id: id, ok: false, error: ["code": "unrecognized_method", "message": "unexpected method: \(method)"])
             }
         }
@@ -2127,7 +2197,30 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 "Internal Grok Notification after Stop fallback must not double-notify thread \(thread.index), saw \(notificationCommands)"
             )
         }
-        _ = server.shutdownAndWait()
+        let snapshot = server.shutdownAndWait()
+        XCTAssertEqual(snapshot.expectedConnections, 20, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.optionalConnections, 0, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.acceptedConnections, 20, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.handledConnections, 20, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.activeHandlers, 0, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.framedRequests, 77, snapshot.diagnostics)
+        XCTAssertEqual(
+            snapshot.methodCounts,
+            [
+                "surface.list": 30,
+                "system.top": 10,
+                "surface.resume.set": 6,
+                "workspace.set_auto_title": 2,
+                "feed.push": 10,
+                "non-json": 19,
+            ],
+            snapshot.diagnostics
+        )
+        XCTAssertEqual(snapshot.attemptedResponses, 67, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.completedResponses, snapshot.attemptedResponses, snapshot.diagnostics)
+        XCTAssertNil(snapshot.terminalFailure, snapshot.diagnostics)
+        XCTAssertTrue(snapshot.listenerClosed, snapshot.diagnostics)
+        XCTAssertTrue(snapshot.acceptLoopFinished, snapshot.diagnostics)
     }
 
     func testGrokStopNotificationFallsBackWhenTranscriptCwdIsUnavailable() throws {
