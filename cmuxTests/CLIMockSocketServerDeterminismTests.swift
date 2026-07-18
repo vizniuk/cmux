@@ -224,6 +224,98 @@ extension CLINotifyProcessIntegrationRegressionTests {
         XCTAssertEqual(state.snapshot(), ["second-request"])
     }
 
+    func testMockSocketServerTreatsZeroExpectedConnectionsAsNoTrafficContract() throws {
+        let socketPath = makeSocketPath("zero-traffic")
+        let listenerFD = try bindUnixSocket(at: socketPath)
+        defer {
+            Darwin.close(listenerFD)
+            unlink(socketPath)
+        }
+
+        let state = MockSocketServerState()
+        let server = startMockServerObservingTraffic(
+            listenerFD: listenerFD,
+            state: state,
+            requiredConnections: 0
+        ) { line in
+            XCTFail("Zero-traffic mock socket accepted unexpected method \(self.jsonObject(line)?["method"] as? String ?? "non-json")")
+            return nil
+        }
+
+        let snapshot = server.shutdownAndWait()
+        XCTAssertEqual(snapshot.expectedConnections, 0, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.acceptedConnections, 0, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.handledConnections, 0, snapshot.diagnostics)
+        XCTAssertEqual(state.snapshot(), [])
+    }
+
+    func testMockSocketServerCompletesRequiredControlWhenOptionalFeedIsAbsent() throws {
+        let socketPath = makeSocketPath("optional-feed-absent")
+        let listenerFD = try bindUnixSocket(at: socketPath)
+        defer {
+            Darwin.close(listenerFD)
+            unlink(socketPath)
+        }
+
+        let state = MockSocketServerState()
+        let server = startMockServerObservingTraffic(
+            listenerFD: listenerFD,
+            state: state,
+            requiredConnections: 1,
+            optionalConnections: 1
+        ) { line in
+            self.claudeStyleResponse(line: line, surfaceId: "surface-optional-feed-absent")
+        }
+
+        let response = try cliMockSocketRoundTrip(
+            socketPath: socketPath,
+            requestFragments: [surfaceListLine(id: "required-control")]
+        )
+        XCTAssertTrue(response.contains(#""id":"required-control""#), response)
+        let snapshot = server.shutdownAndWait()
+        XCTAssertEqual(snapshot.acceptedConnections, 1, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.handledConnections, 1, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.methodCounts["surface.list"] ?? 0, 1, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.methodCounts["feed.push"] ?? 0, 0, snapshot.diagnostics)
+        XCTAssertEqual(observedMethods(in: state), ["surface.list"])
+    }
+
+    func testMockSocketServerObservesForbiddenFeedAbsenceWithoutPolling() throws {
+        let socketPath = makeSocketPath("forbidden-feed-absent")
+        let listenerFD = try bindUnixSocket(at: socketPath)
+        defer {
+            Darwin.close(listenerFD)
+            unlink(socketPath)
+        }
+
+        let state = MockSocketServerState()
+        let server = startMockServerObservingTraffic(
+            listenerFD: listenerFD,
+            state: state,
+            requiredConnections: 1,
+            optionalConnections: 1
+        ) { line in
+            self.claudeStyleResponse(line: line, surfaceId: "surface-forbidden-feed-absent")
+        }
+
+        let response = try cliMockSocketRoundTrips(
+            socketPath: socketPath,
+            requestFragments: [
+                surfaceListLine(id: "forbidden-control"),
+                surfaceResumeSetLine(id: "forbidden-resume"),
+            ],
+            expectedResponseLineCount: 2
+        )
+        XCTAssertTrue(response.contains(#""id":"forbidden-control""#), response)
+        XCTAssertTrue(response.contains(#""id":"forbidden-resume""#), response)
+        let snapshot = server.shutdownAndWait()
+        XCTAssertEqual(snapshot.acceptedConnections, 1, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.handledConnections, 1, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.methodCounts["surface.list"] ?? 0, 1, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.methodCounts["surface.resume.set"] ?? 0, 1, snapshot.diagnostics)
+        XCTAssertFalse(observedMethods(in: state).contains("feed.push"))
+    }
+
     func testClaudeStyleTwoConnectionProtocolCompletesAfterBothHandlersFinish() throws {
         let socketPath = makeSocketPath("claude-two")
         let listenerFD = try bindUnixSocket(at: socketPath)
