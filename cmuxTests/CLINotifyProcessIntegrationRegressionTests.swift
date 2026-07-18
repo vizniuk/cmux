@@ -521,34 +521,66 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         let context = try makeClaudeHookContext(name: "claude-clear-stale-stop")
         defer { context.cleanup() }
 
-        let oldStart = runClaudeHook(
+        let oldStart = try runClaudeHook(
             context: context,
             arguments: ["hooks", "claude", "session-start"],
-            standardInput: #"{"session_id":"old-session","cwd":"\#(context.root.path)","hook_event_name":"SessionStart"}"#
+            standardInput: #"{"session_id":"old-session","cwd":"\#(context.root.path)","hook_event_name":"SessionStart"}"#,
+            trafficContract: ClaudeHookTrafficContract(
+                expectedConnections: 2,
+                optionalConnections: 0,
+                framedRequests: 3,
+                methodCounts: ["surface.list": 2, "feed.push": 1],
+                responseRequiredFrames: 2,
+                oneWayFeedFrames: 1
+            )
         )
         XCTAssertFalse(oldStart.timedOut, oldStart.stderr)
         XCTAssertEqual(oldStart.status, 0, oldStart.stderr)
 
-        let clearStart = runClaudeHook(
+        let clearStart = try runClaudeHook(
             context: context,
             arguments: ["hooks", "claude", "session-start"],
-            standardInput: #"{"session_id":"clear-session","source":"clear","cwd":"\#(context.root.path)","hook_event_name":"SessionStart"}"#
+            standardInput: #"{"session_id":"clear-session","source":"clear","cwd":"\#(context.root.path)","hook_event_name":"SessionStart"}"#,
+            trafficContract: ClaudeHookTrafficContract(
+                expectedConnections: 2,
+                optionalConnections: 0,
+                framedRequests: 7,
+                methodCounts: ["surface.list": 2, "feed.push": 1, "surface.resume.set": 1, "non-json": 3],
+                responseRequiredFrames: 6,
+                oneWayFeedFrames: 1
+            )
         )
         XCTAssertFalse(clearStart.timedOut, clearStart.stderr)
         XCTAssertEqual(clearStart.status, 0, clearStart.stderr)
 
-        let lateOldStart = runClaudeHook(
+        let lateOldStart = try runClaudeHook(
             context: context,
             arguments: ["hooks", "claude", "session-start"],
-            standardInput: #"{"session_id":"old-session","source":"startup","cwd":"\#(context.root.path)","hook_event_name":"SessionStart"}"#
+            standardInput: #"{"session_id":"old-session","source":"startup","cwd":"\#(context.root.path)","hook_event_name":"SessionStart"}"#,
+            trafficContract: ClaudeHookTrafficContract(
+                expectedConnections: 2,
+                optionalConnections: 0,
+                framedRequests: 3,
+                methodCounts: ["surface.list": 2, "feed.push": 1],
+                responseRequiredFrames: 2,
+                oneWayFeedFrames: 1
+            )
         )
         XCTAssertFalse(lateOldStart.timedOut, lateOldStart.stderr)
         XCTAssertEqual(lateOldStart.status, 0, lateOldStart.stderr)
 
-        let staleStop = runClaudeHook(
+        let staleStop = try runClaudeHook(
             context: context,
             arguments: ["hooks", "claude", "stop"],
-            standardInput: #"{"session_id":"old-session","cwd":"\#(context.root.path)","hook_event_name":"Stop","last_assistant_message":"old turn finished late"}"#
+            standardInput: #"{"session_id":"old-session","cwd":"\#(context.root.path)","hook_event_name":"Stop","last_assistant_message":"old turn finished late"}"#,
+            trafficContract: ClaudeHookTrafficContract(
+                expectedConnections: 2,
+                optionalConnections: 0,
+                framedRequests: 3,
+                methodCounts: ["surface.list": 2, "feed.push": 1],
+                responseRequiredFrames: 2,
+                oneWayFeedFrames: 1
+            )
         )
         XCTAssertFalse(staleStop.timedOut, staleStop.stderr)
         XCTAssertEqual(staleStop.status, 0, staleStop.stderr)
@@ -582,43 +614,83 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         let context = try makeClaudeHookContext(name: "claude-new-session-after-stop")
         defer { context.cleanup() }
 
-        let oldStart = runClaudeHook(
+        let oldStart = try runClaudeHook(
             context: context,
             arguments: ["hooks", "claude", "session-start"],
-            standardInput: #"{"session_id":"old-session","cwd":"\#(context.root.path)","hook_event_name":"SessionStart"}"#
+            standardInput: #"{"session_id":"old-session","cwd":"\#(context.root.path)","hook_event_name":"SessionStart"}"#,
+            trafficContract: ClaudeHookTrafficContract(
+                expectedConnections: 2,
+                optionalConnections: 0,
+                framedRequests: 3,
+                methodCounts: ["surface.list": 2, "feed.push": 1],
+                responseRequiredFrames: 2,
+                oneWayFeedFrames: 1
+            )
         )
         XCTAssertFalse(oldStart.timedOut, oldStart.stderr)
         XCTAssertEqual(oldStart.status, 0, oldStart.stderr)
 
-        let oldPrompt = runClaudeHook(
+        let oldPrompt = try runClaudeHook(
             context: context,
             arguments: ["hooks", "claude", "prompt-submit"],
-            standardInput: #"{"session_id":"old-session","turn_id":"turn-1","cwd":"\#(context.root.path)","hook_event_name":"PromptSubmit"}"#
+            standardInput: #"{"session_id":"old-session","turn_id":"turn-1","cwd":"\#(context.root.path)","hook_event_name":"PromptSubmit"}"#,
+            trafficContract: ClaudeHookTrafficContract(
+                expectedConnections: 2,
+                optionalConnections: 0,
+                framedRequests: 7,
+                methodCounts: ["surface.list": 2, "feed.push": 1, "surface.resume.set": 1, "non-json": 3],
+                responseRequiredFrames: 6,
+                oneWayFeedFrames: 1
+            )
         )
         XCTAssertFalse(oldPrompt.timedOut, oldPrompt.stderr)
         XCTAssertEqual(oldPrompt.status, 0, oldPrompt.stderr)
 
-        let oldStop = runClaudeHook(
+        let oldStop = try runClaudeHook(
             context: context,
             arguments: ["hooks", "claude", "stop"],
-            standardInput: #"{"session_id":"old-session","turn_id":"turn-1","cwd":"\#(context.root.path)","hook_event_name":"Stop","last_assistant_message":"old turn finished"}"#
+            standardInput: #"{"session_id":"old-session","turn_id":"turn-1","cwd":"\#(context.root.path)","hook_event_name":"Stop","last_assistant_message":"old turn finished"}"#,
+            trafficContract: ClaudeHookTrafficContract(
+                expectedConnections: 2,
+                optionalConnections: 0,
+                framedRequests: 7,
+                methodCounts: ["surface.list": 2, "feed.push": 1, "surface.resume.set": 1, "non-json": 3],
+                responseRequiredFrames: 6,
+                oneWayFeedFrames: 1
+            )
         )
         XCTAssertFalse(oldStop.timedOut, oldStop.stderr)
         XCTAssertEqual(oldStop.status, 0, oldStop.stderr)
 
-        let newStart = runClaudeHook(
+        let newStart = try runClaudeHook(
             context: context,
             arguments: ["hooks", "claude", "session-start"],
-            standardInput: #"{"session_id":"new-session","source":"startup","cwd":"\#(context.root.path)","hook_event_name":"SessionStart"}"#
+            standardInput: #"{"session_id":"new-session","source":"startup","cwd":"\#(context.root.path)","hook_event_name":"SessionStart"}"#,
+            trafficContract: ClaudeHookTrafficContract(
+                expectedConnections: 2,
+                optionalConnections: 0,
+                framedRequests: 4,
+                methodCounts: ["surface.list": 2, "feed.push": 1, "surface.resume.set": 1],
+                responseRequiredFrames: 3,
+                oneWayFeedFrames: 1
+            )
         )
         XCTAssertFalse(newStart.timedOut, newStart.stderr)
         XCTAssertEqual(newStart.status, 0, newStart.stderr)
 
         let newPromptStart = context.state.commands.count
-        let newPrompt = runClaudeHook(
+        let newPrompt = try runClaudeHook(
             context: context,
             arguments: ["hooks", "claude", "prompt-submit"],
-            standardInput: #"{"session_id":"new-session","turn_id":"turn-1","cwd":"\#(context.root.path)","hook_event_name":"PromptSubmit"}"#
+            standardInput: #"{"session_id":"new-session","turn_id":"turn-1","cwd":"\#(context.root.path)","hook_event_name":"PromptSubmit"}"#,
+            trafficContract: ClaudeHookTrafficContract(
+                expectedConnections: 2,
+                optionalConnections: 0,
+                framedRequests: 7,
+                methodCounts: ["surface.list": 2, "feed.push": 1, "surface.resume.set": 1, "non-json": 3],
+                responseRequiredFrames: 6,
+                oneWayFeedFrames: 1
+            )
         )
         XCTAssertFalse(newPrompt.timedOut, newPrompt.stderr)
         XCTAssertEqual(newPrompt.status, 0, newPrompt.stderr)
@@ -8832,6 +8904,15 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         )
     }
 
+    private struct ClaudeHookTrafficContract: Sendable {
+        let expectedConnections: Int
+        let optionalConnections: Int
+        let framedRequests: Int
+        let methodCounts: [String: Int]
+        let responseRequiredFrames: Int
+        let oneWayFeedFrames: Int
+    }
+
     private func runClaudeHook(
         context: ClaudeHookContext,
         arguments: [String],
@@ -8850,6 +8931,74 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
             extraEnvironment: extraEnvironment
         )
         wait(for: [serverHandled], timeout: 5)
+        return result
+    }
+
+    private func runClaudeHook(
+        context: ClaudeHookContext,
+        arguments: [String],
+        standardInput: String,
+        trafficContract: ClaudeHookTrafficContract,
+        extraEnvironment: [String: String] = [:]
+    ) throws -> ProcessRunResult {
+        // Each lifecycle invocation owns its listener as well as its observing
+        // handle. This prevents a retiring accept call from consuming the next
+        // event's connection while the synthetic session store remains shared.
+        let socketPath = makeSocketPath("claude-contract")
+        let listenerFD = try bindUnixSocket(at: socketPath)
+        defer {
+            Darwin.close(listenerFD)
+            unlink(socketPath)
+        }
+        let invocationContext = ClaudeHookContext(
+            cliPath: context.cliPath,
+            socketPath: socketPath,
+            listenerFD: listenerFD,
+            state: context.state,
+            root: context.root,
+            workspaceId: context.workspaceId,
+            surfaceId: context.surfaceId
+        )
+        let server = startMockServerObservingTraffic(
+            listenerFD: invocationContext.listenerFD,
+            state: invocationContext.state,
+            requiredConnections: trafficContract.expectedConnections,
+            optionalConnections: trafficContract.optionalConnections
+        ) { line in
+            if let payload = self.jsonObject(line),
+               let method = payload["method"] as? String,
+               trafficContract.methodCounts[method] == nil {
+                XCTFail("Unexpected Claude hook socket method: \(method)")
+                return self.v2Response(
+                    id: payload["id"] as? String ?? "unexpected-method",
+                    ok: false,
+                    error: ["code": "unrecognized_method", "message": "unexpected method: \(method)"]
+                )
+            }
+            return self.agentHookMockResponse(line: line, context: invocationContext)
+        }
+
+        let result = runClaudeHookProcess(
+            context: invocationContext,
+            arguments: arguments,
+            standardInput: standardInput,
+            extraEnvironment: extraEnvironment
+        )
+        let snapshot = server.shutdownAndWait(recordIncomplete: true)
+
+        XCTAssertEqual(snapshot.expectedConnections, trafficContract.expectedConnections, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.optionalConnections, trafficContract.optionalConnections, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.acceptedConnections, trafficContract.expectedConnections, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.handledConnections, trafficContract.expectedConnections, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.activeHandlers, 0, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.framedRequests, trafficContract.framedRequests, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.methodCounts, trafficContract.methodCounts, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.methodCounts["feed.push", default: 0], trafficContract.oneWayFeedFrames, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.attemptedResponses, trafficContract.responseRequiredFrames, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.completedResponses, snapshot.attemptedResponses, snapshot.diagnostics)
+        XCTAssertNil(snapshot.terminalFailure, snapshot.diagnostics)
+        XCTAssertTrue(snapshot.listenerClosed, snapshot.diagnostics)
+        XCTAssertTrue(snapshot.acceptLoopFinished, snapshot.diagnostics)
         return result
     }
 
