@@ -552,6 +552,82 @@ extension CLINotifyProcessIntegrationRegressionTests {
         )
     }
 
+    private func runHookProcessObservingTermination(
+        executablePath: String,
+        arguments: [String],
+        environment: [String: String],
+        standardInput: String,
+        timeout: TimeInterval
+    ) -> ProcessRunResult {
+        let process = Process()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        let stdinPipe = Pipe()
+        let exitSignal = DispatchSemaphore(value: 0)
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+        process.environment = environment
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        // The shared runner signals from a queued waitUntilExit worker, which can be
+        // delayed under a composed XCTest host after the child has already exited.
+        // These subprocess-heavy selectors observe Process termination directly while
+        // retaining the same deadline and genuine-timeout termination behavior.
+        process.terminationHandler = { _ in exitSignal.signal() }
+        defer {
+            process.terminationHandler = nil
+            try? stdinPipe.fileHandleForWriting.close()
+            try? stdinPipe.fileHandleForReading.close()
+            try? stdoutPipe.fileHandleForWriting.close()
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForWriting.close()
+            try? stderrPipe.fileHandleForReading.close()
+        }
+
+        do {
+            try process.run()
+            try? stdinPipe.fileHandleForReading.close()
+            try? stdoutPipe.fileHandleForWriting.close()
+            try? stderrPipe.fileHandleForWriting.close()
+            stdinPipe.fileHandleForWriting.write(Data(standardInput.utf8))
+            try? stdinPipe.fileHandleForWriting.close()
+
+            let deadlineExpired = exitSignal.wait(timeout: .now() + processTimeout(timeout)) == .timedOut
+            let timedOut = deadlineExpired && process.isRunning
+            if timedOut {
+                process.terminate()
+                if exitSignal.wait(timeout: .now() + 1) == .timedOut, process.isRunning {
+                    Darwin.kill(process.processIdentifier, SIGKILL)
+                    _ = exitSignal.wait(timeout: .now() + 1)
+                }
+            }
+
+            let stdout = String(
+                data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+            ) ?? ""
+            let stderr = String(
+                data: stderrPipe.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+            ) ?? ""
+            return ProcessRunResult(
+                status: process.isRunning ? SIGKILL : process.terminationStatus,
+                stdout: stdout,
+                stderr: stderr,
+                timedOut: timedOut
+            )
+        } catch {
+            return ProcessRunResult(
+                status: -1,
+                stdout: "",
+                stderr: String(describing: error),
+                timedOut: false
+            )
+        }
+    }
+
     func testHermesAgentNotificationsUseShellHookExtraPayload() throws {
         let cliPath = try bundledCLIPath()
         let socketPath = makeSocketPath("hermes-notification")
@@ -608,7 +684,7 @@ extension CLINotifyProcessIntegrationRegressionTests {
         }
 
         func runHermesHook(_ subcommand: String, input: String) -> ProcessRunResult {
-            let result = runProcess(
+            let result = runHookProcessObservingTermination(
                 executablePath: cliPath,
                 arguments: ["hooks", "hermes-agent", subcommand],
                 environment: environment,
@@ -2009,8 +2085,6 @@ extension CLINotifyProcessIntegrationRegressionTests {
 
     func testGrokStopFallbackCompletionsFireForTwoConcurrentThreads() throws {
         let cliPath = try bundledCLIPath()
-        let socketPath = makeSocketPath("grok-two-threads")
-        let listenerFD = try bindUnixSocket(at: socketPath)
         let state = MockSocketServerState()
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("cmux-grok-two-threads-\(UUID().uuidString)", isDirectory: true)
@@ -2023,8 +2097,6 @@ extension CLINotifyProcessIntegrationRegressionTests {
 
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer {
-            Darwin.close(listenerFD)
-            unlink(socketPath)
             try? FileManager.default.removeItem(at: root)
         }
 
@@ -2032,65 +2104,113 @@ extension CLINotifyProcessIntegrationRegressionTests {
             "HOME": root.path,
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "PWD": root.path,
-            "CMUX_SOCKET_PATH": socketPath,
             "CMUX_WORKSPACE_ID": workspaceId,
             "CMUX_AGENT_HOOK_STATE_DIR": root.path,
             "CMUX_CLI_SENTRY_DISABLED": "1",
             "GROK_HOME": grokHome.path,
         ]
 
-        let server = startMockServerObservingTraffic(
-            listenerFD: listenerFD,
-            state: state,
-            requiredConnections: 20
-        ) { line in
-            guard let payload = self.jsonObject(line) else {
-                return "OK"
-            }
-            guard let id = payload["id"] as? String, let method = payload["method"] as? String else {
-                return self.malformedRequestResponse(id: payload["id"] as? String, raw: line)
-            }
-            switch method {
-            case "surface.list":
-                return self.v2Response(
-                    id: id,
-                    ok: true,
-                    result: [
-                        "surfaces": surfaceIds.enumerated().map { index, listedSurfaceId in
-                            [
-                                "id": listedSurfaceId,
-                                "ref": "surface:\(index + 1)",
-                                "focused": false,
-                            ] as [String: Any]
-                        },
-                    ]
-                )
-            case "system.top":
-                return self.v2Response(id: id, ok: true, result: ["windows": []])
-            case "surface.resume.set":
-                return self.v2Response(id: id, ok: true, result: ["resume_binding": [:]])
-            case "workspace.set_auto_title":
-                return self.v2Response(
-                    id: id,
-                    ok: true,
-                    result: ["enabled": false, "workspace_user_owned": false]
-                )
-            default:
-                XCTFail("Grok concurrent-thread scenario received unexpected method \(method)")
-                return self.v2Response(id: id, ok: false, error: ["code": "unrecognized_method", "message": "unexpected method: \(method)"])
-            }
-        }
+        var invocationSnapshots: [MockSocketServerSnapshot] = []
 
-        func runGrokHook(_ subcommand: String, input: String, surfaceId: String) -> ProcessRunResult {
+        func runGrokHook(
+            _ subcommand: String,
+            input: String,
+            surfaceId: String,
+            framedRequests: Int,
+            methodCounts: [String: Int],
+            responseRequiredFrames: Int
+        ) throws -> ProcessRunResult {
+            // Each hook invocation owns and joins its socket server so a retiring
+            // accept or handler cannot claim the next hook's traffic. The shared
+            // synthetic session state stays rooted separately across all ten hooks.
+            let socketPath = makeSocketPath("grok-two-threads")
+            let listenerFD = try bindUnixSocket(at: socketPath)
+            defer {
+                XCTAssertEqual(Darwin.close(listenerFD), 0, "Failed to close invocation listener")
+                XCTAssertEqual(unlink(socketPath), 0, "Failed to unlink invocation socket")
+                XCTAssertFalse(FileManager.default.fileExists(atPath: socketPath), "Invocation socket was not removed")
+            }
+
+            let server = startMockServerObservingTraffic(
+                listenerFD: listenerFD,
+                state: state,
+                requiredConnections: 2,
+                optionalConnections: 0
+            ) { line in
+                guard let payload = self.jsonObject(line) else {
+                    return "OK"
+                }
+                guard let id = payload["id"] as? String, let method = payload["method"] as? String else {
+                    return self.malformedRequestResponse(id: payload["id"] as? String, raw: line)
+                }
+                guard methodCounts[method] != nil else {
+                    XCTFail("Grok concurrent-thread scenario received unexpected method \(method)")
+                    return self.v2Response(
+                        id: id,
+                        ok: false,
+                        error: ["code": "unrecognized_method", "message": "unexpected method: \(method)"]
+                    )
+                }
+                switch method {
+                case "surface.list":
+                    return self.v2Response(
+                        id: id,
+                        ok: true,
+                        result: [
+                            "surfaces": surfaceIds.enumerated().map { index, listedSurfaceId in
+                                [
+                                    "id": listedSurfaceId,
+                                    "ref": "surface:\(index + 1)",
+                                    "focused": false,
+                                ] as [String: Any]
+                            },
+                        ]
+                    )
+                case "system.top":
+                    return self.v2Response(id: id, ok: true, result: ["windows": []])
+                case "surface.resume.set":
+                    return self.v2Response(id: id, ok: true, result: ["resume_binding": [:]])
+                case "workspace.set_auto_title":
+                    return self.v2Response(
+                        id: id,
+                        ok: true,
+                        result: ["enabled": false, "workspace_user_owned": false]
+                    )
+                default:
+                    XCTFail("Grok concurrent-thread scenario received unexpected method \(method)")
+                    return self.v2Response(
+                        id: id,
+                        ok: false,
+                        error: ["code": "unrecognized_method", "message": "unexpected method: \(method)"]
+                    )
+                }
+            }
+
             var environment = baseEnvironment
+            environment["CMUX_SOCKET_PATH"] = socketPath
             environment["CMUX_SURFACE_ID"] = surfaceId
-            let result = runProcess(
+            let result = runHookProcessObservingTermination(
                 executablePath: cliPath,
                 arguments: ["hooks", "grok", subcommand],
                 environment: environment,
                 standardInput: input,
                 timeout: 5
             )
+            let snapshot = server.shutdownAndWait(recordIncomplete: true)
+            XCTAssertEqual(snapshot.expectedConnections, 2, snapshot.diagnostics)
+            XCTAssertEqual(snapshot.optionalConnections, 0, snapshot.diagnostics)
+            XCTAssertEqual(snapshot.acceptedConnections, 2, snapshot.diagnostics)
+            XCTAssertEqual(snapshot.handledConnections, 2, snapshot.diagnostics)
+            XCTAssertEqual(snapshot.activeHandlers, 0, snapshot.diagnostics)
+            XCTAssertEqual(snapshot.framedRequests, framedRequests, snapshot.diagnostics)
+            XCTAssertEqual(snapshot.methodCounts, methodCounts, snapshot.diagnostics)
+            XCTAssertEqual(snapshot.methodCounts["feed.push", default: 0], 1, snapshot.diagnostics)
+            XCTAssertEqual(snapshot.attemptedResponses, responseRequiredFrames, snapshot.diagnostics)
+            XCTAssertEqual(snapshot.completedResponses, responseRequiredFrames, snapshot.diagnostics)
+            XCTAssertNil(snapshot.terminalFailure, snapshot.diagnostics)
+            XCTAssertTrue(snapshot.listenerClosed, snapshot.diagnostics)
+            XCTAssertTrue(snapshot.acceptLoopFinished, snapshot.diagnostics)
+            invocationSnapshots.append(snapshot)
             return result
         }
 
@@ -2104,29 +2224,54 @@ extension CLINotifyProcessIntegrationRegressionTests {
         }
 
         for thread in threads {
-            let start = runGrokHook(
+            let start = try runGrokHook(
                 "session-start",
                 input: #"{"sessionId":"\#(thread.sessionId)","cwd":"\#(root.path)","hookEventName":"SessionStart"}"#,
-                surfaceId: thread.surfaceId
+                surfaceId: thread.surfaceId,
+                framedRequests: 8,
+                methodCounts: [
+                    "surface.list": 3,
+                    "system.top": 1,
+                    "surface.resume.set": 1,
+                    "feed.push": 1,
+                    "non-json": 2,
+                ],
+                responseRequiredFrames: 7
             )
             XCTAssertFalse(start.timedOut, start.stderr)
             XCTAssertEqual(start.status, 0, start.stderr)
             XCTAssertEqual(start.stdout, "{}\n")
 
-            let prompt = runGrokHook(
+            let prompt = try runGrokHook(
                 "prompt-submit",
                 input: #"{"sessionId":"\#(thread.sessionId)","cwd":"\#(root.path)","hookEventName":"UserPromptSubmit","prompt":"thread \#(thread.index) prompt"}"#,
-                surfaceId: thread.surfaceId
+                surfaceId: thread.surfaceId,
+                framedRequests: 10,
+                methodCounts: [
+                    "surface.list": 3,
+                    "system.top": 1,
+                    "surface.resume.set": 1,
+                    "feed.push": 1,
+                    "non-json": 4,
+                ],
+                responseRequiredFrames: 9
             )
             XCTAssertFalse(prompt.timedOut, prompt.stderr)
             XCTAssertEqual(prompt.status, 0, prompt.stderr)
             XCTAssertEqual(prompt.stdout, "{}\n")
 
             let internalCommandStart = state.commands.count
-            let internalNotification = runGrokHook(
+            let internalNotification = try runGrokHook(
                 "notification",
                 input: #"{"sessionId":"\#(thread.sessionId)","cwd":"\#(root.path)","hookEventName":"Notification","message":"SessionNotification { update: HookExecution { event_name: user_prompt_submit } }"}"#,
-                surfaceId: thread.surfaceId
+                surfaceId: thread.surfaceId,
+                framedRequests: 5,
+                methodCounts: [
+                    "surface.list": 3,
+                    "system.top": 1,
+                    "feed.push": 1,
+                ],
+                responseRequiredFrames: 4
             )
             XCTAssertFalse(internalNotification.timedOut, internalNotification.stderr)
             XCTAssertEqual(internalNotification.status, 0, internalNotification.stderr)
@@ -2150,10 +2295,21 @@ extension CLINotifyProcessIntegrationRegressionTests {
 
         for thread in threads {
             let stopCommandStart = state.commands.count
-            let stop = runGrokHook(
+            let stopNonJSONFrames = thread.index == 1 ? 3 : 4
+            let stop = try runGrokHook(
                 "stop",
                 input: #"{"sessionId":"\#(thread.sessionId)","cwd":"\#(root.path)","hookEventName":"Stop"}"#,
-                surfaceId: thread.surfaceId
+                surfaceId: thread.surfaceId,
+                framedRequests: 7 + stopNonJSONFrames,
+                methodCounts: [
+                    "surface.list": 3,
+                    "system.top": 1,
+                    "surface.resume.set": 1,
+                    "workspace.set_auto_title": 1,
+                    "feed.push": 1,
+                    "non-json": stopNonJSONFrames,
+                ],
+                responseRequiredFrames: 6 + stopNonJSONFrames
             )
             XCTAssertFalse(stop.timedOut, stop.stderr)
             XCTAssertEqual(stop.status, 0, stop.stderr)
@@ -2182,10 +2338,17 @@ extension CLINotifyProcessIntegrationRegressionTests {
 
         for thread in threads {
             let notificationCommandStart = state.commands.count
-            let notification = runGrokHook(
+            let notification = try runGrokHook(
                 "notification",
                 input: #"{"sessionId":"\#(thread.sessionId)","cwd":"\#(root.path)","hookEventName":"Notification","message":"SessionNotification { update: HookExecution { event_name: stop } }"}"#,
-                surfaceId: thread.surfaceId
+                surfaceId: thread.surfaceId,
+                framedRequests: 5,
+                methodCounts: [
+                    "surface.list": 3,
+                    "system.top": 1,
+                    "feed.push": 1,
+                ],
+                responseRequiredFrames: 4
             )
             XCTAssertFalse(notification.timedOut, notification.stderr)
             XCTAssertEqual(notification.status, 0, notification.stderr)
@@ -2197,15 +2360,21 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 "Internal Grok Notification after Stop fallback must not double-notify thread \(thread.index), saw \(notificationCommands)"
             )
         }
-        let snapshot = server.shutdownAndWait()
-        XCTAssertEqual(snapshot.expectedConnections, 20, snapshot.diagnostics)
-        XCTAssertEqual(snapshot.optionalConnections, 0, snapshot.diagnostics)
-        XCTAssertEqual(snapshot.acceptedConnections, 20, snapshot.diagnostics)
-        XCTAssertEqual(snapshot.handledConnections, 20, snapshot.diagnostics)
-        XCTAssertEqual(snapshot.activeHandlers, 0, snapshot.diagnostics)
-        XCTAssertEqual(snapshot.framedRequests, 77, snapshot.diagnostics)
+        let aggregateDiagnostics = invocationSnapshots.map(\.diagnostics).joined(separator: "\n")
+        let aggregateMethodCounts = invocationSnapshots.reduce(into: [String: Int]()) { counts, snapshot in
+            for (method, count) in snapshot.methodCounts {
+                counts[method, default: 0] += count
+            }
+        }
+        XCTAssertEqual(invocationSnapshots.count, 10, aggregateDiagnostics)
+        XCTAssertEqual(invocationSnapshots.reduce(0) { $0 + $1.expectedConnections }, 20, aggregateDiagnostics)
+        XCTAssertEqual(invocationSnapshots.reduce(0) { $0 + $1.optionalConnections }, 0, aggregateDiagnostics)
+        XCTAssertEqual(invocationSnapshots.reduce(0) { $0 + $1.acceptedConnections }, 20, aggregateDiagnostics)
+        XCTAssertEqual(invocationSnapshots.reduce(0) { $0 + $1.handledConnections }, 20, aggregateDiagnostics)
+        XCTAssertEqual(invocationSnapshots.reduce(0) { $0 + $1.activeHandlers }, 0, aggregateDiagnostics)
+        XCTAssertEqual(invocationSnapshots.reduce(0) { $0 + $1.framedRequests }, 77, aggregateDiagnostics)
         XCTAssertEqual(
-            snapshot.methodCounts,
+            aggregateMethodCounts,
             [
                 "surface.list": 30,
                 "system.top": 10,
@@ -2214,13 +2383,13 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 "feed.push": 10,
                 "non-json": 19,
             ],
-            snapshot.diagnostics
+            aggregateDiagnostics
         )
-        XCTAssertEqual(snapshot.attemptedResponses, 67, snapshot.diagnostics)
-        XCTAssertEqual(snapshot.completedResponses, snapshot.attemptedResponses, snapshot.diagnostics)
-        XCTAssertNil(snapshot.terminalFailure, snapshot.diagnostics)
-        XCTAssertTrue(snapshot.listenerClosed, snapshot.diagnostics)
-        XCTAssertTrue(snapshot.acceptLoopFinished, snapshot.diagnostics)
+        XCTAssertEqual(invocationSnapshots.reduce(0) { $0 + $1.attemptedResponses }, 67, aggregateDiagnostics)
+        XCTAssertEqual(invocationSnapshots.reduce(0) { $0 + $1.completedResponses }, 67, aggregateDiagnostics)
+        XCTAssertTrue(invocationSnapshots.allSatisfy { $0.terminalFailure == nil }, aggregateDiagnostics)
+        XCTAssertTrue(invocationSnapshots.allSatisfy(\.listenerClosed), aggregateDiagnostics)
+        XCTAssertTrue(invocationSnapshots.allSatisfy(\.acceptLoopFinished), aggregateDiagnostics)
     }
 
     func testGrokStopNotificationFallsBackWhenTranscriptCwdIsUnavailable() throws {
