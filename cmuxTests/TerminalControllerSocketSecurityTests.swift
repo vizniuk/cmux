@@ -724,7 +724,13 @@ final class TerminalControllerSocketSecurityTests {
         let historicalSessionID = "synthetic-historical-endpoint-session"
         let historicalTurnID = "synthetic-historical-endpoint-turn"
         let exact = "  ## Exact endpoint reply\n\n日本語 ✅  \n"
-        let transcriptURL = home.appendingPathComponent("synthetic-rollout.jsonl")
+        let transcriptURL = home
+            .appendingPathComponent(".codex/sessions/2026/07/17", isDirectory: true)
+            .appendingPathComponent("synthetic-rollout.jsonl")
+        try FileManager.default.createDirectory(
+            at: transcriptURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
         try #"{"type":"session_meta","payload":{"id":"synthetic-endpoint-session"}}"#
             .appending("\n")
             .write(to: transcriptURL, atomically: true, encoding: .utf8)
