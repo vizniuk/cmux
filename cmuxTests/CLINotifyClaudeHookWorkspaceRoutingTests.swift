@@ -138,10 +138,15 @@ extension CLINotifyProcessIntegrationRegressionTests {
             try? FileManager.default.removeItem(at: root)
         }
 
-        // connectionCount 2: the deferred feed telemetry (the pre-fix regression this
-        // test guards against) arrives on a second socket connection, which must be
-        // accepted and drained for the feed.push absence assertion to be falsifiable.
-        let serverHandled = startMockServer(listenerFD: listenerFD, state: state, connectionCount: 2) { line in
+        // The unresolved notification path performs one control lookup connection.
+        // Feed is forbidden, not required; the observation server stays open until
+        // the child exits so a late feed.push is caught without a sleep window.
+        let server = startMockServerObservingTraffic(
+            listenerFD: listenerFD,
+            state: state,
+            requiredConnections: 1,
+            optionalConnections: 1
+        ) { line in
             guard let payload = self.jsonObject(line) else { return "OK" }
             guard let id = payload["id"] as? String, let method = payload["method"] as? String else {
                 return self.malformedRequestResponse(id: payload["id"] as? String, raw: line)
@@ -189,9 +194,14 @@ extension CLINotifyProcessIntegrationRegressionTests {
             timeout: 5
         )
 
-        wait(for: [serverHandled], timeout: 5)
+        let snapshot = server.shutdownAndWait()
         XCTAssertFalse(result.timedOut, result.stderr)
         XCTAssertEqual(result.status, 0, result.stderr)
+        XCTAssertEqual(snapshot.methodCounts["agent.resolve_delivery_target"] ?? 0, 1, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.methodCounts["debug.terminals"] ?? 0, 1, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.methodCounts["surface.list"] ?? 0, 1, snapshot.diagnostics)
+        XCTAssertLessThanOrEqual(snapshot.methodCounts["workspace.current"] ?? 0, 1, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.framedRequests, snapshot.methodCounts.values.reduce(0, +), snapshot.diagnostics)
         // Scope to routing commands so the resolver's own surface.list validation
         // calls (whose JSON carries a candidate workspace id) can't false-match.
         for candidate in [ttyWorkspaceA, ttyWorkspaceB, focusedWorkspaceId] {
@@ -202,14 +212,8 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 "Ambiguous-TTY notification must not guess workspace \(candidate), saw \(state.commands)"
             )
         }
-        // The telemetry connection is drained on its own accept thread; give a
-        // regression a bounded window to land in state.commands so the pre-fix
-        // failure is deterministic (the CLI process has already exited here, so any
-        // feed.push frame is in flight at most a scheduling delay away).
-        let feedDeadline = Date().addingTimeInterval(1.0)
-        while Date() < feedDeadline, !state.commands.contains(where: { $0.contains("feed.push") }) {
-            usleep(50_000)
-        }
+        XCTAssertEqual(snapshot.acceptedConnections, 1, snapshot.diagnostics)
+        XCTAssertEqual(snapshot.methodCounts["feed.push"] ?? 0, 0, snapshot.diagnostics)
         XCTAssertFalse(
             state.commands.contains { $0.contains("feed.push") },
             "Unresolved notification must not push a feed event, saw \(state.commands)"
