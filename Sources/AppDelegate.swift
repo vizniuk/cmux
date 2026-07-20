@@ -33,6 +33,13 @@ private enum CmuxThemeNotifications {
     static let reloadConfig = Notification.Name("com.cmuxterm.themes.reload-config")
 }
 
+extension Notification.Name {
+    /// Content-free signal that visible Agent Report copy availability changed.
+    static let agentReportCopyAvailabilityDidChange = Notification.Name(
+        "com.cmuxterm.agent-report-copy-availability-did-change"
+    )
+}
+
 private struct WorkspaceGroupNewWorkspaceTarget {
     let groupId: UUID
     let referenceWorkspaceId: UUID
@@ -782,9 +789,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// Process-local private report store. Its policy defaults to disabled and
     /// it is injected only into the dedicated capture transport; exact report
     /// text is never composed into Feed, notifications, or persisted services.
-    private let agentReportCaptureStore = AgentReportCaptureStore(
-        transcriptRecovery: AgentChatTranscriptResolver()
-    )
+    private(set) var agentReportCaptureStore: AgentReportCaptureStore?
+    /// Synchronous UI/privacy gate reflecting the persisted Boolean setting.
+    private(set) var agentReportCaptureEnabled = false
+    /// Content-free exact topology tuples whose report remains copy-eligible.
+    private var agentReportWorkspaceIDByRuntimeSurfaceID: [UUID: UUID] = [:]
+    private var agentReportAvailabilityTask: Task<Void, Never>?
+    private var agentReportSettingObservationTask: Task<Void, Never>?
+    private var agentReportPolicyUpdateTask: Task<Void, Never>?
+    private var agentReportPolicyUpdateRevision: UInt64 = 0
     /// The app's settings dependency container, handed over by `cmuxApp` via
     /// `configure(...)` before any main window is created. AppKit builds the
     /// main window's `NSHostingView` itself, so it injects this into the
@@ -1983,6 +1996,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     func applicationWillTerminate(_ notification: Notification) {
         StartupBreadcrumbLog.append("appDelegate.willTerminate.begin")
+        agentReportAvailabilityTask?.cancel()
+        agentReportSettingObservationTask?.cancel()
+        agentReportPolicyUpdateTask?.cancel()
         // Backstop for any terminate path that did not route through
         // prepareForConfirmedAppTermination() (idempotent with the primary arm).
         // Apple's promised-pasteboard observer can fire before this delegate
@@ -2033,16 +2049,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     /// Composes process-wide app services before socket and session activity begins.
     ///
-    /// Slice A wires the default-disabled private report actor and a
-    /// content-free surface lifecycle invalidator here so ownership remains at
-    /// the executable composition root.
+    /// Wires the private report actor, persisted Boolean policy, content-free
+    /// availability observation, and lifecycle invalidator at the executable
+    /// composition root.
     ///
     /// - Parameters:
     ///   - tabManager: Initial app window's workspace manager.
     ///   - notificationStore: Existing notification store; private report text
     ///     is never passed to it.
     ///   - sidebarState: Shared sidebar state.
-    ///   - settingsRuntime: Existing settings graph; Slice A adds no setting.
+    ///   - settingsRuntime: Existing settings graph, including the persisted
+    ///     default-disabled Agent Report capture Boolean.
     ///   - auth: Existing authentication composition.
     func configure(
         tabManager: TabManager,
@@ -2056,6 +2073,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         self.notificationStore = notificationStore
         self.sidebarState = sidebarState
         self.auth = auth
+        let initialAgentReportCaptureEnabled = settingsRuntime.userDefaultsStore.initialValue(
+            for: settingsRuntime.catalog.app.agentReportCapture
+        )
+        let agentReportCaptureStore = AgentReportCaptureStore(
+            policy: initialAgentReportCaptureEnabled ? .enabled : .disabled,
+            transcriptRecovery: AgentChatTranscriptResolver()
+        )
+        self.agentReportCaptureStore = agentReportCaptureStore
+        agentReportCaptureEnabled = initialAgentReportCaptureEnabled
+        agentReportWorkspaceIDByRuntimeSurfaceID.removeAll(keepingCapacity: false)
         VMClient.bootstrap(auth: auth.coordinator)
         RemotesClient.bootstrap(auth: auth.coordinator)
         AIAccountsClient.bootstrap(auth: auth.coordinator)
@@ -2070,11 +2097,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         TerminalController.shared.attachAuth(coordinator: auth.coordinator, browserSignIn: auth.browserSignIn)
         TerminalController.shared.agentChatTranscriptService = agentChatTranscriptService
         TerminalController.shared.agentReportCaptureStore = agentReportCaptureStore
-        agentChatTranscriptService.setAgentReportSurfaceInvalidator { [agentReportCaptureStore] surfaceID in
+        agentChatTranscriptService.setAgentReportSurfaceInvalidator { [weak self, agentReportCaptureStore] surfaceID in
             // Cleanup may queue, but lifecycle authority was already revoked
             // synchronously by AgentChatTranscriptService on the main actor.
+            self?.agentReportWorkspaceIDByRuntimeSurfaceID.removeValue(forKey: surfaceID)
+            NotificationCenter.default.post(name: .agentReportCopyAvailabilityDidChange, object: nil)
             Task { await agentReportCaptureStore.invalidatePendingCapture(runtimeSurfaceID: surfaceID) }
         }
+        startAgentReportAvailabilityObservation(store: agentReportCaptureStore)
+        startAgentReportSettingObservation(runtime: settingsRuntime)
         auth.start()
         ensureMobileWorkspaceListObserver(for: tabManager)
         MobileTerminalRenderObserver.shared.start()
@@ -2110,6 +2141,156 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // keeps working. No-op when already set or the legacy file is absent.
         Task { await DevWindowDisplayDefault.migrateLegacyFileIfNeeded(runtime: settingsRuntime) }
 #endif
+    }
+
+    /// Applies a settings change to the synchronous UI gate immediately and
+    /// serializes actor policy changes in user-observed order.
+    ///
+    /// - Parameter enabled: Persisted Boolean capture preference.
+    func applyAgentReportCapturePolicy(_ enabled: Bool) {
+        agentReportCaptureEnabled = enabled
+        if !enabled {
+            agentReportWorkspaceIDByRuntimeSurfaceID.removeAll(keepingCapacity: false)
+        }
+        NotificationCenter.default.post(name: .agentReportCopyAvailabilityDidChange, object: nil)
+
+        guard let store = agentReportCaptureStore else { return }
+        agentReportPolicyUpdateRevision &+= 1
+        let revision = agentReportPolicyUpdateRevision
+        let previous = agentReportPolicyUpdateTask
+        agentReportPolicyUpdateTask = Task { [weak self, store] in
+            if let previous { await previous.value }
+            guard !Task.isCancelled else { return }
+            await store.setPolicy(enabled ? .enabled : .disabled)
+            guard !Task.isCancelled else { return }
+            if self?.agentReportPolicyUpdateRevision == revision {
+                self?.agentReportPolicyUpdateTask = nil
+                NotificationCenter.default.post(
+                    name: .agentReportCopyAvailabilityDidChange,
+                    object: nil
+                )
+            }
+        }
+    }
+
+    /// Starts newest-value observation of the private actor's content-free
+    /// availability projection.
+    private func startAgentReportAvailabilityObservation(store: AgentReportCaptureStore) {
+        agentReportAvailabilityTask?.cancel()
+        agentReportAvailabilityTask = Task { [weak self, store] in
+            let snapshots = await store.availabilitySnapshots()
+            for await snapshot in snapshots {
+                guard !Task.isCancelled, let self else { break }
+                self.acceptAgentReportAvailability(snapshot)
+            }
+        }
+    }
+
+    /// Observes persisted Boolean changes, including reset or non-view writes,
+    /// without creating a parallel settings path.
+    private func startAgentReportSettingObservation(runtime: SettingsRuntime) {
+        agentReportSettingObservationTask?.cancel()
+        let key = runtime.catalog.app.agentReportCapture
+        agentReportSettingObservationTask = Task { [weak self, store = runtime.userDefaultsStore] in
+            for await enabled in store.values(for: key) {
+                guard !Task.isCancelled, let self else { break }
+                self.applyAgentReportCapturePolicy(enabled)
+            }
+        }
+    }
+
+    /// Accepts only content-free topology availability from the report actor.
+    private func acceptAgentReportAvailability(_ snapshot: AgentReportAvailabilitySnapshot) {
+        if agentReportCaptureEnabled, snapshot.isCaptureEnabled {
+            agentReportWorkspaceIDByRuntimeSurfaceID = snapshot.workspaceIDByRuntimeSurfaceID
+        } else {
+            agentReportWorkspaceIDByRuntimeSurfaceID.removeAll(keepingCapacity: false)
+        }
+        NotificationCenter.default.post(name: .agentReportCopyAvailabilityDidChange, object: nil)
+    }
+
+    /// Resolves visible control state for one exact represented live surface.
+    ///
+    /// - Parameters:
+    ///   - workspaceID: Exact represented workspace.
+    ///   - runtimeSurfaceID: Exact represented runtime surface.
+    ///   - representedSurface: Optional expected live surface instance.
+    /// - Returns: Content-free capture and report availability flags.
+    func agentReportCopyControlAvailability(
+        workspaceID: UUID,
+        runtimeSurfaceID: UUID,
+        representedSurface: TerminalSurface? = nil
+    ) -> (isCaptureEnabled: Bool, hasReport: Bool) {
+        guard agentReportCaptureEnabled else { return (false, false) }
+        guard agentReportPolicyUpdateTask == nil else { return (true, false) }
+        guard agentReportWorkspaceIDByRuntimeSurfaceID[runtimeSurfaceID] == workspaceID,
+              let manager = tabManagerFor(tabId: workspaceID),
+              let workspace = manager.tabs.first(where: { $0.id == workspaceID }),
+              workspace.surfaceIdFromPanelId(runtimeSurfaceID) != nil,
+              let panel = workspace.panels[runtimeSurfaceID] as? TerminalPanel,
+              representedSurface == nil || panel.surface === representedSurface else {
+            return (true, false)
+        }
+        return (true, true)
+    }
+
+    /// Copies the latest report for an exact represented surface through the
+    /// single actor-authorized clipboard implementation.
+    ///
+    /// - Parameters:
+    ///   - workspaceID: Exact active or represented workspace.
+    ///   - runtimeSurfaceID: Exact active or represented runtime surface.
+    ///   - pasteboard: Destination pasteboard; the general pasteboard by default.
+    /// - Returns: `true` only when an authorized body was written.
+    @discardableResult
+    func copyLatestAgentReport(
+        workspaceID: UUID,
+        runtimeSurfaceID: UUID,
+        to pasteboard: NSPasteboard = .general
+    ) async -> Bool {
+        guard agentReportCaptureEnabled,
+              agentReportPolicyUpdateTask == nil,
+              agentReportWorkspaceIDByRuntimeSurfaceID[runtimeSurfaceID] == workspaceID,
+              let store = agentReportCaptureStore else { return false }
+        let policyRevision = agentReportPolicyUpdateRevision
+        return await Self.copyLatestAgentReport(
+            store: store,
+            runtimeSurfaceID: runtimeSurfaceID,
+            to: pasteboard,
+            authorize: { context in
+                await TerminalController.shared.authorizesAgentReportCopy(
+                    context,
+                    representedWorkspaceID: workspaceID,
+                    representedSurfaceID: runtimeSurfaceID
+                )
+            },
+            shouldWrite: { [weak self] in
+                self?.agentReportCaptureEnabled == true
+                    && self?.agentReportPolicyUpdateTask == nil
+                    && self?.agentReportPolicyUpdateRevision == policyRevision
+                    && self?.agentReportWorkspaceIDByRuntimeSurfaceID[runtimeSurfaceID] == workspaceID
+            }
+        )
+    }
+
+    /// Authoritative report lookup and clipboard write shared by shortcut,
+    /// menu, and button entrypoints. It has no transcript or terminal fallback.
+    @discardableResult
+    static func copyLatestAgentReport(
+        store: AgentReportCaptureStore,
+        runtimeSurfaceID: UUID,
+        to pasteboard: NSPasteboard,
+        authorize: @escaping @Sendable (AgentReportCopyAuthorizationContext) async -> Bool,
+        shouldWrite: @escaping @MainActor @Sendable () -> Bool = { true }
+    ) async -> Bool {
+        guard let body = await store.authorizedReportBody(
+            runtimeSurfaceID: runtimeSurfaceID,
+            authorize: authorize
+        ), shouldWrite() else {
+            return false
+        }
+        WorkspaceSurfaceIdentifierClipboardText.copy(body, to: pasteboard)
+        return true
     }
 
     private func scheduleGhosttyCrashBreadcrumbIfNeeded(notificationStore: TerminalNotificationStore) {
@@ -12799,6 +12980,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return true
     }
 
+    /// Fixed B1 default routed through the existing shortcut matcher. It is not
+    /// user-configurable until Slice B2.
+    private static let agentReportCopyShortcut = StoredShortcut(
+        key: "c",
+        command: true,
+        shift: true,
+        option: false,
+        control: false
+    )
+
+    /// Handles the fixed Slice B1 Agent Report shortcut while leaving ordinary
+    /// Command-C and text-input/recorder ownership untouched.
+    ///
+    /// Test-only injection parameters keep shortcut routing verifiable without
+    /// reading or mutating private report state.
+    @discardableResult
+    func handleAgentReportCopyShortcut(
+        event: NSEvent,
+        captureEnabled: Bool? = nil,
+        firstResponder: NSResponder? = nil,
+        targetResolver: ((NSEvent) -> (workspaceID: UUID, runtimeSurfaceID: UUID)?)? = nil,
+        hasActiveConfiguredChord: Bool? = nil,
+        configuredShortcutOwnsEvent: ((NSEvent) -> Bool)? = nil,
+        performCopy: ((UUID, UUID) -> Void)? = nil
+    ) -> Bool {
+        guard event.type == .keyDown else { return false }
+        let configuredChordIsActive = hasActiveConfiguredChord
+            ?? (activeConfiguredShortcutChordPrefixForCurrentEvent != nil)
+        guard !configuredChordIsActive else { return false }
+        guard matchShortcut(event: event, shortcut: Self.agentReportCopyShortcut),
+              (captureEnabled ?? agentReportCaptureEnabled) else {
+            return false
+        }
+
+        let resolvedResponder = firstResponder
+            ?? resolvedShortcutEventWindow(event)?.firstResponder
+            ?? shortcutRoutingKeyWindow?.firstResponder
+        if resolvedResponder is NSText || resolvedResponder is NSTextField {
+            return false
+        }
+        if configuredShortcutOwnsEvent?(event) == true {
+            return false
+        }
+
+        let target: (workspaceID: UUID, runtimeSurfaceID: UUID)?
+        if let targetResolver {
+            target = targetResolver(event)
+        } else if let manager = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager,
+                  let workspace = manager.selectedWorkspace,
+                  let panel = manager.selectedTerminalPanel {
+            target = (workspace.id, panel.id)
+        } else {
+            target = nil
+        }
+        guard let target else { return false }
+
+        if let performCopy {
+            performCopy(target.workspaceID, target.runtimeSurfaceID)
+        } else {
+            Task { @MainActor [weak self] in
+                await self?.copyLatestAgentReport(
+                    workspaceID: target.workspaceID,
+                    runtimeSurfaceID: target.runtimeSurfaceID
+                )
+            }
+        }
+        return true
+    }
+
     private func handleCustomShortcut(event: NSEvent) -> Bool {
         guard event.type == .keyDown else {
             clearConfiguredShortcutChordState()
@@ -13236,6 +13486,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             cmuxDebugLog("handleCustomShortcut: unresolved event window context; bypassing app shortcut handling")
 #endif
             return false
+        }
+        if handleAgentReportCopyShortcut(
+            event: event,
+            configuredShortcutOwnsEvent: { [self] event in
+                configuredShortcutOwnsAgentReportCopyEvent(event)
+            }
+        ) {
+            return true
         }
         if handleFocusedFileExplorerOpenSelectionShortcut(
             event,
@@ -15079,6 +15337,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func matchConfiguredShortcut(event: NSEvent, action: KeyboardShortcutSettings.Action) -> Bool {
         if !shortcutWhenClauseAllows(action: action, event: event) { return false }
         return matchConfiguredShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: action))
+    }
+
+    /// Returns whether an existing configurable shortcut owns the fixed Agent
+    /// Report stroke. Single-stroke bindings and eligible chord prefixes both
+    /// win, including custom-command shortcuts from cmux.json.
+    private func configuredShortcutOwnsAgentReportCopyEvent(_ event: NSEvent) -> Bool {
+        let chordActions = Set(currentConfiguredShortcutChordActions())
+        for action in KeyboardShortcutSettings.Action.allCases {
+            guard shortcutWhenClauseAllows(action: action, event: event) else { continue }
+            let shortcut = KeyboardShortcutSettings.shortcut(for: action)
+            if configuredShortcutClaimsEvent(
+                event,
+                shortcut: shortcut,
+                permitsChordPrefix: chordActions.contains(action)
+            ) {
+                return true
+            }
+        }
+
+        let context = preferredMainWindowContextForShortcutRouting(event: event)
+        return configuredCmuxShortcutActions(for: context).contains { action in
+            guard let shortcut = action.shortcut else { return false }
+            return configuredShortcutClaimsEvent(
+                event,
+                shortcut: shortcut,
+                permitsChordPrefix: true
+            )
+        }
+    }
+
+    /// Shared collision predicate used by production routing and focused tests.
+    /// When no chord is active, an eligible first stroke owns the event so the
+    /// general router can arm it instead of the fixed Agent Report action
+    /// consuming it first.
+    func configuredShortcutClaimsEvent(
+        _ event: NSEvent,
+        shortcut: StoredShortcut,
+        permitsChordPrefix: Bool
+    ) -> Bool {
+        guard !shortcut.isUnbound else { return false }
+        if activeConfiguredShortcutChordPrefixForCurrentEvent != nil {
+            return matchConfiguredShortcut(event: event, shortcut: shortcut)
+        }
+        if shortcut.hasChord {
+            return permitsChordPrefix
+                && matchShortcutStroke(event: event, stroke: shortcut.firstStroke)
+        }
+        return matchShortcutStroke(event: event, stroke: shortcut.firstStroke)
     }
 
     /// Whether `action`'s effective `when` clause (its `shortcuts.when` override,

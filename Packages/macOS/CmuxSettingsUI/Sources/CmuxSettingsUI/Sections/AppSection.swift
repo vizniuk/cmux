@@ -11,8 +11,8 @@ import SwiftUI
 /// cmux, Terminal Config link, Open Markdown in cmux Viewer,
 /// Markdown Viewer typography, iMessage Mode, Reorder on Notification, Dock Badge, Menu Bar
 /// Only, Show in Menu Bar, Unread Pane Ring, Pane Flash, Desktop
-/// Notifications, Notification Sound, Notification Command, Send
-/// anonymous telemetry, Warn Before Quit, Warn Before Closing Tab /
+/// Notifications, Notification Sound, Notification Command, Agent Report
+/// Capture, Send anonymous telemetry, Warn Before Quit, Warn Before Closing Tab /
 /// X Button / Hide Tab Close Button, Rename Selects Existing Name,
 /// Command Palette Searches All Surfaces.
 @MainActor
@@ -56,6 +56,7 @@ public struct AppSection: View {
     @State private var soundCommand: DefaultsValueModel<String>
     @State private var customSoundFile: DefaultsValueModel<String>
     @State private var telemetry: DefaultsValueModel<Bool>
+    @State private var agentReportCapture: DefaultsValueModel<Bool>
     @State private var confirmQuit: DefaultsValueModel<ConfirmQuitMode>
     @State private var warnCloseTab: DefaultsValueModel<Bool>
     @State private var warnCloseX: DefaultsValueModel<Bool>
@@ -108,6 +109,7 @@ public struct AppSection: View {
         _soundCommand = State(initialValue: DefaultsValueModel(store: defaultsStore, key: catalog.notifications.command))
         _customSoundFile = State(initialValue: DefaultsValueModel(store: defaultsStore, key: catalog.notifications.customSoundFilePath))
         _telemetry = State(initialValue: DefaultsValueModel(store: defaultsStore, key: catalog.app.sendAnonymousTelemetry))
+        _agentReportCapture = State(initialValue: DefaultsValueModel(store: defaultsStore, key: catalog.app.agentReportCapture))
         _confirmQuit = State(initialValue: DefaultsValueModel(store: defaultsStore, key: catalog.app.confirmQuitMode))
         _warnCloseTab = State(initialValue: DefaultsValueModel(store: defaultsStore, key: catalog.app.warnBeforeClosingTab))
         _warnCloseX = State(initialValue: DefaultsValueModel(store: defaultsStore, key: catalog.app.warnBeforeClosingTabXButton))
@@ -136,7 +138,7 @@ public struct AppSection: View {
             mainCard
         }
         .task {
-            startSettingsObservation([language, appearance, appIcon, placement, inheritDir, minimalMode, keepWorkspaceOpen, firstClick, fileDrop, preferredEditor, openSupported, openMarkdown, globalFontMagnification, markdownFontSize, markdownFontFamily, markdownMaxWidth, canvasPaneGap, canvasSnapping, fileEditorWordWrap, iMessage, reorder, dockBadge, menuBarOnly, showInMenuBar, paneRing, paneFlash, agentPermissionPrompt, agentTurnComplete, agentIdleReminder, soundName, soundCommand, customSoundFile, telemetry, confirmQuit, warnCloseTab, warnCloseX, hideCloseButton, renameSelects, paletteAllSurfaces])
+            startSettingsObservation([language, appearance, appIcon, placement, inheritDir, minimalMode, keepWorkspaceOpen, firstClick, fileDrop, preferredEditor, openSupported, openMarkdown, globalFontMagnification, markdownFontSize, markdownFontFamily, markdownMaxWidth, canvasPaneGap, canvasSnapping, fileEditorWordWrap, iMessage, reorder, dockBadge, menuBarOnly, showInMenuBar, paneRing, paneFlash, agentPermissionPrompt, agentTurnComplete, agentIdleReminder, soundName, soundCommand, customSoundFile, telemetry, agentReportCapture, confirmQuit, warnCloseTab, warnCloseX, hideCloseButton, renameSelects, paletteAllSurfaces])
             if languageAtAppear == nil { languageAtAppear = language.current }; if telemetryAtAppear == nil { telemetryAtAppear = telemetry.current }
         }
     }
@@ -673,6 +675,36 @@ public struct AppSection: View {
             }
             SettingsCardDivider()
 
+            // Agent Report Capture. The package persists only the Boolean;
+            // the host applies it to the process-local private report store.
+            SettingsCardRow(
+                configurationReview: .settingsOnly,
+                searchAnchorID: "setting:app:agent-report-capture",
+                String(
+                    localized: "settings.app.agentReportCapture",
+                    defaultValue: "Agent Report Capture"
+                ),
+                subtitle: String(
+                    localized: "settings.app.agentReportCapture.subtitle",
+                    defaultValue: "Capture the latest completed coding-agent report for explicit copying."
+                )
+            ) {
+                Toggle("", isOn: Binding(
+                    get: { agentReportCapture.current },
+                    set: { enabled in
+                        Self.setAgentReportCapture(
+                            enabled,
+                            model: agentReportCapture,
+                            hostActions: hostActions
+                        )
+                    }
+                ))
+                .labelsHidden()
+                .controlSize(.small)
+                .accessibilityIdentifier("SettingsAgentReportCaptureToggle")
+            }
+            SettingsCardDivider()
+
             // Telemetry
             SettingsCardRow(
                 configurationReview: .json("app.sendAnonymousTelemetry"),
@@ -774,6 +806,20 @@ public struct AppSection: View {
                     .controlSize(.small)
                     .accessibilityIdentifier("CommandPaletteSearchAllSurfacesToggle")
             }
+        }
+    }
+
+    /// Applies the process-local privacy gate before the asynchronous Boolean
+    /// persistence write. A rejected write reconciles both the model and host
+    /// to the value that remains committed.
+    static func setAgentReportCapture(
+        _ enabled: Bool,
+        model: DefaultsValueModel<Bool>,
+        hostActions: SettingsHostActions
+    ) {
+        hostActions.agentReportCaptureDidChange(enabled)
+        model.set(enabled) { committedValue in
+            hostActions.agentReportCaptureDidChange(committedValue)
         }
     }
 

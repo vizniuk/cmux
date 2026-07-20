@@ -176,6 +176,10 @@ public protocol SettingsHostActions: AnyObject {
     /// catalog-backed setting.
     func resetAllSettingsSideEffects()
 
+    /// Applies the persisted Agent Report capture preference to the live,
+    /// process-local private report store.
+    func agentReportCaptureDidChange(_ enabled: Bool)
+
     /// Invalidates host-owned shortcut caches after Settings persists a shortcut change.
     func notifyShortcutSettingsDidChange()
 
@@ -190,6 +194,9 @@ public extension SettingsHostActions {
 
     /// Default no-op for hosts with no app-owned reset side effects.
     func resetAllSettingsSideEffects() {}
+
+    /// Default no-op for hosts without Agent Report capture.
+    func agentReportCaptureDidChange(_ enabled: Bool) {}
 
     /// Default no-op for hosts with no app-owned shortcut caches.
     func notifyShortcutSettingsDidChange() {}

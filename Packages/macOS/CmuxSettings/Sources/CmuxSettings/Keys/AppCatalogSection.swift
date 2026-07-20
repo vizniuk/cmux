@@ -117,6 +117,14 @@ public struct AppCatalogSection: SettingCatalogSection {
         userDefaultsKey: "sendAnonymousTelemetry"
     )
 
+    /// Enables process-local capture of the latest completed coding-agent
+    /// report. Only this Boolean preference is persisted; report content is not.
+    public let agentReportCapture = DefaultsKey<Bool>(
+        id: "app.agentReportCapture",
+        defaultValue: false,
+        userDefaultsKey: "agentReportCaptureEnabled"
+    )
+
     public let confirmQuitMode = DefaultsKey<ConfirmQuitMode>(
         id: "app.confirmQuit",
         defaultValue: .always,

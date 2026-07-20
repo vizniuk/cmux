@@ -227,6 +227,27 @@ struct AgentReportCaptureStoreTests {
         #expect(await store.latestReport(runtimeSurfaceID: surfaceID) == nil)
     }
 
+    @Test("disabling invalidates transcript recovery already in flight")
+    func disableInvalidatesInFlightRecovery() async {
+        let recovery = SuspendedAgentReportTranscriptRecovery(reply: "late exact reply")
+        let store = AgentReportCaptureStore(policy: .enabled, transcriptRecovery: recovery)
+        let capture = Task {
+            await store.capture(
+                request(raw: nil),
+                target: target(),
+                revalidateTarget: { target() }
+            )
+        }
+        await recovery.waitUntilRecoveryStarted()
+
+        await store.setPolicy(.disabled)
+        await recovery.resumeRecovery()
+
+        #expect(await capture.value == .disabled)
+        #expect(await store.isCaptureEnabled == false)
+        #expect(await store.latestReport(runtimeSurfaceID: surfaceID) == nil)
+    }
+
     @Test("authoritative revalidation rejects a session rebind during recovery")
     func rebindDuringRecoveryIsRejected() async {
         let recovery = SuspendedAgentReportTranscriptRecovery(reply: "late exact reply")
@@ -335,6 +356,109 @@ struct AgentReportCaptureStoreTests {
         #expect(await store.latestReport(runtimeSurfaceID: surfaceID)?.finalReply == "completed")
     }
 
+    @Test("authorized copy body preserves exact Unicode and newlines without metadata")
+    func authorizedCopyBodyIsExact() async throws {
+        let recovery = StubAgentReportTranscriptRecovery(reply: nil)
+        let store = AgentReportCaptureStore(policy: .enabled, transcriptRecovery: recovery)
+        let exact = "  ## 完了 ✅\n\nПривіт\nno-extra-newline"
+        #expect(await store.capture(request(raw: exact), target: target()) == .captured)
+        let recoveryCallsBeforeCopy = await recovery.callCount
+
+        let copied = await store.authorizedReportBody(
+            runtimeSurfaceID: surfaceID,
+            authorize: { context in
+                #expect(!String(reflecting: context).contains(exact))
+                #expect(!Mirror(reflecting: context).children.contains { $0.label == "finalReply" })
+                return context.workspaceID == self.workspaceID
+                    && context.runtimeSurfaceID == self.surfaceID
+                    && context.agentSessionID == "session-1"
+                    && context.turnID == "turn-1"
+                    && context.lifecycleToken == self.lifecycleToken
+            }
+        )
+
+        #expect(copied == exact)
+        #expect(copied?.hasSuffix("no-extra-newline") == true)
+        #expect(!exact.contains(workspaceID.uuidString))
+        #expect(await recovery.callCount == recoveryCallsBeforeCopy)
+    }
+
+    @Test("copy lookup cannot cross surfaces or bypass fresh authority")
+    func authorizedCopyEnforcesExactSurfaceAndAuthority() async {
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
+        )
+        #expect(await store.capture(request(raw: "private body"), target: target()) == .captured)
+
+        #expect(
+            await store.authorizedReportBody(runtimeSurfaceID: UUID(), authorize: { _ in true }) == nil
+        )
+        #expect(
+            await store.authorizedReportBody(runtimeSurfaceID: surfaceID, authorize: { _ in false }) == nil
+        )
+    }
+
+    @Test("disable purge and rebind invalidation prevent stale copy")
+    func staleLifecycleCannotCopy() async {
+        let makeStore = {
+            AgentReportCaptureStore(
+                policy: .enabled,
+                transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
+            )
+        }
+
+        let invalidated = makeStore()
+        #expect(await invalidated.capture(request(raw: "old"), target: target()) == .captured)
+        await invalidated.invalidatePendingCapture(runtimeSurfaceID: surfaceID)
+        #expect(
+            await invalidated.authorizedReportBody(runtimeSurfaceID: surfaceID, authorize: { _ in true }) == nil
+        )
+        #expect(await invalidated.latestReport(runtimeSurfaceID: surfaceID)?.finalReply == "old")
+
+        let purged = makeStore()
+        #expect(await purged.capture(request(raw: "old"), target: target()) == .captured)
+        await purged.purge(runtimeSurfaceID: surfaceID)
+        #expect(
+            await purged.authorizedReportBody(runtimeSurfaceID: surfaceID, authorize: { _ in true }) == nil
+        )
+
+        let disabled = makeStore()
+        #expect(await disabled.capture(request(raw: "old"), target: target()) == .captured)
+        await disabled.setPolicy(.disabled)
+        #expect(
+            await disabled.authorizedReportBody(runtimeSurfaceID: surfaceID, authorize: { _ in true }) == nil
+        )
+        await disabled.setPolicy(.enabled)
+        #expect(
+            await disabled.authorizedReportBody(runtimeSurfaceID: surfaceID, authorize: { _ in true }) == nil
+        )
+    }
+
+    @Test("availability observation contains only live topology identities")
+    func availabilitySnapshotsAreContentFree() async throws {
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
+        )
+        let snapshots = await store.availabilitySnapshots()
+        var iterator = snapshots.makeAsyncIterator()
+        let initial = try #require(await iterator.next())
+        #expect(initial.isCaptureEnabled)
+        #expect(initial.workspaceIDByRuntimeSurfaceID.isEmpty)
+
+        let privateBody = "PRIVATE-AVAILABILITY-SENTINEL"
+        #expect(await store.capture(request(raw: privateBody), target: target()) == .captured)
+        let captured = try #require(await iterator.next())
+        #expect(captured.hasReport(runtimeSurfaceID: surfaceID, workspaceID: workspaceID))
+        #expect(!String(describing: captured).contains(privateBody))
+
+        await store.invalidatePendingCapture(runtimeSurfaceID: surfaceID)
+        let invalidated = try #require(await iterator.next())
+        #expect(!invalidated.hasReport(runtimeSurfaceID: surfaceID, workspaceID: workspaceID))
+        #expect(await store.latestReport(runtimeSurfaceID: surfaceID)?.finalReply == privateBody)
+    }
+
     @Test("diagnostic descriptions disclose no identifiers or report properties")
     func diagnosticDescriptionsAreInvariantAcrossPrivateValues() {
         let shortRequest = request(raw: "private")
@@ -440,6 +564,7 @@ struct AgentReportCaptureStoreTests {
             agentSessionID: request.agentSessionID,
             turnID: request.turnID,
             completionKind: request.completionKind,
+            lifecycleToken: target.lifecycleToken,
             finalReply: reply,
             captureSource: .rawHook,
             capturedAt: Date(timeIntervalSince1970: 1),

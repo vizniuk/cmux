@@ -581,6 +581,36 @@ import Testing
         #expect(!flag.didRun)
     }
 
+    @Test func agentReportSettingRevokesHostSynchronouslyAndReconcilesRejectedWrite() async {
+        let suiteName = "agent-report-setting-synchronous-host-policy"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        let store = UserDefaultsSettingsStore(defaults: defaults)
+        let key = SettingCatalog().app.agentReportCapture
+        await store.set(true, for: key)
+        let (stream, _) = AsyncStream<DefaultsEvent<Bool>>.makeStream()
+        let model = DefaultsValueModel(
+            store: store,
+            key: key,
+            initialValue: true,
+            makeStream: { _ in stream }
+        )
+        let host = AgentReportCaptureHostActionsSpy()
+
+        AppSection.setAgentReportCapture(false, model: model, hostActions: host)
+        #expect(host.appliedValues == [false])
+        #expect(model.current == false)
+
+        // Supersede the fire-and-forget write. Its rejection callback must
+        // restore the effective host policy to the authoritative store value.
+        await store.set(true, for: key)
+        await waitUntil { host.appliedValues.last == true }
+
+        #expect(await store.value(for: key) == true)
+        #expect(model.current == true)
+        #expect(host.appliedValues == [false, true])
+    }
+
     private func waitUntil(_ condition: () -> Bool) async {
         var spins = 0
         while !condition(), spins < 100_000 {
@@ -588,4 +618,24 @@ import Testing
             spins += 1
         }
     }
+}
+
+@MainActor
+private final class AgentReportCaptureHostActionsSpy: SettingsHostActions {
+    var appliedValues: [Bool] = []
+
+    func agentReportCaptureDidChange(_ enabled: Bool) {
+        appliedValues.append(enabled)
+    }
+
+    func clearBrowserHistory() {}
+    func openConfigInExternalEditor() {}
+    func sendFeedback() {}
+    func sendTestNotification() {}
+    func openSystemNotificationSettings() {}
+    func restartApp() {}
+    func openBrowserImportFlow() {}
+    func requestNotificationAuthorization() {}
+    func openTerminalConfigWindow() {}
+    func previewNotificationSound(value: String, customFilePath: String) {}
 }

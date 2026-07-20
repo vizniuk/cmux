@@ -8,8 +8,8 @@ import Foundation
 /// or late completions cannot race. Transcript recovery may suspend for
 /// off-main file I/O; policy, actor-owned cleanup generations, and an
 /// app-authoritative opaque lifecycle token force fresh validation after that
-/// suspension. It performs no persistence and exposes no observation surface
-/// in Slice A.
+/// suspension. It performs no persistence. Its observation surface exposes
+/// content-free topology availability only.
 ///
 /// Exact reply text exists only in this actor's process memory. It must never
 /// be forwarded to Feed, notifications, logs, analytics, crash reporting,
@@ -19,6 +19,10 @@ public actor AgentReportCaptureStore {
     private var latestByRuntimeSurfaceID: [UUID: AgentReport] = [:]
     private var latestReceiptOrdinalByRuntimeSurfaceID: [UUID: UInt64] = [:]
     private var lifecycleGenerationByRuntimeSurfaceID: [UUID: UInt64] = [:]
+    private var capturedLifecycleGenerationByRuntimeSurfaceID: [UUID: UInt64] = [:]
+    private var availabilityContinuations: [
+        UUID: AsyncStream<AgentReportAvailabilitySnapshot>.Continuation
+    ] = [:]
     private var policyGeneration: UInt64 = 0
     private var nextReceiptOrdinal: UInt64 = 0
     private let transcriptRecovery: any AgentReportTranscriptRecovering
@@ -56,7 +60,9 @@ public actor AgentReportCaptureStore {
                 latestByRuntimeSurfaceID.removeAll(keepingCapacity: false)
                 latestReceiptOrdinalByRuntimeSurfaceID.removeAll(keepingCapacity: false)
                 lifecycleGenerationByRuntimeSurfaceID.removeAll(keepingCapacity: false)
+                capturedLifecycleGenerationByRuntimeSurfaceID.removeAll(keepingCapacity: false)
             }
+            publishAvailability()
             return
         }
         policy = newPolicy
@@ -65,7 +71,9 @@ public actor AgentReportCaptureStore {
             latestByRuntimeSurfaceID.removeAll(keepingCapacity: false)
             latestReceiptOrdinalByRuntimeSurfaceID.removeAll(keepingCapacity: false)
             lifecycleGenerationByRuntimeSurfaceID.removeAll(keepingCapacity: false)
+            capturedLifecycleGenerationByRuntimeSurfaceID.removeAll(keepingCapacity: false)
         }
+        publishAvailability()
     }
 
     /// Returns the current report for one exact live runtime surface.
@@ -76,6 +84,57 @@ public actor AgentReportCaptureStore {
         latestByRuntimeSurfaceID[runtimeSurfaceID]
     }
 
+    /// Returns an exact report body only after fresh caller-supplied authority.
+    ///
+    /// This is the sole report-body reveal seam. It never performs transcript
+    /// recovery or terminal/scrollback reads. Policy, lifecycle generation, and
+    /// actor-owned latest identity are rechecked after authorization suspends so
+    /// disable, purge, rebind, replacement, or prompt invalidation fails closed.
+    ///
+    /// - Parameters:
+    ///   - runtimeSurfaceID: Exact process-local surface requested by the user.
+    ///   - authorize: Fresh app authority check using body-free metadata.
+    /// - Returns: The unmodified body, or `nil` when unavailable or unauthorized.
+    public func authorizedReportBody(
+        runtimeSurfaceID: UUID,
+        authorize: @escaping @Sendable (AgentReportCopyAuthorizationContext) async -> Bool
+    ) async -> String? {
+        guard policy.isEnabled,
+              let report = latestByRuntimeSurfaceID[runtimeSurfaceID],
+              capturedLifecycleGenerationByRuntimeSurfaceID[runtimeSurfaceID]
+                == lifecycleGenerationByRuntimeSurfaceID[runtimeSurfaceID, default: 0],
+              await authorize(AgentReportCopyAuthorizationContext(report: report)),
+              policy.isEnabled,
+              latestByRuntimeSurfaceID[runtimeSurfaceID] == report,
+              capturedLifecycleGenerationByRuntimeSurfaceID[runtimeSurfaceID]
+                == lifecycleGenerationByRuntimeSurfaceID[runtimeSurfaceID, default: 0] else {
+            return nil
+        }
+        return report.finalReply
+    }
+
+    /// Observes content-free report availability without polling.
+    ///
+    /// Each subscriber immediately receives the current snapshot. Later
+    /// capture, replacement, lifecycle invalidation, purge, and policy changes
+    /// yield new snapshots. No report-derived text or provider metadata is
+    /// included.
+    ///
+    /// - Returns: A newest-value stream of content-free availability.
+    public func availabilitySnapshots() -> AsyncStream<AgentReportAvailabilitySnapshot> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: AgentReportAvailabilitySnapshot.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        availabilityContinuations[id] = continuation
+        continuation.yield(availabilitySnapshot())
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeAvailabilityContinuation(id: id) }
+        }
+        return stream
+    }
+
     /// Purges report state owned by a closed or replaced runtime surface.
     ///
     /// - Parameter runtimeSurfaceID: Exact process-local surface identifier.
@@ -83,6 +142,8 @@ public actor AgentReportCaptureStore {
         invalidatePendingCapture(runtimeSurfaceID: runtimeSurfaceID)
         latestByRuntimeSurfaceID.removeValue(forKey: runtimeSurfaceID)
         latestReceiptOrdinalByRuntimeSurfaceID.removeValue(forKey: runtimeSurfaceID)
+        capturedLifecycleGenerationByRuntimeSurfaceID.removeValue(forKey: runtimeSurfaceID)
+        publishAvailability()
     }
 
     /// Invalidates capture work already in flight for a surface while keeping
@@ -92,6 +153,7 @@ public actor AgentReportCaptureStore {
     /// - Parameter runtimeSurfaceID: Surface whose in-flight generation changes.
     public func invalidatePendingCapture(runtimeSurfaceID: UUID) {
         lifecycleGenerationByRuntimeSurfaceID[runtimeSurfaceID, default: 0] &+= 1
+        publishAvailability()
     }
 
     /// Validates and captures one exact final report.
@@ -215,6 +277,7 @@ public actor AgentReportCaptureStore {
             agentSessionID: request.agentSessionID,
             turnID: request.turnID,
             completionKind: request.completionKind,
+            lifecycleToken: currentTarget.lifecycleToken,
             finalReply: exactReply,
             captureSource: source,
             capturedAt: now(),
@@ -223,6 +286,8 @@ public actor AgentReportCaptureStore {
             duplicateIdentity: identity
         )
         latestReceiptOrdinalByRuntimeSurfaceID[request.runtimeSurfaceID] = receiptOrdinal
+        capturedLifecycleGenerationByRuntimeSurfaceID[request.runtimeSurfaceID] = lifecycleGeneration
+        publishAvailability()
         return .captured
     }
 
@@ -270,5 +335,40 @@ public actor AgentReportCaptureStore {
             return nil
         }
         return value
+    }
+
+    /// Builds the narrow content-free projection used by visible controls.
+    private func availabilitySnapshot() -> AgentReportAvailabilitySnapshot {
+        guard policy.isEnabled else {
+            return AgentReportAvailabilitySnapshot(
+                isCaptureEnabled: false,
+                workspaceIDByRuntimeSurfaceID: [:]
+            )
+        }
+        let available = latestByRuntimeSurfaceID.reduce(into: [UUID: UUID]()) { result, element in
+            let (surfaceID, report) = element
+            guard capturedLifecycleGenerationByRuntimeSurfaceID[surfaceID]
+                    == lifecycleGenerationByRuntimeSurfaceID[surfaceID, default: 0] else {
+                return
+            }
+            result[surfaceID] = report.workspaceID
+        }
+        return AgentReportAvailabilitySnapshot(
+            isCaptureEnabled: true,
+            workspaceIDByRuntimeSurfaceID: available
+        )
+    }
+
+    /// Publishes a content-free newest-value snapshot to every subscriber.
+    private func publishAvailability() {
+        let snapshot = availabilitySnapshot()
+        for continuation in availabilityContinuations.values {
+            continuation.yield(snapshot)
+        }
+    }
+
+    /// Removes a terminated availability subscriber.
+    private func removeAvailabilityContinuation(id: UUID) {
+        availabilityContinuations.removeValue(forKey: id)
     }
 }

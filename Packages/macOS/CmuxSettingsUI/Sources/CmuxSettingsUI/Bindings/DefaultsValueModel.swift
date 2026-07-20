@@ -134,6 +134,34 @@ public final class DefaultsValueModel<Value: SettingCodable> {
         return source
     }
 
+    /// Persists an optimistically-applied value and reports storage rejection.
+    ///
+    /// Privacy-sensitive host effects can apply synchronously in a binding
+    /// setter, then use `onRejected` to restore the effective host state if the
+    /// asynchronous defaults write loses a revision race or is rejected.
+    ///
+    /// - Parameters:
+    ///   - value: The new optimistic and persisted value.
+    ///   - onRejected: Main-actor reconciliation invoked with the value that
+    ///     remains committed in the store when this write is rejected.
+    @discardableResult
+    public func set(
+        _ value: Value,
+        onRejected: @escaping @MainActor @Sendable (Value) -> Void
+    ) -> UserDefaultsSettingsMutationSource {
+        let source = recordPendingStoreEcho(value)
+        updateCurrent(value)
+        Task { @MainActor [self, store, key, source, value, onRejected] in
+            guard await store.set(value, for: key, source: source) != nil else {
+                let committedValue = await store.value(for: key)
+                reconcileRejectedStoreWrite(source: source, committedValue: committedValue)
+                onRejected(committedValue)
+                return
+            }
+        }
+        return source
+    }
+
     /// Persists the value, then runs `afterCommit` after storage accepts it.
     ///
     /// Use this when a setting has host-side live-update work that must observe

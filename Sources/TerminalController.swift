@@ -5708,6 +5708,52 @@ class TerminalController {
         )
     }
 
+    /// Revalidates a retained report against current workspace, surface,
+    /// session, turn, stable-surface, and lifecycle authority before an
+    /// explicit user copy.
+    ///
+    /// The validation consults only content-free hook lifecycle metadata. It
+    /// performs no transcript read, terminal/scrollback capture, network call,
+    /// or provider request.
+    ///
+    /// - Parameters:
+    ///   - context: Body-free capture-time identity and lifecycle authority.
+    ///   - representedWorkspaceID: Exact active or menu/button workspace.
+    ///   - representedSurfaceID: Exact active or menu/button runtime surface.
+    /// - Returns: `true` only while the original report tuple remains current.
+    @MainActor
+    func authorizesAgentReportCopy(
+        _ context: AgentReportCopyAuthorizationContext,
+        representedWorkspaceID: UUID,
+        representedSurfaceID: UUID
+    ) async -> Bool {
+        guard context.workspaceID == representedWorkspaceID,
+              context.runtimeSurfaceID == representedSurfaceID else {
+            return false
+        }
+        let request = AgentReportCaptureRequest(
+            provider: context.provider,
+            workspaceID: context.workspaceID,
+            runtimeSurfaceID: context.runtimeSurfaceID,
+            agentSessionID: context.agentSessionID,
+            turnID: context.turnID,
+            completionKind: context.completionKind,
+            transcriptPath: nil,
+            rawFinalReply: nil,
+            completionTimestamp: .distantPast,
+            promptTimestamp: nil
+        )
+        guard let target = await agentReportCaptureTarget(for: request) else {
+            return false
+        }
+        return target.workspaceID == context.workspaceID
+            && target.runtimeSurfaceID == context.runtimeSurfaceID
+            && target.stableSurfaceID == context.stableSurfaceID
+            && target.agentSessionID == context.agentSessionID
+            && target.turnID == context.turnID
+            && target.lifecycleToken == context.lifecycleToken
+    }
+
     /// Purges completed and in-flight report state for a truly closed surface.
     ///
     /// - Parameter runtimeSurfaceID: Exact process-local closed surface.

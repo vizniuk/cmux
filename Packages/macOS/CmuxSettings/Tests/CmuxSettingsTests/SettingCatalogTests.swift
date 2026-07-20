@@ -106,4 +106,47 @@ struct SettingCatalogTests {
         #expect(catalog.paneChrome.paneBorderColorHex.id == "paneBorderColor")
         #expect(catalog.paneChrome.activePaneBorderColorHex.id == "activePaneBorderColor")
     }
+
+    @Test func agentReportCaptureDefaultsDisabled() {
+        let key = SettingCatalog().app.agentReportCapture
+        #expect(key.defaultValue == false)
+        #expect(key.userDefaultsKey == "agentReportCaptureEnabled")
+    }
+
+    @Test func persistedAgentReportCapturePreferenceAppliesAtStartup() async throws {
+        let suiteName = "cmux-settings-agent-report-\(UUID().uuidString)"
+        let cleanupDefaults = try #require(UserDefaults(suiteName: suiteName))
+        cleanupDefaults.removePersistentDomain(forName: suiteName)
+        defer { cleanupDefaults.removePersistentDomain(forName: suiteName) }
+        let key = SettingCatalog().app.agentReportCapture
+        let writer = UserDefaultsSettingsStore(
+            defaults: try #require(UserDefaults(suiteName: suiteName))
+        )
+        await writer.set(true, for: key)
+
+        let startupStore = UserDefaultsSettingsStore(
+            defaults: try #require(UserDefaults(suiteName: suiteName))
+        )
+        #expect(startupStore.initialValue(for: key) == true)
+    }
+
+    @Test func agentReportPreferencePersistsOnlyABoolean() async throws {
+        let suiteName = "cmux-settings-agent-report-privacy-\(UUID().uuidString)"
+        let cleanupDefaults = try #require(UserDefaults(suiteName: suiteName))
+        cleanupDefaults.removePersistentDomain(forName: suiteName)
+        defer { cleanupDefaults.removePersistentDomain(forName: suiteName) }
+        let key = SettingCatalog().app.agentReportCapture
+        let store = UserDefaultsSettingsStore(
+            defaults: try #require(UserDefaults(suiteName: suiteName))
+        )
+        let privateBody = "PRIVATE-REPORT-PERSISTENCE-SENTINEL"
+
+        await store.set(true, for: key)
+
+        let inspectionDefaults = try #require(UserDefaults(suiteName: suiteName))
+        let domain = try #require(inspectionDefaults.persistentDomain(forName: suiteName))
+        #expect(domain[key.userDefaultsKey] as? Bool == true)
+        #expect(domain.count == 1)
+        #expect(!String(describing: domain).contains(privateBody))
+    }
 }

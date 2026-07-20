@@ -766,6 +766,252 @@ final class TerminalControllerSocketSecurityTests {
         )
     }
 
+    @Test func centralAgentReportCopyWritesExactBodyAndUnavailableDoesNotTouchClipboard() async throws {
+        let manager = TabManager()
+        let workspace = try #require(manager.selectedWorkspace)
+        let panel = try #require(workspace.focusedTerminalPanel)
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: SuspendedEndpointAgentReportRecovery(reply: "unused")
+        )
+        let workspaceID = workspace.id
+        let surfaceID = panel.id
+        let exact = "  ## 完了 ✅\n\nUnicode: Привіт\nno-extra-newline"
+        let request = agentReportRequest(workspace: workspace, panel: panel, raw: exact)
+        let target = agentReportTarget(workspace: workspace, panel: panel)
+        #expect(await store.capture(request, target: target, revalidateTarget: { target }) == .captured)
+        let pasteboard = NSPasteboard(name: .init("cmux-agent-report-copy-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        pasteboard.setString("stale clipboard", forType: .string)
+
+        let copied = await AppDelegate.copyLatestAgentReport(
+            store: store,
+            runtimeSurfaceID: surfaceID,
+            to: pasteboard,
+            authorize: { report in
+                report.workspaceID == workspaceID && report.runtimeSurfaceID == surfaceID
+            }
+        )
+
+        #expect(copied)
+        #expect(pasteboard.string(forType: .string) == exact)
+        #expect(!pasteboard.string(forType: .string)!.contains(workspaceID.uuidString))
+        #expect(pasteboard.string(forType: .string)!.hasSuffix("no-extra-newline"))
+
+        pasteboard.clearContents()
+        pasteboard.setString("preserve me", forType: .string)
+        let unavailableChangeCount = pasteboard.changeCount
+        #expect(
+            await AppDelegate.copyLatestAgentReport(
+                store: store,
+                runtimeSurfaceID: UUID(),
+                to: pasteboard,
+                authorize: { _ in true }
+            ) == false
+        )
+        #expect(pasteboard.changeCount == unavailableChangeCount)
+        #expect(pasteboard.string(forType: .string) == "preserve me")
+
+        #expect(
+            await AppDelegate.copyLatestAgentReport(
+                store: store,
+                runtimeSurfaceID: surfaceID,
+                to: pasteboard,
+                authorize: { _ in true },
+                shouldWrite: { false }
+            ) == false
+        )
+        #expect(pasteboard.changeCount == unavailableChangeCount)
+
+        #expect(
+            await AppDelegate.copyLatestAgentReport(
+                store: store,
+                runtimeSurfaceID: surfaceID,
+                to: pasteboard,
+                authorize: { _ in false }
+            ) == false
+        )
+        #expect(pasteboard.changeCount == unavailableChangeCount)
+        workspace.teardownAllPanels()
+    }
+
+    @Test func shiftCommandCUsesCentralRequestWhileCommandCAndTextInputRemainUntouched() throws {
+        let previousAppDelegate = AppDelegate.shared
+        let app = AppDelegate()
+        defer { AppDelegate.shared = previousAppDelegate }
+        let workspaceID = UUID()
+        let surfaceID = UUID()
+        var requests: [(UUID, UUID)] = []
+        let shiftCommandC = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command, .shift],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "C",
+            charactersIgnoringModifiers: "c",
+            isARepeat: false,
+            keyCode: 8
+        ))
+
+        #expect(app.handleAgentReportCopyShortcut(
+            event: shiftCommandC,
+            captureEnabled: true,
+            targetResolver: { _ in (workspaceID, surfaceID) },
+            performCopy: { requests.append(($0, $1)) }
+        ))
+        #expect(requests.count == 1)
+        #expect(requests.first?.0 == workspaceID)
+        #expect(requests.first?.1 == surfaceID)
+
+        let commandC = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "c",
+            charactersIgnoringModifiers: "c",
+            isARepeat: false,
+            keyCode: 8
+        ))
+        #expect(!app.handleAgentReportCopyShortcut(
+            event: commandC,
+            captureEnabled: true,
+            targetResolver: { _ in (workspaceID, surfaceID) },
+            performCopy: { requests.append(($0, $1)) }
+        ))
+        #expect(!app.handleAgentReportCopyShortcut(
+            event: shiftCommandC,
+            captureEnabled: true,
+            firstResponder: NSTextView(),
+            targetResolver: { _ in (workspaceID, surfaceID) },
+            performCopy: { requests.append(($0, $1)) }
+        ))
+        #expect(!app.handleAgentReportCopyShortcut(
+            event: shiftCommandC,
+            captureEnabled: true,
+            targetResolver: { _ in (workspaceID, surfaceID) },
+            configuredShortcutOwnsEvent: { _ in true },
+            performCopy: { requests.append(($0, $1)) }
+        ))
+        #expect(!app.handleAgentReportCopyShortcut(
+            event: shiftCommandC,
+            captureEnabled: true,
+            targetResolver: { _ in (workspaceID, surfaceID) },
+            hasActiveConfiguredChord: true,
+            performCopy: { requests.append(($0, $1)) }
+        ))
+
+        let configuredChord = StoredShortcut(
+            key: "c",
+            command: true,
+            shift: true,
+            option: false,
+            control: false,
+            chordKey: "x"
+        )
+        let configuredSingleStroke = StoredShortcut(
+            key: "c",
+            command: true,
+            shift: true,
+            option: false,
+            control: false
+        )
+        #expect(app.configuredShortcutClaimsEvent(
+            shiftCommandC,
+            shortcut: configuredSingleStroke,
+            permitsChordPrefix: false
+        ))
+        #expect(app.configuredShortcutClaimsEvent(
+            shiftCommandC,
+            shortcut: configuredChord,
+            permitsChordPrefix: true
+        ))
+        #expect(!app.configuredShortcutClaimsEvent(
+            shiftCommandC,
+            shortcut: configuredChord,
+            permitsChordPrefix: false
+        ))
+        #expect(!app.handleAgentReportCopyShortcut(
+            event: shiftCommandC,
+            captureEnabled: true,
+            targetResolver: { _ in (workspaceID, surfaceID) },
+            configuredShortcutOwnsEvent: { event in
+                app.configuredShortcutClaimsEvent(
+                    event,
+                    shortcut: configuredChord,
+                    permitsChordPrefix: true
+                )
+            },
+            performCopy: { requests.append(($0, $1)) }
+        ))
+        #expect(requests.count == 1)
+    }
+
+    @Test func representedMenuAndSmallButtonExposeOnlyLocalizedContentFreeState() throws {
+        let manager = TabManager()
+        let workspace = try #require(manager.selectedWorkspace)
+        let panel = try #require(workspace.focusedTerminalPanel)
+        let surfaceView = panel.hostedView.surfaceView
+        var requests: [(UUID, UUID)] = []
+        surfaceView.agentReportCopyRequestHandler = { requests.append(($0, $1)) }
+        defer {
+            surfaceView.agentReportCopyRequestHandler = nil
+            workspace.teardownAllPanels()
+        }
+
+        let enabledItem = surfaceView.makeAgentReportCopyMenuItem(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: panel.id,
+            isCaptureEnabled: true,
+            hasReport: true
+        )
+        let unavailableItem = surfaceView.makeAgentReportCopyMenuItem(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: panel.id,
+            isCaptureEnabled: false,
+            hasReport: true
+        )
+        #expect(enabledItem.title == String(localized: "agentReport.copy", defaultValue: "Copy Agent Report"))
+        #expect(enabledItem.isEnabled)
+        #expect(!unavailableItem.isEnabled)
+
+        // The represented IDs remain authoritative even if app focus changes
+        // after the menu was constructed.
+        surfaceView.copyAgentReport(enabledItem)
+        #expect(requests.count == 1)
+        #expect(requests.first?.0 == workspace.id)
+        #expect(requests.first?.1 == panel.id)
+
+        let hostedView = panel.hostedView
+        hostedView.frame = NSRect(x: 0, y: 0, width: 44, height: 40)
+        hostedView.layoutSubtreeIfNeeded()
+        hostedView.applyAgentReportCopyControlState(isCaptureEnabled: true, hasReport: true)
+        let button = hostedView.agentReportCopyButtonForTesting
+        let localizedTitle = String(localized: "agentReport.copy", defaultValue: "Copy Agent Report")
+        #expect(!button.isHidden)
+        #expect(button.isEnabled)
+        #expect(button.toolTip == localizedTitle)
+        #expect(button.accessibilityLabel() == localizedTitle)
+        #expect(button.title.isEmpty)
+        #expect(hostedView.bounds.contains(button.frame))
+        #expect(!String(describing: button).contains("PRIVATE-REPORT"))
+
+        button.performClick(nil)
+        #expect(requests.count == 2)
+        #expect(requests.last?.0 == workspace.id)
+        #expect(requests.last?.1 == panel.id)
+
+        hostedView.applyAgentReportCopyControlState(isCaptureEnabled: true, hasReport: false)
+        #expect(!button.isHidden)
+        #expect(!button.isEnabled)
+        hostedView.applyAgentReportCopyControlState(isCaptureEnabled: false, hasReport: false)
+        #expect(button.isHidden)
+    }
+
     @Test(arguments: ["tab", "pane", "workspace"])
     func completedReportIsPurgedByEveryTrueRemovalPath(_ removalPath: String) async throws {
         let controller = TerminalController.shared

@@ -90,6 +90,11 @@ final class HostSettingsActions: SettingsHostActions {
         LanguageSettingsStore(defaults: .standard).applyLanguageOverride(.system)
         PaneChromeSettings.notifyDidChange()
         AppDelegate.shared?.reconcileSocketListenerConfiguration(source: "settings.reset_all")
+        AppDelegate.shared?.applyAgentReportCapturePolicy(false)
+    }
+
+    func agentReportCaptureDidChange(_ enabled: Bool) {
+        AppDelegate.shared?.applyAgentReportCapturePolicy(enabled)
     }
 
     func notifyShortcutSettingsDidChange() {

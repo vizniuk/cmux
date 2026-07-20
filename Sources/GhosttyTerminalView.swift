@@ -3537,6 +3537,8 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
     var selectionTranslationHostView: NSView?
     var onFocus: (() -> Void)?
     var onTriggerFlash: (() -> Void)?
+    /// Test seam and single dispatch point for represented-surface copy UI.
+    var agentReportCopyRequestHandler: ((UUID, UUID) -> Void)?
     var backgroundColor: NSColor?
     private var appliedColorScheme: ghostty_color_scheme_e?
     private var lastLoggedSurfaceBackgroundSignature: String?
@@ -5188,6 +5190,19 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
             return canSplitCurrentSurface()
         case #selector(copyWorkspaceAndSurfaceIdentifiers(_:)):
             return terminalSurface != nil
+        case #selector(copyAgentReport(_:)):
+            guard let menuItem = item as? NSMenuItem,
+                  let represented = menuItem.representedObject as? [String: String],
+                  let workspaceValue = represented["workspaceID"],
+                  let surfaceValue = represented["runtimeSurfaceID"],
+                  let workspaceID = UUID(uuidString: workspaceValue),
+                  let runtimeSurfaceID = UUID(uuidString: surfaceValue) else {
+                return false
+            }
+            return AppDelegate.shared?.agentReportCopyControlAvailability(
+                workspaceID: workspaceID,
+                runtimeSurfaceID: runtimeSurfaceID
+            ).hasReport == true
         default:
             return true
         }
@@ -7245,6 +7260,19 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
             item.target = self
             addTranslateSelectionMenuItem(to: menu, surface: surface)
         }
+        if let terminalSurface {
+            let availability = AppDelegate.shared?.agentReportCopyControlAvailability(
+                workspaceID: terminalSurface.tabId,
+                runtimeSurfaceID: terminalSurface.id,
+                representedSurface: terminalSurface
+            ) ?? (isCaptureEnabled: false, hasReport: false)
+            menu.addItem(makeAgentReportCopyMenuItem(
+                workspaceID: terminalSurface.tabId,
+                runtimeSurfaceID: terminalSurface.id,
+                isCaptureEnabled: availability.isCaptureEnabled,
+                hasReport: availability.hasReport
+            ))
+        }
         let pasteItem = menu.addItem(
             withTitle: String(localized: "terminalContextMenu.paste", defaultValue: "Paste"),
             action: #selector(paste(_:)),
@@ -7303,6 +7331,65 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
             linkItem.target = self
         }
         return menu
+    }
+
+    /// Builds the represented-surface menu item without report-derived state.
+    func makeAgentReportCopyMenuItem(
+        workspaceID: UUID,
+        runtimeSurfaceID: UUID,
+        isCaptureEnabled: Bool,
+        hasReport: Bool
+    ) -> NSMenuItem {
+        let title = String(localized: "agentReport.copy", defaultValue: "Copy Agent Report")
+        let item = NSMenuItem(
+            title: title,
+            action: #selector(copyAgentReport(_:)),
+            keyEquivalent: ""
+        )
+        item.target = self
+        item.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: title)
+        item.representedObject = [
+            "workspaceID": workspaceID.uuidString,
+            "runtimeSurfaceID": runtimeSurfaceID.uuidString,
+        ]
+        item.isEnabled = isCaptureEnabled && hasReport
+        return item
+    }
+
+    /// Copies the report for the IDs captured when the context menu was built.
+    @objc func copyAgentReport(_ sender: NSMenuItem) {
+        guard let represented = sender.representedObject as? [String: String],
+              let workspaceValue = represented["workspaceID"],
+              let surfaceValue = represented["runtimeSurfaceID"],
+              let workspaceID = UUID(uuidString: workspaceValue),
+              let runtimeSurfaceID = UUID(uuidString: surfaceValue) else {
+            return
+        }
+        requestAgentReportCopy(workspaceID: workspaceID, runtimeSurfaceID: runtimeSurfaceID)
+    }
+
+    /// Routes every represented UI control to the central app copy action.
+    func requestAgentReportCopy(workspaceID: UUID, runtimeSurfaceID: UUID) {
+        if let agentReportCopyRequestHandler {
+            agentReportCopyRequestHandler(workspaceID, runtimeSurfaceID)
+            return
+        }
+        Task { @MainActor in
+            await AppDelegate.shared?.copyLatestAgentReport(
+                workspaceID: workspaceID,
+                runtimeSurfaceID: runtimeSurfaceID
+            )
+        }
+    }
+
+    /// Routes the currently represented terminal instance without consulting
+    /// whichever surface becomes active later.
+    func requestAgentReportCopyForRepresentedSurface() {
+        guard let terminalSurface else { return }
+        requestAgentReportCopy(
+            workspaceID: terminalSurface.tabId,
+            runtimeSurfaceID: terminalSurface.id
+        )
     }
 
     private func canSplitCurrentSurface() -> Bool {
@@ -8139,6 +8226,7 @@ final class GhosttySurfaceScrollView: NSView {
     private let inactiveOverlayView: GhosttyFlashOverlayView
     private let dropZoneOverlayView: GhosttyFlashOverlayView
     private let paneDropTargetView = TerminalPaneDropTargetView(frame: .zero)
+    private let agentReportCopyButton: NSButton
     private let notificationRingOverlayView: GhosttyFlashOverlayView
     private let notificationRingLayer: CAShapeLayer
     private let flashOverlayView: GhosttyFlashOverlayView
@@ -8407,6 +8495,7 @@ final class GhosttySurfaceScrollView: NSView {
         imageTransferIndicatorView = NSVisualEffectView(frame: .zero)
         imageTransferIndicatorSpinner = NSProgressIndicator(frame: .zero)
         imageTransferCancelButton = NSButton(frame: .zero)
+        agentReportCopyButton = NSButton(frame: .zero)
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = false
@@ -8438,6 +8527,34 @@ final class GhosttySurfaceScrollView: NSView {
         addSubview(mobileViewportBorderOverlayView, positioned: .above, relativeTo: scrollView)
         paneDropTargetView.hostedView = self
         addSubview(paneDropTargetView, positioned: .above, relativeTo: nil)
+        let agentReportCopyTitle = String(
+            localized: "agentReport.copy",
+            defaultValue: "Copy Agent Report"
+        )
+        agentReportCopyButton.translatesAutoresizingMaskIntoConstraints = false
+        agentReportCopyButton.isBordered = false
+        agentReportCopyButton.imagePosition = .imageOnly
+        agentReportCopyButton.title = ""
+        agentReportCopyButton.image = NSImage(
+            systemSymbolName: "doc.on.doc",
+            accessibilityDescription: agentReportCopyTitle
+        )
+        agentReportCopyButton.contentTintColor = .secondaryLabelColor
+        agentReportCopyButton.toolTip = agentReportCopyTitle
+        agentReportCopyButton.setAccessibilityLabel(agentReportCopyTitle)
+        agentReportCopyButton.setAccessibilityElement(true)
+        agentReportCopyButton.identifier = NSUserInterfaceItemIdentifier("AgentReportCopyButton")
+        agentReportCopyButton.target = self
+        agentReportCopyButton.action = #selector(handleAgentReportCopyButton)
+        agentReportCopyButton.isHidden = true
+        addSubview(agentReportCopyButton, positioned: .above, relativeTo: nil)
+        NSLayoutConstraint.activate([
+            agentReportCopyButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            agentReportCopyButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+            agentReportCopyButton.widthAnchor.constraint(equalToConstant: 22),
+            agentReportCopyButton.heightAnchor.constraint(equalToConstant: 22),
+        ])
+        bringPaneDropTargetToFrontIfNeeded()
         synchronizeScrollbarAppearance()
         inactiveOverlayView.wantsLayer = true
         inactiveOverlayView.layer?.backgroundColor = NSColor.clear.cgColor
@@ -8616,6 +8733,14 @@ final class GhosttySurfaceScrollView: NSView {
         linkHoverIndicatorView.frame = bounds
         linkHoverIndicatorView.autoresizingMask = [.width, .height]
         addSubview(linkHoverIndicatorView)
+
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .agentReportCopyAvailabilityDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.synchronizeAgentReportCopyControl()
+        })
 
         scrollView.contentView.postsBoundsChangedNotifications = true
         observers.append(NotificationCenter.default.addObserver(
@@ -9032,6 +9157,9 @@ final class GhosttySurfaceScrollView: NSView {
     }
 
     private func bringPaneDropTargetToFrontIfNeeded() {
+        if agentReportCopyButton.superview !== self {
+            addSubview(agentReportCopyButton, positioned: .above, relativeTo: nil)
+        }
         if paneDropTargetView.superview !== self || subviews.last !== paneDropTargetView {
             addSubview(paneDropTargetView, positioned: .above, relativeTo: nil)
         }
@@ -9192,11 +9320,42 @@ final class GhosttySurfaceScrollView: NSView {
     func attachSurface(_ terminalSurface: TerminalSurface) {
         if surfaceView.terminalSurface !== terminalSurface { setLinkHoverURL(nil) }
         surfaceView.attachSurface(terminalSurface)
+        synchronizeAgentReportCopyControl()
         // Preserve the bootstrap 800x600 surface until portal reattach churn
         // has produced a real host size instead of a transient 1x1 placeholder.
         guard bounds.width > 1, bounds.height > 1 else { return }
         _ = synchronizeGeometryAndContent()
         synchronizeCloudTerminalReconnectOverlay()
+    }
+
+    /// Applies content-free visible/enabled state to the small overlay button.
+    func applyAgentReportCopyControlState(isCaptureEnabled: Bool, hasReport: Bool) {
+        agentReportCopyButton.isHidden = !isCaptureEnabled
+        agentReportCopyButton.isEnabled = isCaptureEnabled && hasReport
+    }
+
+    /// Refreshes the small control for this exact represented live surface.
+    func synchronizeAgentReportCopyControl() {
+        guard let terminalSurface = surfaceView.terminalSurface else {
+            applyAgentReportCopyControlState(isCaptureEnabled: false, hasReport: false)
+            return
+        }
+        let availability = AppDelegate.shared?.agentReportCopyControlAvailability(
+            workspaceID: terminalSurface.tabId,
+            runtimeSurfaceID: terminalSurface.id,
+            representedSurface: terminalSurface
+        ) ?? (isCaptureEnabled: false, hasReport: false)
+        applyAgentReportCopyControlState(
+            isCaptureEnabled: availability.isCaptureEnabled,
+            hasReport: availability.hasReport
+        )
+    }
+
+    /// Internal test inspection of content-free button state and geometry.
+    var agentReportCopyButtonForTesting: NSButton { agentReportCopyButton }
+
+    @objc private func handleAgentReportCopyButton() {
+        surfaceView.requestAgentReportCopyForRepresentedSurface()
     }
 
     func setFocusHandler(_ handler: (() -> Void)?) {

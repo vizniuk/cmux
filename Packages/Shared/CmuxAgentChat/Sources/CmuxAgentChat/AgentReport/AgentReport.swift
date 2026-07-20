@@ -29,6 +29,9 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
     /// The accepted completion boundary.
     public let completionKind: AgentReportCompletionKind
 
+    /// Capture-time lifecycle authority, compared again before explicit copy.
+    public let lifecycleToken: UUID
+
     /// Exact final reply text. This value is never suitable for diagnostics.
     public let finalReply: String
 
@@ -66,6 +69,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
     ///   - agentSessionID: Provider-owned session identity.
     ///   - turnID: Provider-owned completed turn identity.
     ///   - completionKind: Accepted provider lifecycle boundary.
+    ///   - lifecycleToken: Capture-time live lifecycle authority.
     ///   - finalReply: Unmodified private final reply text.
     ///   - captureSource: Authoritative source of `finalReply`.
     ///   - capturedAt: Time the actor committed the record.
@@ -80,6 +84,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
         agentSessionID: String,
         turnID: String,
         completionKind: AgentReportCompletionKind,
+        lifecycleToken: UUID,
         finalReply: String,
         captureSource: AgentReportCaptureSource,
         capturedAt: Date,
@@ -94,6 +99,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
         self.agentSessionID = agentSessionID
         self.turnID = turnID
         self.completionKind = completionKind
+        self.lifecycleToken = lifecycleToken
         self.finalReply = finalReply
         self.captureSource = captureSource
         self.capturedAt = capturedAt
