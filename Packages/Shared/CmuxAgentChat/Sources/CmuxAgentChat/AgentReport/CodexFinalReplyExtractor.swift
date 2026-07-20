@@ -1,5 +1,17 @@
 import Foundation
 
+/// One complete descriptor-backed Codex transcript record.
+///
+/// This SPI keeps byte-level corruption distinct from valid Unicode without
+/// exposing transcript-recovery internals as user-facing package API.
+@_spi(AgentReportTranscript)
+public enum CodexTranscriptRecord: Sendable {
+    /// A complete record that decoded as strict UTF-8.
+    case jsonLine(String)
+    /// A newline-terminated record that failed strict UTF-8 decoding.
+    case malformedCompleteRecord
+}
+
 /// Extracts an exact final assistant reply from Codex rollout JSONL without
 /// applying preview normalization or ``TranscriptTextBudget``.
 ///
@@ -21,8 +33,26 @@ public struct CodexFinalReplyExtractor: Sendable {
         lines: some Sequence<String>,
         sessionID: String
     ) -> Bool {
+        isPrimarySession(
+            records: lines.lazy.map(CodexTranscriptRecord.jsonLine),
+            sessionID: sessionID
+        )
+    }
+
+    /// Validates primary-session metadata from descriptor-backed records.
+    ///
+    /// - Parameters:
+    ///   - records: Complete strict UTF-8 records or explicit malformed-record events.
+    ///   - sessionID: Exact provider session expected in `session_meta`.
+    /// - Returns: `true` only for a matching, uncorrupted primary rollout.
+    @_spi(AgentReportTranscript)
+    public func isPrimarySession(
+        records: some Sequence<CodexTranscriptRecord>,
+        sessionID: String
+    ) -> Bool {
         var result: Bool?
-        for line in lines {
+        for record in records {
+            guard case let .jsonLine(line) = record else { return false }
             guard line.utf8.count <= AgentReportResourceLimits.sliceA.maximumJSONLRecordBytes else {
                 return false
             }
@@ -57,6 +87,30 @@ public struct CodexFinalReplyExtractor: Sendable {
         sessionID: String,
         turnID: String
     ) -> String? {
+        extract(
+            records: lines.lazy.map(CodexTranscriptRecord.jsonLine),
+            sessionID: sessionID,
+            turnID: turnID
+        )
+    }
+
+    /// Extracts one exact final reply from descriptor-backed transcript records.
+    ///
+    /// A malformed complete record clears inherited turn authority and all
+    /// candidates until a later explicit turn boundary establishes new authority.
+    ///
+    /// - Parameters:
+    ///   - records: Complete strict UTF-8 records or explicit malformed-record events.
+    ///   - sessionID: Exact provider session identifier expected in `session_meta`.
+    ///   - turnID: Exact accepted Codex turn identifier.
+    /// - Returns: Exact final reply text, or `nil` when identity or completion
+    ///   cannot be proven.
+    @_spi(AgentReportTranscript)
+    public func extract(
+        records: some Sequence<CodexTranscriptRecord>,
+        sessionID: String,
+        turnID: String
+    ) -> String? {
         var sawMatchingSession = false
         var currentTurnID: String?
         var responseItemCandidate: String?
@@ -66,9 +120,24 @@ public struct CodexFinalReplyExtractor: Sendable {
         var requestedTurnCompleted = false
         var completedResult: String?
 
-        for line in lines {
-            guard line.utf8.count <= AgentReportResourceLimits.sliceA.maximumJSONLRecordBytes else {
-                return nil
+        for record in records {
+            let line: String
+            switch record {
+            case let .jsonLine(value):
+                guard value.utf8.count <= AgentReportResourceLimits.sliceA.maximumJSONLRecordBytes else {
+                    return nil
+                }
+                line = value
+            case .malformedCompleteRecord:
+                if requestedTurnCompleted {
+                    continue
+                }
+                currentTurnID = nil
+                responseItemCandidate = nil
+                responseItemCandidateCount = 0
+                terminalCandidate = nil
+                requiresExplicitTurnBoundary = true
+                continue
             }
             if requestedTurnCompleted {
                 continue

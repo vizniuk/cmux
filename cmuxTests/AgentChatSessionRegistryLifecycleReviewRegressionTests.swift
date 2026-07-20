@@ -93,6 +93,158 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
         #expect(recovered == exact)
     }
 
+    @Test func invalidUTF8CompleteRecordClearsInheritedAuthorityAndCandidates() async throws {
+        let fixture = try rawTranscriptFixture(fileName: "invalid-utf8-authority.jsonl")
+        defer { try? FileManager.default.removeItem(at: fixture.home) }
+        var data = Data()
+        appendJSONLLine(
+            #"{"type":"session_meta","payload":{"id":"\#(fixture.sessionID)"}}"#,
+            to: &data
+        )
+        appendJSONLLine(
+            #"{"type":"turn_context","payload":{"turn_id":"turn-a"}}"#,
+            to: &data
+        )
+        appendJSONLLine(finalReplyLine(text: "stale report candidate", turnID: nil), to: &data)
+        appendInvalidUTF8JSONRecord(terminated: true, to: &data)
+        appendJSONLLine(finalReplyLine(text: "must not inherit turn A", turnID: nil), to: &data)
+        appendJSONLLine(
+            #"{"type":"event_msg","payload":{"type":"turn_complete","last_agent_message":"stale completion candidate"}}"#,
+            to: &data
+        )
+        try data.write(to: fixture.transcript)
+
+        let recovered = await AgentChatTranscriptResolver(
+            homeDirectory: fixture.home,
+            environment: [:]
+        ).recoverCodexFinalReply(
+            recordedPath: fixture.transcript.path,
+            sessionID: fixture.sessionID,
+            turnID: "turn-a"
+        )
+
+        #expect(recovered == nil)
+    }
+
+    @Test func invalidUTF8CorruptionAllowsOnlyNewExplicitTurnBoundary() async throws {
+        let fixture = try rawTranscriptFixture(fileName: "invalid-utf8-new-boundary.jsonl")
+        defer { try? FileManager.default.removeItem(at: fixture.home) }
+        var data = Data()
+        appendJSONLLine(
+            #"{"type":"session_meta","payload":{"id":"\#(fixture.sessionID)"}}"#,
+            to: &data
+        )
+        appendJSONLLine(
+            #"{"type":"turn_context","payload":{"turn_id":"turn-a"}}"#,
+            to: &data
+        )
+        appendInvalidUTF8JSONRecord(terminated: true, to: &data)
+        appendJSONLLine(finalReplyLine(text: "must not inherit turn A", turnID: nil), to: &data)
+        appendJSONLLine(
+            #"{"type":"event_msg","payload":{"type":"turn_complete"}}"#,
+            to: &data
+        )
+        appendJSONLLine(
+            #"{"type":"turn_context","payload":{"turn_id":"turn-b"}}"#,
+            to: &data
+        )
+        appendJSONLLine(finalReplyLine(text: "authorized turn B", turnID: nil), to: &data)
+        appendJSONLLine(
+            #"{"type":"event_msg","payload":{"type":"turn_complete"}}"#,
+            to: &data
+        )
+        try data.write(to: fixture.transcript)
+
+        let resolver = AgentChatTranscriptResolver(homeDirectory: fixture.home, environment: [:])
+        #expect(
+            await resolver.recoverCodexFinalReply(
+                recordedPath: fixture.transcript.path,
+                sessionID: fixture.sessionID,
+                turnID: "turn-a"
+            ) == nil
+        )
+        #expect(
+            await resolver.recoverCodexFinalReply(
+                recordedPath: fixture.transcript.path,
+                sessionID: fixture.sessionID,
+                turnID: "turn-b"
+            ) == "authorized turn B"
+        )
+    }
+
+    @Test func invalidUTF8IncompleteEOFTailIsDiscarded() async throws {
+        let fixture = try rawTranscriptFixture(fileName: "invalid-utf8-incomplete-tail.jsonl")
+        defer { try? FileManager.default.removeItem(at: fixture.home) }
+        var data = Data()
+        appendJSONLLine(
+            #"{"type":"session_meta","payload":{"id":"\#(fixture.sessionID)"}}"#,
+            to: &data
+        )
+        appendJSONLLine(
+            #"{"type":"turn_context","payload":{"turn_id":"turn-a"}}"#,
+            to: &data
+        )
+        appendJSONLLine(finalReplyLine(text: "complete before tail", turnID: nil), to: &data)
+        appendJSONLLine(
+            #"{"type":"event_msg","payload":{"type":"turn_complete"}}"#,
+            to: &data
+        )
+        appendInvalidUTF8JSONRecord(terminated: false, to: &data)
+        try data.write(to: fixture.transcript)
+
+        let recovered = await AgentChatTranscriptResolver(
+            homeDirectory: fixture.home,
+            environment: [:]
+        ).recoverCodexFinalReply(
+            recordedPath: fixture.transcript.path,
+            sessionID: fixture.sessionID,
+            turnID: "turn-a"
+        )
+
+        #expect(recovered == "complete before tail")
+    }
+
+    @Test func completedTurnIsFrozenBeforeLaterInvalidUTF8() async throws {
+        let fixture = try rawTranscriptFixture(fileName: "invalid-utf8-after-completion.jsonl")
+        defer { try? FileManager.default.removeItem(at: fixture.home) }
+        var data = Data()
+        appendJSONLLine(
+            #"{"type":"session_meta","payload":{"id":"\#(fixture.sessionID)"}}"#,
+            to: &data
+        )
+        appendJSONLLine(
+            #"{"type":"turn_context","payload":{"turn_id":"turn-a"}}"#,
+            to: &data
+        )
+        appendJSONLLine(finalReplyLine(text: "frozen turn A", turnID: nil), to: &data)
+        appendJSONLLine(
+            #"{"type":"event_msg","payload":{"type":"turn_complete"}}"#,
+            to: &data
+        )
+        appendInvalidUTF8JSONRecord(terminated: true, to: &data)
+        appendJSONLLine(
+            #"{"type":"turn_context","payload":{"turn_id":"turn-b"}}"#,
+            to: &data
+        )
+        appendJSONLLine(finalReplyLine(text: "later turn B", turnID: nil), to: &data)
+        appendJSONLLine(
+            #"{"type":"event_msg","payload":{"type":"turn_complete"}}"#,
+            to: &data
+        )
+        try data.write(to: fixture.transcript)
+
+        let recovered = await AgentChatTranscriptResolver(
+            homeDirectory: fixture.home,
+            environment: [:]
+        ).recoverCodexFinalReply(
+            recordedPath: fixture.transcript.path,
+            sessionID: fixture.sessionID,
+            turnID: "turn-a"
+        )
+
+        #expect(recovered == "frozen turn A")
+    }
+
     @Test func codexReportPathValidationRejectsUntrustedAndNonRegularTargets() async throws {
         let home = try temporaryHomeDirectory()
         defer { try? FileManager.default.removeItem(at: home) }
@@ -128,8 +280,50 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
         let resolver = AgentChatTranscriptResolver(homeDirectory: home, environment: [:])
         let noFallbackSession = "session-with-no-filename-match"
         #expect(
+            AgentChatTranscriptResolver.hasStrictRawPathComponents(valid.path)
+        )
+        for rawPath in [
+            "~/.codex/sessions/2026/07/17/rollout-valid.jsonl",
+            "~user/.codex/sessions/2026/07/17/rollout-valid.jsonl",
+            "2026/07/17/rollout-valid.jsonl",
+            "/",
+            "",
+            "//tmp/rollout-valid.jsonl",
+            "///tmp/rollout-valid.jsonl",
+            "/tmp//rollout-valid.jsonl",
+            "/tmp/rollout-valid.jsonl/",
+            "/tmp/./rollout-valid.jsonl",
+            "/tmp/../rollout-valid.jsonl",
+        ] {
+            #expect(!AgentChatTranscriptResolver.hasStrictRawPathComponents(rawPath))
+        }
+        #expect(
             resolver.codexTranscriptPath(recordedPath: valid.path, sessionID: noFallbackSession)
                 == valid.resolvingSymlinksInPath().path
+        )
+        #expect(
+            resolver.codexTranscriptPath(
+                recordedPath: "~/.codex/sessions/2026/07/17/rollout-valid.jsonl",
+                sessionID: noFallbackSession
+            ) == nil
+        )
+        #expect(
+            resolver.codexTranscriptPath(
+                recordedPath: "~user/.codex/sessions/2026/07/17/rollout-valid.jsonl",
+                sessionID: noFallbackSession
+            ) == nil
+        )
+        #expect(
+            resolver.codexTranscriptPath(
+                recordedPath: "/" + valid.path,
+                sessionID: noFallbackSession
+            ) == nil
+        )
+        #expect(
+            resolver.codexTranscriptPath(
+                recordedPath: valid.path + "/",
+                sessionID: noFallbackSession
+            ) == nil
         )
         #expect(resolver.codexTranscriptPath(recordedPath: insideSymlink.path, sessionID: noFallbackSession) == nil)
         #expect(
@@ -728,6 +922,43 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
             finalReply: finalReply
         ).write(to: transcript, atomically: false, encoding: .utf8)
         return (home, transcript, sessionID, turnID, finalReply)
+    }
+
+    private func rawTranscriptFixture(fileName: String) throws -> (
+        home: URL,
+        transcript: URL,
+        sessionID: String
+    ) {
+        let home = try temporaryHomeDirectory()
+        let transcript = home
+            .appendingPathComponent(".codex/sessions/2026/07/17", isDirectory: true)
+            .appendingPathComponent(fileName)
+        try FileManager.default.createDirectory(
+            at: transcript.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        return (home, transcript, "invalid-utf8-session")
+    }
+
+    private func appendJSONLLine(_ line: String, to data: inout Data) {
+        data.append(contentsOf: line.utf8)
+        data.append(0x0A)
+    }
+
+    private func appendInvalidUTF8JSONRecord(terminated: Bool, to data: inout Data) {
+        data.append(contentsOf: #"{"type":"event_msg","payload":{"type":"status","message":""#.utf8)
+        data.append(0xFF)
+        data.append(contentsOf: #""}}"#.utf8)
+        if terminated {
+            data.append(0x0A)
+        }
+    }
+
+    private func finalReplyLine(text: String, turnID: String?) -> String {
+        let metadata = turnID.map {
+            #", "internal_chat_message_metadata_passthrough":{"turn_id":"\#($0)"}"#
+        } ?? ""
+        return #"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"\#(text)"}]\#(metadata)}}"#
     }
 
     private func codexTranscriptText(

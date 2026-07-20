@@ -1,4 +1,4 @@
-import CmuxAgentChat
+@_spi(AgentReportTranscript) import CmuxAgentChat
 import Darwin
 import Foundation
 
@@ -218,7 +218,7 @@ struct AgentChatTranscriptResolver: Sendable {
     private func validatedCodexTranscriptPath(_ path: String) -> String? {
         guard let transcript = openTrustedCodexTranscript(path) else { return nil }
         transcript.close()
-        return (path as NSString).expandingTildeInPath
+        return path
     }
 
     /// Opens a recorded path first, then exact-session fallback candidates.
@@ -351,8 +351,7 @@ struct AgentChatTranscriptResolver: Sendable {
     /// Derives a strict relative path without resolving untrusted components.
     private func trustedRelativeComponents(for path: String) -> [String]? {
         guard Self.hasStrictRawPathComponents(path) else { return nil }
-        let expanded = (path as NSString).expandingTildeInPath
-        guard let candidateComponents = Self.strictAbsolutePathComponents(expanded),
+        guard let candidateComponents = Self.strictAbsolutePathComponents(path),
               candidateComponents.last?.lowercased().hasSuffix(".jsonl") == true else {
             return nil
         }
@@ -378,11 +377,13 @@ struct AgentChatTranscriptResolver: Sendable {
         return nil
     }
 
-    /// Rejects unsafe lexical components before any path normalization occurs.
-    private static func hasStrictRawPathComponents(_ path: String) -> Bool {
-        guard !path.isEmpty, !path.contains("\0") else { return false }
+    /// Requires one leading slash and rejects unsafe raw lexical components.
+    static func hasStrictRawPathComponents(_ path: String) -> Bool {
+        guard path.hasPrefix("/"), !path.hasPrefix("//"), !path.contains("\0") else {
+            return false
+        }
         let rawComponents = path.split(separator: "/", omittingEmptySubsequences: false)
-        let components = path.hasPrefix("/") ? rawComponents.dropFirst() : rawComponents[...]
+        let components = rawComponents.dropFirst()
         return !components.isEmpty
             && components.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
     }
@@ -440,7 +441,7 @@ extension AgentChatTranscriptResolver: AgentReportTranscriptRecovering {
             }
             defer { lines.close() }
             let result = CodexFinalReplyExtractor().isPrimarySession(
-                lines: lines,
+                records: lines,
                 sessionID: sessionID
             )
             return !lines.didFailTrustedRead && !lines.didViolateResourceLimit && result
@@ -470,7 +471,7 @@ extension AgentChatTranscriptResolver: AgentReportTranscriptRecovering {
             }
             defer { lines.close() }
             let result = CodexFinalReplyExtractor().extract(
-                lines: lines,
+                records: lines,
                 sessionID: sessionID,
                 turnID: turnID
             )
@@ -485,7 +486,7 @@ extension AgentChatTranscriptResolver: AgentReportTranscriptRecovering {
 /// is never reopened by path. An incomplete trailing fragment is deliberately
 /// discarded at EOF.
 private final class CompleteJSONLLineSequence: Sequence, IteratorProtocol {
-    typealias Element = String
+    typealias Element = CodexTranscriptRecord
 
     private static let chunkSize = 64 * 1024
 
@@ -533,17 +534,19 @@ private final class CompleteJSONLLineSequence: Sequence, IteratorProtocol {
 
     /// Returns the next newline-terminated record, dropping an incomplete tail.
     ///
-    /// - Returns: One complete UTF-8-decoded line, or `nil` at safe EOF.
-    func next() -> String? {
+    /// - Returns: One complete strict UTF-8 line or malformed-record event;
+    ///   `nil` at safe EOF.
+    func next() -> CodexTranscriptRecord? {
         while true {
             if let newline = buffer.firstIndex(of: 0x0A) {
                 guard newline <= limits.maximumJSONLRecordBytes else {
                     failResourceLimit()
                     return nil
                 }
-                let line = String(decoding: buffer[..<newline], as: UTF8.self)
+                let line = String(data: Data(buffer[..<newline]), encoding: .utf8)
                 buffer.removeSubrange(...newline)
-                return line
+                guard let line else { return .malformedCompleteRecord }
+                return .jsonLine(line)
             }
             guard buffer.count <= limits.maximumJSONLRecordBytes else {
                 failResourceLimit()
