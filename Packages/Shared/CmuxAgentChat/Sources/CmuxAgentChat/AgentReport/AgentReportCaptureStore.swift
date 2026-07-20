@@ -342,20 +342,20 @@ public actor AgentReportCaptureStore {
         guard policy.isEnabled else {
             return AgentReportAvailabilitySnapshot(
                 isCaptureEnabled: false,
-                workspaceIDByRuntimeSurfaceID: [:]
+                availableRuntimeSurfaceIDs: []
             )
         }
-        let available = latestByRuntimeSurfaceID.reduce(into: [UUID: UUID]()) { result, element in
-            let (surfaceID, report) = element
+        let available = latestByRuntimeSurfaceID.reduce(into: Set<UUID>()) { result, element in
+            let (surfaceID, _) = element
             guard capturedLifecycleGenerationByRuntimeSurfaceID[surfaceID]
                     == lifecycleGenerationByRuntimeSurfaceID[surfaceID, default: 0] else {
                 return
             }
-            result[surfaceID] = report.workspaceID
+            result.insert(surfaceID)
         }
         return AgentReportAvailabilitySnapshot(
             isCaptureEnabled: true,
-            workspaceIDByRuntimeSurfaceID: available
+            availableRuntimeSurfaceIDs: available
         )
     }
 

@@ -11,7 +11,8 @@ public struct AgentReportCopyAuthorizationContext: Sendable, Equatable,
     /// Agent runtime whose live primary-session binding must still match.
     public let provider: AgentReportProvider
 
-    /// Exact process-local workspace containing the retained surface.
+    /// Capture-time workspace used only to validate the provider lifecycle
+    /// record. Current ownership is independently proven from live topology.
     public let workspaceID: UUID
 
     /// Exact process-local surface requested by the explicit copy action.

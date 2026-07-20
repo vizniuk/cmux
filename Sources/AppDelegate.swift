@@ -792,8 +792,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private(set) var agentReportCaptureStore: AgentReportCaptureStore?
     /// Synchronous UI/privacy gate reflecting the persisted Boolean setting.
     private(set) var agentReportCaptureEnabled = false
-    /// Content-free exact topology tuples whose report remains copy-eligible.
-    private var agentReportWorkspaceIDByRuntimeSurfaceID: [UUID: UUID] = [:]
+    /// Content-free exact runtime surfaces whose report remains copy-eligible.
+    private var agentReportAvailableRuntimeSurfaceIDs: Set<UUID> = []
     private var agentReportAvailabilityTask: Task<Void, Never>?
     private var agentReportSettingObservationTask: Task<Void, Never>?
     private var agentReportPolicyUpdateTask: Task<Void, Never>?
@@ -2082,7 +2082,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         )
         self.agentReportCaptureStore = agentReportCaptureStore
         agentReportCaptureEnabled = initialAgentReportCaptureEnabled
-        agentReportWorkspaceIDByRuntimeSurfaceID.removeAll(keepingCapacity: false)
+        agentReportAvailableRuntimeSurfaceIDs.removeAll(keepingCapacity: false)
         VMClient.bootstrap(auth: auth.coordinator)
         RemotesClient.bootstrap(auth: auth.coordinator)
         AIAccountsClient.bootstrap(auth: auth.coordinator)
@@ -2100,7 +2100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         agentChatTranscriptService.setAgentReportSurfaceInvalidator { [weak self, agentReportCaptureStore] surfaceID in
             // Cleanup may queue, but lifecycle authority was already revoked
             // synchronously by AgentChatTranscriptService on the main actor.
-            self?.agentReportWorkspaceIDByRuntimeSurfaceID.removeValue(forKey: surfaceID)
+            self?.agentReportAvailableRuntimeSurfaceIDs.remove(surfaceID)
             NotificationCenter.default.post(name: .agentReportCopyAvailabilityDidChange, object: nil)
             Task { await agentReportCaptureStore.invalidatePendingCapture(runtimeSurfaceID: surfaceID) }
         }
@@ -2150,7 +2150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func applyAgentReportCapturePolicy(_ enabled: Bool) {
         agentReportCaptureEnabled = enabled
         if !enabled {
-            agentReportWorkspaceIDByRuntimeSurfaceID.removeAll(keepingCapacity: false)
+            agentReportAvailableRuntimeSurfaceIDs.removeAll(keepingCapacity: false)
         }
         NotificationCenter.default.post(name: .agentReportCopyAvailabilityDidChange, object: nil)
 
@@ -2200,11 +2200,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     /// Accepts only content-free topology availability from the report actor.
-    private func acceptAgentReportAvailability(_ snapshot: AgentReportAvailabilitySnapshot) {
+    func acceptAgentReportAvailability(_ snapshot: AgentReportAvailabilitySnapshot) {
         if agentReportCaptureEnabled, snapshot.isCaptureEnabled {
-            agentReportWorkspaceIDByRuntimeSurfaceID = snapshot.workspaceIDByRuntimeSurfaceID
+            agentReportAvailableRuntimeSurfaceIDs = snapshot.availableRuntimeSurfaceIDs
         } else {
-            agentReportWorkspaceIDByRuntimeSurfaceID.removeAll(keepingCapacity: false)
+            agentReportAvailableRuntimeSurfaceIDs.removeAll(keepingCapacity: false)
         }
         NotificationCenter.default.post(name: .agentReportCopyAvailabilityDidChange, object: nil)
     }
@@ -2223,8 +2223,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     ) -> (isCaptureEnabled: Bool, hasReport: Bool) {
         guard agentReportCaptureEnabled else { return (false, false) }
         guard agentReportPolicyUpdateTask == nil else { return (true, false) }
-        guard agentReportWorkspaceIDByRuntimeSurfaceID[runtimeSurfaceID] == workspaceID,
-              let manager = tabManagerFor(tabId: workspaceID),
+        guard agentReportAvailableRuntimeSurfaceIDs.contains(runtimeSurfaceID),
+              let manager = tabManagerFor(tabId: workspaceID)
+                ?? (tabManager?.tabs.contains(where: { $0.id == workspaceID }) == true
+                    ? tabManager
+                    : nil),
               let workspace = manager.tabs.first(where: { $0.id == workspaceID }),
               workspace.surfaceIdFromPanelId(runtimeSurfaceID) != nil,
               let panel = workspace.panels[runtimeSurfaceID] as? TerminalPanel,
@@ -2248,10 +2251,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         runtimeSurfaceID: UUID,
         to pasteboard: NSPasteboard = .general
     ) async -> Bool {
-        guard agentReportCaptureEnabled,
-              agentReportPolicyUpdateTask == nil,
-              agentReportWorkspaceIDByRuntimeSurfaceID[runtimeSurfaceID] == workspaceID,
-              let store = agentReportCaptureStore else { return false }
+        let availability = agentReportCopyControlAvailability(
+            workspaceID: workspaceID,
+            runtimeSurfaceID: runtimeSurfaceID
+        )
+        guard availability.hasReport, let store = agentReportCaptureStore else { return false }
         let policyRevision = agentReportPolicyUpdateRevision
         return await Self.copyLatestAgentReport(
             store: store,
@@ -2268,7 +2272,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 self?.agentReportCaptureEnabled == true
                     && self?.agentReportPolicyUpdateTask == nil
                     && self?.agentReportPolicyUpdateRevision == policyRevision
-                    && self?.agentReportWorkspaceIDByRuntimeSurfaceID[runtimeSurfaceID] == workspaceID
+                    && self?.agentReportCopyControlAvailability(
+                        workspaceID: workspaceID,
+                        runtimeSurfaceID: runtimeSurfaceID
+                    ).hasReport == true
             }
         )
     }

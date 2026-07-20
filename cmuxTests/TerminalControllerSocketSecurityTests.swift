@@ -1098,40 +1098,477 @@ final class TerminalControllerSocketSecurityTests {
         #expect(await store.latestReport(runtimeSurfaceID: panel.id) == nil)
     }
 
-    @Test func detachTransferPreservesReportAndDoesNotEnqueuePurge() async throws {
+    @Test func liveWorkspaceTransferMovesAvailabilityAndCentralCopyAuthority() async throws {
+        let previousAppDelegate = AppDelegate.shared
         let controller = TerminalController.shared
+        let previousTabManager = controller.tabManager
+        let previousService = controller.agentChatTranscriptService
+        let previousStore = controller.agentReportCaptureStore
         let manager = TabManager()
         let source = try #require(manager.selectedWorkspace)
         let destination = manager.addWorkspace(select: false)
         let panel = try #require(source.focusedTerminalPanel)
+        let differentPanel = try #require(destination.focusedTerminalPanel)
+        let exact = "  transferred report ✅\n\nПривіт\nno-extra-newline"
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-report-transfer-\(UUID().uuidString)", isDirectory: true)
+        let storeDirectory = home.appendingPathComponent(".cmuxterm", isDirectory: true)
+        try FileManager.default.createDirectory(at: storeDirectory, withIntermediateDirectories: true)
+        let payload: [String: Any] = [
+            "sessions": [
+                "lifecycle-session": [
+                    "workspaceId": source.id.uuidString,
+                    "surfaceId": panel.id.uuidString,
+                    "transcriptPath": "/synthetic/lifecycle.jsonl",
+                    "lastPromptTurnId": "lifecycle-turn",
+                    "updatedAt": 100.0,
+                ],
+            ],
+            "activeSessionsBySurface": [
+                panel.id.uuidString: [
+                    "sessionId": "lifecycle-session",
+                    "turnId": "lifecycle-turn",
+                    "updatedAt": 100.0,
+                ],
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+            .write(to: storeDirectory.appendingPathComponent("codex-hook-sessions.json"))
+        let registry = AgentChatSessionRegistry(
+            hookStore: AgentChatHookSessionStore(homeDirectory: home)
+        )
+        let service = AgentChatTranscriptService(
+            registry: registry,
+            resolver: AgentChatTranscriptResolver(homeDirectory: home, environment: [:])
+        )
         let store = AgentReportCaptureStore(
             policy: .enabled,
             transcriptRecovery: SuspendedEndpointAgentReportRecovery(reply: "unused")
         )
+        let app = AppDelegate()
+        app.tabManager = manager
+        app.applyAgentReportCapturePolicy(true)
+        AppDelegate.shared = app
+        controller.tabManager = manager
+        controller.agentChatTranscriptService = service
         controller.agentReportCaptureStore = store
         var purgeCount = 0
         controller.agentReportPurgeObserverForTesting = { _ in purgeCount += 1 }
         defer {
             controller.agentReportPurgeObserverForTesting = nil
-            controller.agentReportCaptureStore = nil
+            controller.tabManager = previousTabManager
+            controller.agentChatTranscriptService = previousService
+            controller.agentReportCaptureStore = previousStore
+            AppDelegate.shared = previousAppDelegate
             for workspace in manager.tabs {
                 workspace.teardownAllPanels()
             }
+            try? FileManager.default.removeItem(at: home)
         }
 
-        let request = agentReportRequest(workspace: source, panel: panel, raw: "completed")
-        let target = agentReportTarget(workspace: source, panel: panel)
+        let snapshots = await store.availabilitySnapshots()
+        var snapshotIterator = snapshots.makeAsyncIterator()
+        _ = try #require(await snapshotIterator.next())
+        let request = agentReportRequest(workspace: source, panel: panel, raw: exact)
+        let target = AgentReportCaptureTarget(
+            workspaceID: source.id,
+            runtimeSurfaceID: panel.id,
+            stableSurfaceID: panel.stableSurfaceId,
+            agentSessionID: request.agentSessionID,
+            turnID: request.turnID,
+            lifecycleToken: service.agentReportLifecycleToken(for: panel.id),
+            transcriptPath: request.transcriptPath
+        )
         #expect(
             await store.capture(request, target: target, revalidateTarget: { target })
                 == .captured
         )
+        let capturedReport = try #require(await store.latestReport(runtimeSurfaceID: panel.id))
+        let capturedSnapshot = try #require(await snapshotIterator.next())
+        #expect(capturedSnapshot.hasReport(runtimeSurfaceID: panel.id))
+        #expect(!String(describing: capturedSnapshot).contains(exact))
+        app.acceptAgentReportAvailability(capturedSnapshot)
+        #expect(app.agentReportCopyControlAvailability(
+            workspaceID: source.id,
+            runtimeSurfaceID: panel.id,
+            representedSurface: panel.surface
+        ).hasReport)
+
         let detached = try #require(source.detachSurface(panelId: panel.id))
         let destinationPane = try #require(destination.bonsplitController.allPaneIds.first)
         #expect(destination.attachDetachedSurface(detached, inPane: destinationPane) == panel.id)
 
-        #expect(await store.latestReport(runtimeSurfaceID: panel.id)?.finalReply == "completed")
+        #expect(await store.latestReport(runtimeSurfaceID: panel.id) == capturedReport)
         #expect(purgeCount == 0)
+        #expect(!app.agentReportCopyControlAvailability(
+            workspaceID: source.id,
+            runtimeSurfaceID: panel.id,
+            representedSurface: panel.surface
+        ).hasReport)
+        let destinationAvailability = app.agentReportCopyControlAvailability(
+            workspaceID: destination.id,
+            runtimeSurfaceID: panel.id,
+            representedSurface: panel.surface
+        )
+        #expect(destinationAvailability.hasReport)
+
+        let sourcePasteboard = NSPasteboard(name: .init("cmux-transfer-source-\(UUID().uuidString)"))
+        sourcePasteboard.clearContents()
+        sourcePasteboard.setString("preserve source", forType: .string)
+        let sourceChangeCount = sourcePasteboard.changeCount
+        #expect(
+            await AppDelegate.copyLatestAgentReport(
+                store: store,
+                runtimeSurfaceID: panel.id,
+                to: sourcePasteboard,
+                authorize: { context in
+                    await controller.authorizesAgentReportCopy(
+                        context,
+                        representedWorkspaceID: source.id,
+                        representedSurfaceID: panel.id
+                    )
+                }
+            ) == false
+        )
+        #expect(sourcePasteboard.changeCount == sourceChangeCount)
+        #expect(sourcePasteboard.string(forType: .string) == "preserve source")
+
+        let destinationPasteboard = NSPasteboard(name: .init("cmux-transfer-destination-\(UUID().uuidString)"))
+        destinationPasteboard.clearContents()
+        #expect(
+            await AppDelegate.copyLatestAgentReport(
+                store: store,
+                runtimeSurfaceID: panel.id,
+                to: destinationPasteboard,
+                authorize: { context in
+                    await controller.authorizesAgentReportCopy(
+                        context,
+                        representedWorkspaceID: destination.id,
+                        representedSurfaceID: panel.id
+                    )
+                }
+            )
+        )
+        #expect(destinationPasteboard.string(forType: .string) == exact)
+        #expect(destinationPasteboard.string(forType: .string)?.hasSuffix("no-extra-newline") == true)
+
+        let differentPasteboard = NSPasteboard(name: .init("cmux-transfer-different-\(UUID().uuidString)"))
+        differentPasteboard.clearContents()
+        differentPasteboard.setString("preserve different", forType: .string)
+        let differentChangeCount = differentPasteboard.changeCount
+        #expect(
+            await AppDelegate.copyLatestAgentReport(
+                store: store,
+                runtimeSurfaceID: differentPanel.id,
+                to: differentPasteboard,
+                authorize: { _ in true }
+            ) == false
+        )
+        #expect(differentPasteboard.changeCount == differentChangeCount)
+
+        var requests: [(UUID, UUID)] = []
+        let surfaceView = panel.hostedView.surfaceView
+        surfaceView.agentReportCopyRequestHandler = { requests.append(($0, $1)) }
+        defer { surfaceView.agentReportCopyRequestHandler = nil }
+        let menuItem = surfaceView.makeAgentReportCopyMenuItem(
+            workspaceID: destination.id,
+            runtimeSurfaceID: panel.id,
+            isCaptureEnabled: destinationAvailability.isCaptureEnabled,
+            hasReport: destinationAvailability.hasReport
+        )
+        #expect(menuItem.isEnabled)
+        manager.selectWorkspace(source)
+        surfaceView.copyAgentReport(menuItem)
+        #expect(requests.count == 1)
+        #expect(requests[0].0 == destination.id)
+        #expect(requests[0].1 == panel.id)
+        let menuTarget = requests[0]
+        let menuPasteboard = NSPasteboard(name: .init("cmux-transfer-menu-\(UUID().uuidString)"))
+        #expect(
+            await AppDelegate.copyLatestAgentReport(
+                store: store,
+                runtimeSurfaceID: menuTarget.1,
+                to: menuPasteboard,
+                authorize: { context in
+                    await controller.authorizesAgentReportCopy(
+                        context,
+                        representedWorkspaceID: menuTarget.0,
+                        representedSurfaceID: menuTarget.1
+                    )
+                }
+            )
+        )
+        #expect(menuPasteboard.string(forType: .string) == exact)
+
+        let hostedView = panel.hostedView
+        hostedView.synchronizeAgentReportCopyControl()
+        let button = hostedView.agentReportCopyButtonForTesting
+        #expect(!button.isHidden)
+        #expect(button.isEnabled)
+        button.performClick(nil)
+        #expect(requests.count == 2)
+        #expect(requests[1].0 == destination.id)
+        #expect(requests[1].1 == panel.id)
+        let buttonTarget = requests[1]
+        let buttonPasteboard = NSPasteboard(name: .init("cmux-transfer-button-\(UUID().uuidString)"))
+        #expect(
+            await AppDelegate.copyLatestAgentReport(
+                store: store,
+                runtimeSurfaceID: buttonTarget.1,
+                to: buttonPasteboard,
+                authorize: { context in
+                    await controller.authorizesAgentReportCopy(
+                        context,
+                        representedWorkspaceID: buttonTarget.0,
+                        representedSurfaceID: buttonTarget.1
+                    )
+                }
+            )
+        )
+        #expect(buttonPasteboard.string(forType: .string) == exact)
+
+        let shiftCommandC = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command, .shift],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "C",
+            charactersIgnoringModifiers: "c",
+            isARepeat: false,
+            keyCode: 8
+        ))
+        #expect(app.handleAgentReportCopyShortcut(
+            event: shiftCommandC,
+            captureEnabled: true,
+            targetResolver: { _ in (destination.id, panel.id) },
+            performCopy: { requests.append(($0, $1)) }
+        ))
+        #expect(requests.count == 3)
+        #expect(requests[2].0 == destination.id)
+        #expect(requests[2].1 == panel.id)
+        let shortcutTarget = requests[2]
+        let shortcutPasteboard = NSPasteboard(name: .init("cmux-transfer-shortcut-\(UUID().uuidString)"))
+        #expect(
+            await AppDelegate.copyLatestAgentReport(
+                store: store,
+                runtimeSurfaceID: shortcutTarget.1,
+                to: shortcutPasteboard,
+                authorize: { context in
+                    await controller.authorizesAgentReportCopy(
+                        context,
+                        representedWorkspaceID: shortcutTarget.0,
+                        representedSurfaceID: shortcutTarget.1
+                    )
+                }
+            )
+        )
+        #expect(shortcutPasteboard.string(forType: .string) == exact)
+
+        let detachedBack = try #require(destination.detachSurface(panelId: panel.id))
+        let sourcePane = try #require(source.bonsplitController.allPaneIds.first)
+        #expect(source.attachDetachedSurface(detachedBack, inPane: sourcePane) == panel.id)
+        #expect(app.agentReportCopyControlAvailability(
+            workspaceID: source.id,
+            runtimeSurfaceID: panel.id,
+            representedSurface: panel.surface
+        ).hasReport)
+        #expect(!app.agentReportCopyControlAvailability(
+            workspaceID: destination.id,
+            runtimeSurfaceID: panel.id,
+            representedSurface: panel.surface
+        ).hasReport)
+        #expect(await store.latestReport(runtimeSurfaceID: panel.id) == capturedReport)
+
         await store.purge(runtimeSurfaceID: panel.id)
+        let purgedSnapshot = try #require(await snapshotIterator.next())
+        app.acceptAgentReportAvailability(purgedSnapshot)
+        #expect(!app.agentReportCopyControlAvailability(
+            workspaceID: source.id,
+            runtimeSurfaceID: panel.id,
+            representedSurface: panel.surface
+        ).hasReport)
+        let purgedPasteboard = NSPasteboard(name: .init("cmux-transfer-purged-\(UUID().uuidString)"))
+        purgedPasteboard.clearContents()
+        purgedPasteboard.setString("preserve purged", forType: .string)
+        let purgedChangeCount = purgedPasteboard.changeCount
+        #expect(
+            await AppDelegate.copyLatestAgentReport(
+                store: store,
+                runtimeSurfaceID: panel.id,
+                to: purgedPasteboard,
+                authorize: { _ in true }
+            ) == false
+        )
+        #expect(purgedPasteboard.changeCount == purgedChangeCount)
+    }
+
+    @Test(arguments: ["session-rebind", "resume", "lifecycle-token", "disable"])
+    func transferredReportFailsClosedAfterAuthorityRevocation(_ revocation: String) async throws {
+        let previousAppDelegate = AppDelegate.shared
+        let controller = TerminalController.shared
+        let previousTabManager = controller.tabManager
+        let previousService = controller.agentChatTranscriptService
+        let previousStore = controller.agentReportCaptureStore
+        let manager = TabManager()
+        let source = try #require(manager.selectedWorkspace)
+        let destination = manager.addWorkspace(select: false)
+        let panel = try #require(source.focusedTerminalPanel)
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-report-transfer-revoke-\(UUID().uuidString)", isDirectory: true)
+        let storeDirectory = home.appendingPathComponent(".cmuxterm", isDirectory: true)
+        try FileManager.default.createDirectory(at: storeDirectory, withIntermediateDirectories: true)
+        let payload: [String: Any] = [
+            "sessions": [
+                "lifecycle-session": [
+                    "workspaceId": source.id.uuidString,
+                    "surfaceId": panel.id.uuidString,
+                    "transcriptPath": "/synthetic/lifecycle.jsonl",
+                    "lastPromptTurnId": "lifecycle-turn",
+                    "updatedAt": 100.0,
+                ],
+            ],
+            "activeSessionsBySurface": [
+                panel.id.uuidString: [
+                    "sessionId": "lifecycle-session",
+                    "turnId": "lifecycle-turn",
+                    "updatedAt": 100.0,
+                ],
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+            .write(to: storeDirectory.appendingPathComponent("codex-hook-sessions.json"))
+        let registry = AgentChatSessionRegistry(
+            hookStore: AgentChatHookSessionStore(homeDirectory: home)
+        )
+        let service = AgentChatTranscriptService(
+            registry: registry,
+            resolver: AgentChatTranscriptResolver(homeDirectory: home, environment: [:])
+        )
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: SuspendedEndpointAgentReportRecovery(reply: "unused")
+        )
+        service.setAgentReportSurfaceInvalidator { surfaceID in
+            Task { await store.invalidatePendingCapture(runtimeSurfaceID: surfaceID) }
+        }
+        let app = AppDelegate()
+        app.tabManager = manager
+        app.applyAgentReportCapturePolicy(true)
+        AppDelegate.shared = app
+        controller.tabManager = manager
+        controller.agentChatTranscriptService = service
+        controller.agentReportCaptureStore = store
+        defer {
+            controller.tabManager = previousTabManager
+            controller.agentChatTranscriptService = previousService
+            controller.agentReportCaptureStore = previousStore
+            AppDelegate.shared = previousAppDelegate
+            for workspace in manager.tabs {
+                workspace.teardownAllPanels()
+            }
+            try? FileManager.default.removeItem(at: home)
+        }
+
+        let snapshots = await store.availabilitySnapshots()
+        var snapshotIterator = snapshots.makeAsyncIterator()
+        _ = try #require(await snapshotIterator.next())
+        let request = agentReportRequest(workspace: source, panel: panel, raw: "retained before revoke")
+        let target = AgentReportCaptureTarget(
+            workspaceID: source.id,
+            runtimeSurfaceID: panel.id,
+            stableSurfaceID: panel.stableSurfaceId,
+            agentSessionID: request.agentSessionID,
+            turnID: request.turnID,
+            lifecycleToken: service.agentReportLifecycleToken(for: panel.id),
+            transcriptPath: request.transcriptPath
+        )
+        #expect(await store.capture(request, target: target, revalidateTarget: { target }) == .captured)
+        let capturedSnapshot = try #require(await snapshotIterator.next())
+        app.acceptAgentReportAvailability(capturedSnapshot)
+        let detached = try #require(source.detachSurface(panelId: panel.id))
+        let destinationPane = try #require(destination.bonsplitController.allPaneIds.first)
+        #expect(destination.attachDetachedSurface(detached, inPane: destinationPane) == panel.id)
+        #expect(app.agentReportCopyControlAvailability(
+            workspaceID: destination.id,
+            runtimeSurfaceID: panel.id,
+            representedSurface: panel.surface
+        ).hasReport)
+
+        let preconditionPasteboard = NSPasteboard(
+            name: .init("cmux-transfer-revoke-precondition-\(UUID().uuidString)")
+        )
+        #expect(
+            await AppDelegate.copyLatestAgentReport(
+                store: store,
+                runtimeSurfaceID: panel.id,
+                to: preconditionPasteboard,
+                authorize: { context in
+                    await controller.authorizesAgentReportCopy(
+                        context,
+                        representedWorkspaceID: destination.id,
+                        representedSurfaceID: panel.id
+                    )
+                }
+            )
+        )
+
+        switch revocation {
+        case "session-rebind":
+            service.noteResumeInitiated(
+                sessionID: "replacement-session",
+                source: "codex",
+                surfaceID: panel.id.uuidString,
+                workspaceID: destination.id.uuidString,
+                workingDirectory: nil
+            )
+        case "resume":
+            service.noteResumeInitiated(
+                sessionID: request.agentSessionID,
+                source: "codex",
+                surfaceID: panel.id.uuidString,
+                workspaceID: destination.id.uuidString,
+                workingDirectory: nil
+            )
+        case "lifecycle-token":
+            service.invalidateAgentReportSurfaceLifecycle(runtimeSurfaceID: panel.id)
+        case "disable":
+            app.applyAgentReportCapturePolicy(false)
+            await store.setPolicy(.disabled)
+        default:
+            Issue.record("Unknown transfer revocation")
+        }
+
+        let revokedSnapshot = try #require(await snapshotIterator.next())
+        app.acceptAgentReportAvailability(revokedSnapshot)
+        #expect(!app.agentReportCopyControlAvailability(
+            workspaceID: destination.id,
+            runtimeSurfaceID: panel.id,
+            representedSurface: panel.surface
+        ).hasReport)
+        let revokedPasteboard = NSPasteboard(
+            name: .init("cmux-transfer-revoked-\(revocation)-\(UUID().uuidString)")
+        )
+        revokedPasteboard.clearContents()
+        revokedPasteboard.setString("preserve revoked", forType: .string)
+        let revokedChangeCount = revokedPasteboard.changeCount
+        #expect(
+            await AppDelegate.copyLatestAgentReport(
+                store: store,
+                runtimeSurfaceID: panel.id,
+                to: revokedPasteboard,
+                authorize: { context in
+                    await controller.authorizesAgentReportCopy(
+                        context,
+                        representedWorkspaceID: destination.id,
+                        representedSurfaceID: panel.id
+                    )
+                }
+            ) == false
+        )
+        #expect(revokedPasteboard.changeCount == revokedChangeCount)
+        #expect(revokedPasteboard.string(forType: .string) == "preserve revoked")
     }
 
     @Test func repeatedWorkspaceTeardownPurgesEachSurfaceExactlyOnce() async throws {

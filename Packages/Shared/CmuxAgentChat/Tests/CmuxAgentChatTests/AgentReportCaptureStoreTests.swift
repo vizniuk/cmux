@@ -445,17 +445,20 @@ struct AgentReportCaptureStoreTests {
         var iterator = snapshots.makeAsyncIterator()
         let initial = try #require(await iterator.next())
         #expect(initial.isCaptureEnabled)
-        #expect(initial.workspaceIDByRuntimeSurfaceID.isEmpty)
+        #expect(initial.availableRuntimeSurfaceIDs.isEmpty)
 
         let privateBody = "PRIVATE-AVAILABILITY-SENTINEL"
         #expect(await store.capture(request(raw: privateBody), target: target()) == .captured)
         let captured = try #require(await iterator.next())
-        #expect(captured.hasReport(runtimeSurfaceID: surfaceID, workspaceID: workspaceID))
+        #expect(captured.hasReport(runtimeSurfaceID: surfaceID))
         #expect(!String(describing: captured).contains(privateBody))
+        #expect(!Mirror(reflecting: captured).children.contains { child in
+            child.label?.localizedCaseInsensitiveContains("workspace") == true
+        })
 
         await store.invalidatePendingCapture(runtimeSurfaceID: surfaceID)
         let invalidated = try #require(await iterator.next())
-        #expect(!invalidated.hasReport(runtimeSurfaceID: surfaceID, workspaceID: workspaceID))
+        #expect(!invalidated.hasReport(runtimeSurfaceID: surfaceID))
         #expect(await store.latestReport(runtimeSurfaceID: surfaceID)?.finalReply == privateBody)
     }
 

@@ -5727,31 +5727,41 @@ class TerminalController {
         representedWorkspaceID: UUID,
         representedSurfaceID: UUID
     ) async -> Bool {
-        guard context.workspaceID == representedWorkspaceID,
-              context.runtimeSurfaceID == representedSurfaceID else {
+        guard context.provider == .codex,
+              context.completionKind == .primaryStop,
+              context.runtimeSurfaceID == representedSurfaceID,
+              let targetManager = AppDelegate.shared?.tabManagerFor(tabId: representedWorkspaceID)
+                ?? (tabManager?.tabs.contains(where: { $0.id == representedWorkspaceID }) == true
+                    ? tabManager
+                    : nil),
+              let workspace = targetManager.tabs.first(where: { $0.id == representedWorkspaceID }),
+              workspace.surfaceIdFromPanelId(representedSurfaceID) != nil,
+              let terminalPanel = workspace.panels[representedSurfaceID] as? TerminalPanel,
+              terminalPanel.stableSurfaceId == context.stableSurfaceID,
+              let service = agentChatTranscriptService,
+              service.agentReportLifecycleToken(for: representedSurfaceID) == context.lifecycleToken else {
             return false
         }
-        let request = AgentReportCaptureRequest(
-            provider: context.provider,
-            workspaceID: context.workspaceID,
-            runtimeSurfaceID: context.runtimeSurfaceID,
-            agentSessionID: context.agentSessionID,
+        guard await service.registry.agentReportCaptureBinding(
+            workspaceID: context.workspaceID.uuidString,
+            surfaceID: context.runtimeSurfaceID.uuidString,
+            sessionID: context.agentSessionID,
             turnID: context.turnID,
-            completionKind: context.completionKind,
-            transcriptPath: nil,
-            rawFinalReply: nil,
-            completionTimestamp: .distantPast,
-            promptTimestamp: nil
-        )
-        guard let target = await agentReportCaptureTarget(for: request) else {
+            requestedTranscriptPath: nil
+        ) != nil,
+              service.agentReportLifecycleToken(for: representedSurfaceID) == context.lifecycleToken,
+              let currentManager = AppDelegate.shared?.tabManagerFor(tabId: representedWorkspaceID)
+                ?? (targetManager.tabs.contains(where: { $0.id == representedWorkspaceID })
+                    ? targetManager
+                    : nil),
+              currentManager === targetManager,
+              let currentWorkspace = currentManager.tabs.first(where: { $0.id == representedWorkspaceID }),
+              currentWorkspace.surfaceIdFromPanelId(representedSurfaceID) != nil,
+              currentWorkspace.panels[representedSurfaceID] === terminalPanel,
+              terminalPanel.stableSurfaceId == context.stableSurfaceID else {
             return false
         }
-        return target.workspaceID == context.workspaceID
-            && target.runtimeSurfaceID == context.runtimeSurfaceID
-            && target.stableSurfaceID == context.stableSurfaceID
-            && target.agentSessionID == context.agentSessionID
-            && target.turnID == context.turnID
-            && target.lifecycleToken == context.lifecycleToken
+        return true
     }
 
     /// Purges completed and in-flight report state for a truly closed surface.

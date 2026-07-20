@@ -9,31 +9,34 @@ public struct AgentReportAvailabilitySnapshot: Sendable, Equatable {
     /// Whether the process-local capture policy is currently enabled.
     public let isCaptureEnabled: Bool
 
-    /// Exact workspace owner for each surface whose latest report remains in
-    /// the same live lifecycle generation in which it was captured.
-    public let workspaceIDByRuntimeSurfaceID: [UUID: UUID]
+    /// Exact runtime surfaces whose latest report remains in the same live
+    /// lifecycle generation in which it was captured.
+    ///
+    /// Workspace ownership is deliberately excluded. A live surface can move
+    /// between workspaces without changing its report identity; callers must
+    /// revalidate the represented workspace against current app topology.
+    public let availableRuntimeSurfaceIDs: Set<UUID>
 
     /// Creates a content-free availability snapshot.
     ///
     /// - Parameters:
     ///   - isCaptureEnabled: Current process-local capture policy.
-    ///   - workspaceIDByRuntimeSurfaceID: Exact available surface ownership.
+    ///   - availableRuntimeSurfaceIDs: Exact surfaces with available reports.
     public init(
         isCaptureEnabled: Bool,
-        workspaceIDByRuntimeSurfaceID: [UUID: UUID]
+        availableRuntimeSurfaceIDs: Set<UUID>
     ) {
         self.isCaptureEnabled = isCaptureEnabled
-        self.workspaceIDByRuntimeSurfaceID = workspaceIDByRuntimeSurfaceID
+        self.availableRuntimeSurfaceIDs = availableRuntimeSurfaceIDs
     }
 
     /// Returns whether one exact represented surface currently has a report.
     ///
     /// - Parameters:
     ///   - runtimeSurfaceID: Exact process-local surface identity.
-    ///   - workspaceID: Exact current workspace representing that surface.
-    /// - Returns: `true` only for a matching available topology tuple.
-    public func hasReport(runtimeSurfaceID: UUID, workspaceID: UUID) -> Bool {
+    /// - Returns: `true` only when that surface has a lifecycle-valid report.
+    public func hasReport(runtimeSurfaceID: UUID) -> Bool {
         isCaptureEnabled
-            && workspaceIDByRuntimeSurfaceID[runtimeSurfaceID] == workspaceID
+            && availableRuntimeSurfaceIDs.contains(runtimeSurfaceID)
     }
 }
