@@ -122,6 +122,10 @@ public actor AgentReportCaptureStore {
         guard Self.identitiesMatch(request: request, target: target) else {
             return .rejected(.identityMismatch)
         }
+        if let rawFinalReply = request.rawFinalReply,
+           !AgentReportResourceLimits.sliceA.permitsReportBody(rawFinalReply) {
+            return .rejected(.exactReplyUnavailable)
+        }
 
         let identity = request.duplicateIdentity
         if let existing = latestByRuntimeSurfaceID[request.runtimeSurfaceID] {
@@ -155,7 +159,13 @@ public actor AgentReportCaptureStore {
                 recordedPath: target.transcriptPath,
                 sessionID: request.agentSessionID,
                 turnID: request.turnID
-            ), let usable = Self.usableExactReply(recovered) else {
+            ) else {
+                return .rejected(.exactReplyUnavailable)
+            }
+            guard AgentReportResourceLimits.sliceA.permitsReportBody(recovered) else {
+                return .rejected(.exactReplyUnavailable)
+            }
+            guard let usable = Self.usableExactReply(recovered) else {
                 return .rejected(.exactReplyUnavailable)
             }
             exactReply = usable
@@ -192,6 +202,9 @@ public actor AgentReportCaptureStore {
         if let latestReceiptOrdinal = latestReceiptOrdinalByRuntimeSurfaceID[request.runtimeSurfaceID],
            receiptOrdinal <= latestReceiptOrdinal {
             return .rejected(.staleCompletion)
+        }
+        guard AgentReportResourceLimits.sliceA.permitsReportBody(exactReply) else {
+            return .rejected(.exactReplyUnavailable)
         }
 
         latestByRuntimeSurfaceID[request.runtimeSurfaceID] = AgentReport(

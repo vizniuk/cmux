@@ -31,6 +31,31 @@ private final class SocketPairFixture {
         write(Array(text.utf8))
     }
 
+    func writeRepeatedInBackground(byte: UInt8, count: Int) -> DispatchSemaphore {
+        let descriptor = writeEnd
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            var remaining = count
+            let chunk = [UInt8](repeating: byte, count: 64 * 1024)
+            while remaining > 0 {
+                let requested = min(remaining, chunk.count)
+                let written = chunk.withUnsafeBufferPointer { buffer in
+                    Darwin.write(descriptor, buffer.baseAddress, requested)
+                }
+                guard written > 0 else {
+                    _ = Darwin.shutdown(descriptor, SHUT_WR)
+                    finished.signal()
+                    return
+                }
+                remaining -= written
+            }
+            var newline: UInt8 = 0x0A
+            _ = Darwin.write(descriptor, &newline, 1)
+            finished.signal()
+        }
+        return finished
+    }
+
     func closeWriteEnd() {
         guard writeEnd >= 0 else { return }
         close(writeEnd)
@@ -302,5 +327,43 @@ struct ControlClientLineReaderTests {
         #expect(reader.nextLine(shouldContinueReading: { true }) == "auth")
         reader.clearLimits()
         #expect(reader.nextLine(shouldContinueReading: { true }) == "subsequent-command")
+    }
+
+    @Test func authorizedFrameLimitAcceptsImmediatelyBelowBoundary() throws {
+        let pair = try SocketPairFixture()
+        let maximumFrameBytes = ControlClientLineReader.maximumAuthorizedRequestFrameBytes
+        let finished = pair.writeRepeatedInBackground(
+            byte: 0x78,
+            count: maximumFrameBytes - 1
+        )
+
+        let reader = ControlClientLineReader(socket: pair.readEnd)
+        let line = try #require(reader.nextLine(shouldContinueReading: { true }))
+
+        #expect(line.utf8.count == maximumFrameBytes - 1)
+        #expect(finished.wait(timeout: .now() + 10) == .success)
+        pair.closeWriteEnd()
+    }
+
+    @Test func authorizedFrameLimitRejectsImmediatelyAboveBoundary() throws {
+        let pair = try SocketPairFixture()
+        let maximumFrameBytes = ControlClientLineReader.maximumAuthorizedRequestFrameBytes
+        let finished = pair.writeRepeatedInBackground(
+            byte: 0x78,
+            count: maximumFrameBytes + 1
+        )
+
+        let reader = ControlClientLineReader(socket: pair.readEnd)
+
+        #expect(reader.nextLine(shouldContinueReading: { true }) == nil)
+        #expect(finished.wait(timeout: .now() + 10) == .success)
+        pair.closeWriteEnd()
+    }
+
+    @Test func authorizedFrameProductionCeilingIsSixteenMiB() {
+        #expect(
+            ControlClientLineReader.maximumAuthorizedRequestFrameBytes
+                == 16 * 1024 * 1024
+        )
     }
 }

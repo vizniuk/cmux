@@ -357,7 +357,9 @@ extension Workspace {
     }
 
     /// Discard every Workspace-owned contribution for a surface whose tab,
-    /// pane, or workspace has already been accepted for closure.
+    /// pane, or workspace has already been accepted for closure. Callers mark
+    /// true terminal removal explicitly so detach and topology movement keep
+    /// the live surface's report authority.
     @discardableResult
     func discardClosedPanelLifecycleState(
         panelId: UUID,
@@ -369,8 +371,12 @@ extension Workspace {
         publishSurfaceClosedEvent: Bool,
         clearSurfaceNotifications: Bool,
         requestTransferredRemoteCleanup: Bool,
-        cleanupControllerSurfaceState: Bool = false
+        cleanupControllerSurfaceState: Bool = false,
+        purgeAgentReportForTrueRemoval: Bool
     ) -> WorkspaceRemoteConfiguration? {
+        if purgeAgentReportForTrueRemoval {
+            TerminalController.shared.purgeAgentReport(runtimeSurfaceID: panelId)
+        }
         if publishSurfaceClosedEvent {
             publishCmuxSurfaceClosed(panelId, paneId: paneId, panel: panel, origin: origin)
         }

@@ -21,17 +21,22 @@ public struct CodexFinalReplyExtractor: Sendable {
         lines: some Sequence<String>,
         sessionID: String
     ) -> Bool {
+        var result: Bool?
         for line in lines {
+            guard line.utf8.count <= AgentReportResourceLimits.sliceA.maximumJSONLRecordBytes else {
+                return false
+            }
             guard let root = TranscriptJSONValue(jsonLine: line),
                   root["type"]?.string == "session_meta" else {
                 continue
             }
+            guard result == nil else { continue }
             let payload = root["payload"]
             let transcriptSessionID = payload?["id"]?.string
                 ?? payload?["session_id"]?.string
-            return transcriptSessionID == sessionID && !Self.isSubagentSession(payload)
+            result = transcriptSessionID == sessionID && !Self.isSubagentSession(payload)
         }
-        return false
+        return result ?? false
     }
 
     /// Extracts the final assistant text for one exact session and turn.
@@ -57,10 +62,23 @@ public struct CodexFinalReplyExtractor: Sendable {
         var responseItemCandidate: String?
         var responseItemCandidateCount = 0
         var terminalCandidate: String?
-        var sawTerminalTurn = false
+        var requiresExplicitTurnBoundary = false
+        var requestedTurnCompleted = false
+        var completedResult: String?
 
         for line in lines {
+            guard line.utf8.count <= AgentReportResourceLimits.sliceA.maximumJSONLRecordBytes else {
+                return nil
+            }
+            if requestedTurnCompleted {
+                continue
+            }
             guard let root = TranscriptJSONValue(jsonLine: line), root.object != nil else {
+                currentTurnID = nil
+                responseItemCandidate = nil
+                responseItemCandidateCount = 0
+                terminalCandidate = nil
+                requiresExplicitTurnBoundary = true
                 continue
             }
             let payload = root["payload"]
@@ -75,16 +93,21 @@ public struct CodexFinalReplyExtractor: Sendable {
                 sawMatchingSession = true
 
             case "turn_context":
-                currentTurnID = Self.turnID(from: payload)
+                guard let authoritativeTurnID = Self.turnID(from: payload) else {
+                    currentTurnID = nil
+                    continue
+                }
+                currentTurnID = authoritativeTurnID
+                requiresExplicitTurnBoundary = false
                 if currentTurnID == turnID {
                     responseItemCandidate = nil
                     responseItemCandidateCount = 0
                     terminalCandidate = nil
-                    sawTerminalTurn = false
                 }
 
             case "response_item":
-                guard sawMatchingSession,
+                guard !requiresExplicitTurnBoundary,
+                      sawMatchingSession,
                       payload?["type"]?.string == "message",
                       payload?["role"]?.string == "assistant",
                       payload?["phase"]?.string == "final_answer" else {
@@ -100,6 +123,9 @@ public struct CodexFinalReplyExtractor: Sendable {
                 // multiple blocks exist and no terminal last_agent_message is
                 // available, joining would invent separators, so fail closed.
                 guard texts.count == 1, let candidate = texts.first else { continue }
+                guard AgentReportResourceLimits.sliceA.permitsReportBody(candidate) else {
+                    return nil
+                }
                 if !candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     responseItemCandidateCount += 1
                     responseItemCandidate = candidate
@@ -109,14 +135,34 @@ public struct CodexFinalReplyExtractor: Sendable {
                 guard let eventType = payload?["type"]?.string else { continue }
                 switch eventType {
                 case "task_started":
-                    currentTurnID = Self.turnID(from: payload)
+                    guard let authoritativeTurnID = Self.turnID(from: payload) else {
+                        currentTurnID = nil
+                        continue
+                    }
+                    currentTurnID = authoritativeTurnID
+                    requiresExplicitTurnBoundary = false
+                    if authoritativeTurnID == turnID {
+                        responseItemCandidate = nil
+                        responseItemCandidateCount = 0
+                        terminalCandidate = nil
+                    }
                 case "task_complete", "turn_complete":
+                    guard !requiresExplicitTurnBoundary else { continue }
                     let completedTurnID = Self.turnID(from: payload) ?? currentTurnID
                     guard completedTurnID == turnID else { continue }
-                    sawTerminalTurn = true
-                    if let final = payload?["last_agent_message"]?.string,
-                       !final.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        terminalCandidate = final
+                    if let final = payload?["last_agent_message"]?.string {
+                        guard AgentReportResourceLimits.sliceA.permitsReportBody(final) else {
+                            return nil
+                        }
+                        if !final.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            terminalCandidate = final
+                        }
+                    }
+                    requestedTurnCompleted = true
+                    if let terminalCandidate {
+                        completedResult = terminalCandidate
+                    } else if responseItemCandidateCount == 1 {
+                        completedResult = responseItemCandidate
                     }
                 default:
                     continue
@@ -127,12 +173,8 @@ public struct CodexFinalReplyExtractor: Sendable {
             }
         }
 
-        guard sawMatchingSession, sawTerminalTurn else { return nil }
-        if let terminalCandidate {
-            return terminalCandidate
-        }
-        guard responseItemCandidateCount == 1 else { return nil }
-        return responseItemCandidate
+        guard sawMatchingSession, requestedTurnCompleted else { return nil }
+        return completedResult
     }
 
     /// Reads provider turn identity across supported rollout field spellings.

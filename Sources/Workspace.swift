@@ -7706,7 +7706,8 @@ final class Workspace: Identifiable, ObservableObject {
             publishSurfaceClosedEvent: false,
             clearSurfaceNotifications: false,
             requestTransferredRemoteCleanup: true,
-            cleanupControllerSurfaceState: false
+            cleanupControllerSurfaceState: false,
+            purgeAgentReportForTrueRemoval: false
         )
         GhosttyApp.terminalSurfaceRegistry.unregister(oldPanel.surface)
         oldPanel.removeOwnedSessionScrollbackReplayArtifact()
@@ -8619,7 +8620,8 @@ final class Workspace: Identifiable, ObservableObject {
                 publishSurfaceClosedEvent: true,
                 clearSurfaceNotifications: true,
                 requestTransferredRemoteCleanup: true,
-                cleanupControllerSurfaceState: true
+                cleanupControllerSurfaceState: true,
+                purgeAgentReportForTrueRemoval: true
             )
         }
         clearAllAgentPIDs(refreshPorts: false)
@@ -12021,14 +12023,9 @@ extension Workspace: BonsplitDelegate {
             publishSurfaceClosedEvent: !isDetaching,
             clearSurfaceNotifications: !preservesSurfaceForDetach,
             requestTransferredRemoteCleanup: false,
-            cleanupControllerSurfaceState: !isDetaching
+            cleanupControllerSurfaceState: !isDetaching,
+            purgeAgentReportForTrueRemoval: !isDetaching
         )
-        if !isDetaching {
-            // A detached panel remains the same live surface in another pane;
-            // purging only on true closure prevents both stale retention and
-            // accidental loss during a topology-only move.
-            TerminalController.shared.purgeAgentReport(runtimeSurfaceID: panelId)
-        }
         if !isDetaching {
             owningTabManager?.invalidateFocusHistoryTarget(workspaceId: id, panelId: panelId)
         }
@@ -12219,7 +12216,8 @@ extension Workspace: BonsplitDelegate {
                     publishSurfaceClosedEvent: true,
                     clearSurfaceNotifications: true,
                     requestTransferredRemoteCleanup: true,
-                    cleanupControllerSurfaceState: !isDetachingCloseTransaction
+                    cleanupControllerSurfaceState: !isDetachingCloseTransaction,
+                    purgeAgentReportForTrueRemoval: !isDetachingCloseTransaction
                 )
                 if !isDetachingCloseTransaction {
                     owningTabManager?.invalidateFocusHistoryTarget(workspaceId: id, panelId: panelId)

@@ -1,6 +1,7 @@
 import AppKit
 import CMUXAgentLaunch
 import CmuxAgentChat
+@testable import CmuxControlSocket
 import CmuxCore
 import Darwin
 import Foundation
@@ -707,6 +708,221 @@ final class TerminalControllerSocketSecurityTests {
         XCTAssertFalse(String(describing: workerEnvelope).contains(privateBody))
         let retained = await store.latestReport(runtimeSurfaceID: surfaceID)
         XCTAssertNil(retained)
+    }
+
+    @Test func privateAgentReportEndpointRejectsOversizedBodyWithoutRetentionOrEmission() async throws {
+        let socketPath = makeSocketPath("report-body-limit")
+        let controller = TerminalController.shared
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: SuspendedEndpointAgentReportRecovery(reply: "unused")
+        )
+        controller.agentReportCaptureStore = store
+        defer { controller.agentReportCaptureStore = nil }
+        controller.start(tabManager: TabManager(), socketPath: socketPath, accessMode: .allowAll)
+        try waitForSocket(at: socketPath)
+
+        let surfaceID = UUID()
+        let sentinel = "PRIVATE-OVERSIZED-ENDPOINT-SENTINEL"
+        let oversized = String(
+            repeating: "x",
+            count: AgentReportResourceLimits.sliceA.maximumReportBodyBytes + 1
+        ) + sentinel
+        let envelope = try await sendV2RequestAsync(
+            method: "agent.report.capture",
+            params: [
+                "provider": "codex",
+                "workspace_id": UUID().uuidString,
+                "surface_id": surfaceID.uuidString,
+                "session_id": "oversized-session",
+                "turn_id": "oversized-turn",
+                "completion_kind": "primaryStop",
+                "completion_timestamp": 100.0,
+                "raw_final_reply": oversized,
+            ],
+            to: socketPath
+        )
+
+        #expect(envelope["ok"] as? Bool == false)
+        let error = try #require(envelope["error"] as? [String: Any])
+        #expect(error["code"] as? String == "invalid_params")
+        #expect(error["data"] == nil)
+        #expect(!String(describing: envelope).contains(sentinel))
+        #expect(await store.latestReport(runtimeSurfaceID: surfaceID) == nil)
+    }
+
+    @Test func appAgentReportResourcePolicyValuesAreFixed() {
+        let limits = AgentReportResourceLimits.sliceA
+        #expect(limits.maximumReportBodyBytes == 2 * 1024 * 1024)
+        #expect(limits.maximumJSONLRecordBytes == 8 * 1024 * 1024)
+        #expect(limits.maximumTranscriptBytes == 128 * 1024 * 1024)
+        #expect(limits.maximumAuthorizedSocketFrameBytes == 16 * 1024 * 1024)
+    }
+
+    @Test func socketFrameCeilingMatchesSharedSliceAPolicy() {
+        #expect(
+            ControlClientLineReader.maximumAuthorizedRequestFrameBytes
+                == AgentReportResourceLimits.sliceA.maximumAuthorizedSocketFrameBytes
+        )
+    }
+
+    @Test(arguments: ["tab", "pane", "workspace"])
+    func completedReportIsPurgedByEveryTrueRemovalPath(_ removalPath: String) async throws {
+        let controller = TerminalController.shared
+        let manager = TabManager()
+        let workspace = try #require(manager.selectedWorkspace)
+        let panel = try #require(workspace.focusedTerminalPanel)
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: SuspendedEndpointAgentReportRecovery(reply: "unused")
+        )
+        controller.agentReportCaptureStore = store
+        var purgeCount = 0
+        let purges = AsyncStream<UUID> { continuation in
+            controller.agentReportPurgeObserverForTesting = { surfaceID in
+                if surfaceID == panel.id { purgeCount += 1 }
+                continuation.yield(surfaceID)
+            }
+        }
+        var purgeIterator = purges.makeAsyncIterator()
+        defer {
+            controller.agentReportPurgeObserverForTesting = nil
+            controller.agentReportCaptureStore = nil
+            for remainingWorkspace in manager.tabs {
+                remainingWorkspace.teardownAllPanels()
+            }
+        }
+
+        let request = agentReportRequest(workspace: workspace, panel: panel, raw: "completed")
+        let target = agentReportTarget(workspace: workspace, panel: panel)
+        #expect(
+            await store.capture(request, target: target, revalidateTarget: { target })
+                == .captured
+        )
+
+        try performTrueRemoval(
+            removalPath,
+            manager: manager,
+            workspace: workspace,
+            panel: panel
+        )
+        #expect(await purgeIterator.next() == panel.id)
+        #expect(await store.latestReport(runtimeSurfaceID: panel.id) == nil)
+        #expect(purgeCount == 1)
+    }
+
+    @Test(arguments: ["tab", "pane", "workspace"])
+    func pendingCaptureCannotCommitAfterEveryTrueRemovalPath(_ removalPath: String) async throws {
+        let controller = TerminalController.shared
+        let manager = TabManager()
+        let workspace = try #require(manager.selectedWorkspace)
+        let panel = try #require(workspace.focusedTerminalPanel)
+        let recovery = SuspendedEndpointAgentReportRecovery(reply: "late report")
+        let store = AgentReportCaptureStore(policy: .enabled, transcriptRecovery: recovery)
+        controller.agentReportCaptureStore = store
+        let purges = AsyncStream<UUID> { continuation in
+            controller.agentReportPurgeObserverForTesting = { continuation.yield($0) }
+        }
+        var purgeIterator = purges.makeAsyncIterator()
+        defer {
+            controller.agentReportPurgeObserverForTesting = nil
+            controller.agentReportCaptureStore = nil
+            for remainingWorkspace in manager.tabs {
+                remainingWorkspace.teardownAllPanels()
+            }
+        }
+
+        let request = agentReportRequest(workspace: workspace, panel: panel, raw: nil)
+        let target = agentReportTarget(workspace: workspace, panel: panel)
+        let capture = Task {
+            await store.capture(request, target: target, revalidateTarget: { target })
+        }
+        await recovery.waitUntilRecoveryStarted()
+
+        try performTrueRemoval(
+            removalPath,
+            manager: manager,
+            workspace: workspace,
+            panel: panel
+        )
+        #expect(await purgeIterator.next() == panel.id)
+        await recovery.resumeRecovery()
+
+        #expect(await capture.value == .rejected(.inaccessibleSurface))
+        #expect(await store.latestReport(runtimeSurfaceID: panel.id) == nil)
+    }
+
+    @Test func detachTransferPreservesReportAndDoesNotEnqueuePurge() async throws {
+        let controller = TerminalController.shared
+        let manager = TabManager()
+        let source = try #require(manager.selectedWorkspace)
+        let destination = manager.addWorkspace(select: false)
+        let panel = try #require(source.focusedTerminalPanel)
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: SuspendedEndpointAgentReportRecovery(reply: "unused")
+        )
+        controller.agentReportCaptureStore = store
+        var purgeCount = 0
+        controller.agentReportPurgeObserverForTesting = { _ in purgeCount += 1 }
+        defer {
+            controller.agentReportPurgeObserverForTesting = nil
+            controller.agentReportCaptureStore = nil
+            for workspace in manager.tabs {
+                workspace.teardownAllPanels()
+            }
+        }
+
+        let request = agentReportRequest(workspace: source, panel: panel, raw: "completed")
+        let target = agentReportTarget(workspace: source, panel: panel)
+        #expect(
+            await store.capture(request, target: target, revalidateTarget: { target })
+                == .captured
+        )
+        let detached = try #require(source.detachSurface(panelId: panel.id))
+        let destinationPane = try #require(destination.bonsplitController.allPaneIds.first)
+        #expect(destination.attachDetachedSurface(detached, inPane: destinationPane) == panel.id)
+
+        #expect(await store.latestReport(runtimeSurfaceID: panel.id)?.finalReply == "completed")
+        #expect(purgeCount == 0)
+        await store.purge(runtimeSurfaceID: panel.id)
+    }
+
+    @Test func repeatedWorkspaceTeardownPurgesEachSurfaceExactlyOnce() async throws {
+        let controller = TerminalController.shared
+        let workspace = Workspace()
+        let panel = try #require(workspace.focusedTerminalPanel)
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: SuspendedEndpointAgentReportRecovery(reply: "unused")
+        )
+        controller.agentReportCaptureStore = store
+        var purgeCount = 0
+        let purges = AsyncStream<UUID> { continuation in
+            controller.agentReportPurgeObserverForTesting = { surfaceID in
+                if surfaceID == panel.id { purgeCount += 1 }
+                continuation.yield(surfaceID)
+            }
+        }
+        var purgeIterator = purges.makeAsyncIterator()
+        defer {
+            controller.agentReportPurgeObserverForTesting = nil
+            controller.agentReportCaptureStore = nil
+            workspace.teardownAllPanels()
+        }
+
+        let request = agentReportRequest(workspace: workspace, panel: panel, raw: "completed")
+        let target = agentReportTarget(workspace: workspace, panel: panel)
+        #expect(
+            await store.capture(request, target: target, revalidateTarget: { target })
+                == .captured
+        )
+        workspace.teardownAllPanels()
+        #expect(await purgeIterator.next() == panel.id)
+        workspace.teardownAllPanels()
+
+        #expect(purgeCount == 1)
+        #expect(await store.latestReport(runtimeSurfaceID: panel.id) == nil)
     }
 
     @Test func enabledPrivateAgentReportEndpointValidatesAndCapturesExactLiveSurface() async throws {
@@ -2156,6 +2372,62 @@ final class TerminalControllerSocketSecurityTests {
             "Expected to create \(url.path)"
         )
         return url.path
+    }
+
+    private func agentReportRequest(
+        workspace: Workspace,
+        panel: TerminalPanel,
+        raw: String?
+    ) -> AgentReportCaptureRequest {
+        AgentReportCaptureRequest(
+            provider: .codex,
+            workspaceID: workspace.id,
+            runtimeSurfaceID: panel.id,
+            agentSessionID: "lifecycle-session",
+            turnID: "lifecycle-turn",
+            completionKind: .primaryStop,
+            transcriptPath: "/synthetic/lifecycle.jsonl",
+            rawFinalReply: raw,
+            completionTimestamp: Date(timeIntervalSince1970: 100)
+        )
+    }
+
+    private func agentReportTarget(
+        workspace: Workspace,
+        panel: TerminalPanel
+    ) -> AgentReportCaptureTarget {
+        AgentReportCaptureTarget(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: panel.id,
+            stableSurfaceID: panel.stableSurfaceId,
+            agentSessionID: "lifecycle-session",
+            turnID: "lifecycle-turn",
+            lifecycleToken: UUID(),
+            transcriptPath: "/synthetic/lifecycle.jsonl"
+        )
+    }
+
+    private func performTrueRemoval(
+        _ removalPath: String,
+        manager: TabManager,
+        workspace: Workspace,
+        panel: TerminalPanel
+    ) throws {
+        switch removalPath {
+        case "tab":
+            #expect(workspace.closePanel(panel.id, force: true))
+        case "pane":
+            _ = try #require(
+                workspace.newTerminalSplit(from: panel.id, orientation: .horizontal)
+            )
+            let pane = try #require(workspace.paneId(forPanelId: panel.id))
+            #expect(workspace.bonsplitController.closePane(pane))
+        case "workspace":
+            _ = manager.addWorkspace(select: false)
+            manager.closeWorkspace(workspace, recordHistory: false)
+        default:
+            Issue.record("Unknown true-removal test path")
+        }
     }
 
     private nonisolated func posixError(_ operation: String) -> NSError {

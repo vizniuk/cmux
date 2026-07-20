@@ -131,6 +131,8 @@ class TerminalController {
 #if DEBUG
     /// Test-only content-free capture-result observation seam.
     @MainActor var agentReportCaptureResultObserverForTesting: ((AgentReportCaptureResult) -> Void)?
+    /// Test-only content-free notification after an actor purge completes.
+    @MainActor var agentReportPurgeObserverForTesting: ((UUID) -> Void)?
 #endif
     // Sendable value type; injected at construction so socket auth never reaches a global.
     nonisolated let passwordStore: SocketControlPasswordStore
@@ -5593,6 +5595,14 @@ class TerminalController {
         if let rawFinalReply = params["raw_final_reply"], !(rawFinalReply is String) {
             return .err(code: "invalid_params", message: "raw_final_reply must be a string", data: nil)
         }
+        if let rawFinalReply = params["raw_final_reply"] as? String,
+           !AgentReportResourceLimits.sliceA.permitsReportBody(rawFinalReply) {
+            return .err(
+                code: "invalid_params",
+                message: "raw_final_reply exceeds the private capture size limit",
+                data: nil
+            )
+        }
 
         let request = AgentReportCaptureRequest(
             provider: provider,
@@ -5709,7 +5719,12 @@ class TerminalController {
             runtimeSurfaceID: runtimeSurfaceID
         )
         guard let store = agentReportCaptureStore else { return }
-        Task { await store.purge(runtimeSurfaceID: runtimeSurfaceID) }
+        Task { [weak self] in
+            await store.purge(runtimeSurfaceID: runtimeSurfaceID)
+#if DEBUG
+            self?.agentReportPurgeObserverForTesting?(runtimeSurfaceID)
+#endif
+        }
     }
 
 #if DEBUG

@@ -1,4 +1,5 @@
 import XCTest
+import CmuxAgentChat
 import Darwin
 #if canImport(cmux_DEV)
 @testable import cmux_DEV
@@ -474,6 +475,53 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         }
         XCTAssertNil(hookRecord["lastEmittedNotificationFingerprint"])
         XCTAssertNil(hookRecord["recentEmittedNotificationFingerprints"])
+    }
+
+    func testCodexOversizedRawStopIsRejectedBeforePrivateSocketSerialization() throws {
+        let context = try makeClaudeHookContext(name: "codex-private-report-limit")
+        defer { context.cleanup() }
+        startAgentHookMockServerAccepting(context: context, connectionLimit: 32)
+        let sessionID = "synthetic-report-limit-session"
+        let turnID = "synthetic-report-limit-turn"
+        let launchEnvironment = codexLaunchEnvironment(context: context, sessionId: sessionID)
+        let prompt = runCodexHook(
+            context: context,
+            subcommand: "prompt-submit",
+            standardInput: #"{"session_id":"\#(sessionID)","turn_id":"\#(turnID)","cwd":"\#(context.root.path)","hook_event_name":"UserPromptSubmit","prompt":"synthetic prompt"}"#,
+            extraEnvironment: launchEnvironment
+        )
+        XCTAssertFalse(prompt.timedOut, prompt.stderr)
+        XCTAssertEqual(prompt.status, 0, prompt.stderr)
+
+        let sentinel = "PRIVATE-CLI-OVERSIZE-SENTINEL"
+        let limit = AgentReportResourceLimits.sliceA.maximumReportBodyBytes
+        let oversized = String(repeating: "x", count: limit + 1 - sentinel.utf8.count) + sentinel
+        XCTAssertEqual(oversized.utf8.count, limit + 1)
+        let stopObject: [String: Any] = [
+            "session_id": sessionID,
+            "turn_id": turnID,
+            "cwd": context.root.path,
+            "hook_event_name": "Stop",
+            "last_assistant_message": oversized,
+        ]
+        let stopInput = String(
+            decoding: try JSONSerialization.data(withJSONObject: stopObject, options: [.sortedKeys]),
+            as: UTF8.self
+        )
+
+        let stop = runCodexHook(
+            context: context,
+            subcommand: "stop",
+            standardInput: stopInput,
+            extraEnvironment: launchEnvironment
+        )
+
+        XCTAssertFalse(stop.timedOut, stop.stderr)
+        XCTAssertEqual(stop.status, 0, stop.stderr)
+        XCTAssertTrue(agentReportCaptureRequests(in: context).isEmpty)
+        XCTAssertFalse(context.state.snapshot().contains { $0.contains(sentinel) })
+        XCTAssertFalse(stop.stdout.contains(sentinel))
+        XCTAssertFalse(stop.stderr.contains(sentinel))
     }
 
     func testCodexNullRawStopQueuesTranscriptRecoveryWithoutPreviewSubstitution() throws {

@@ -25,15 +25,25 @@ internal import Foundation
 ///   waiting for each next read even though readiness polling precedes `read(2)`.
 /// - EOF, a read error, or a `false` poll ends the stream (`nil`); buffered
 ///   bytes without a trailing newline are discarded, as before.
+/// - Every authorized request frame has a permanent byte ceiling enforced
+///   before the frame is materialized as a `String`.
 /// - While `initialLimits` remain active, raw bytes are counted cumulatively
 ///   before UTF-8 decoding, including invalid chunks and line delimiters, and
 ///   the absolute deadline is checked before buffered lines are returned.
 public final class ControlClientLineReader {
+    /// Permanent ceiling for one authorized request frame.
+    ///
+    /// This mirrors Slice A's shared agent-report policy because the lower
+    /// control-socket package cannot depend on `CmuxAgentChat`.
+    static let maximumAuthorizedRequestFrameBytes = 16 * 1024 * 1024
+
     private let socket: Int32
     private var buffer: [UInt8]
     private var pendingBytes: [UInt8] = []
     private var pendingStartIndex = 0
     private var newlineSearchIndex = 0
+    private var droppedRawBytesInCurrentFrame = 0
+    private let maximumFrameBytes: Int
     private var limitedBytesRead = 0
     private var limits: ControlClientLineReadLimits?
     private var deadlineUptimeNanoseconds: UInt64?
@@ -62,6 +72,7 @@ public final class ControlClientLineReader {
     ) {
         self.socket = socket
         self.buffer = [UInt8](repeating: 0, count: bufferSize)
+        self.maximumFrameBytes = Self.maximumAuthorizedRequestFrameBytes
         self.authorizationRevocationSignal = authorizationRevocationSignal
         var readinessPollDescriptors = [
             pollfd(fd: socket, events: Int16(POLLIN), revents: 0)
@@ -120,15 +131,26 @@ public final class ControlClientLineReader {
             guard deadlineHasNotExpired else { return nil }
 
             if let newlineIndex = nextBareNewlineIndex() {
+                let lineBytes = newlineIndex - pendingStartIndex
+                let (framedBytes, overflowed) = lineBytes.addingReportingOverflow(
+                    droppedRawBytesInCurrentFrame
+                )
+                guard !overflowed, framedBytes <= maximumFrameBytes else { return nil }
                 let line = String(
                     bytes: pendingBytes[pendingStartIndex..<newlineIndex],
                     encoding: .utf8
                 ) ?? ""
                 pendingStartIndex = newlineIndex + 1
                 newlineSearchIndex = pendingStartIndex
+                droppedRawBytesInCurrentFrame = 0
                 compactPendingBytesIfNeeded()
                 return line
             }
+            let bufferedFrameBytes = pendingBytes.count - pendingStartIndex
+            let (framedBytes, overflowed) = bufferedFrameBytes.addingReportingOverflow(
+                droppedRawBytesInCurrentFrame
+            )
+            guard !overflowed, framedBytes <= maximumFrameBytes else { return nil }
 
             if !startedReadWait {
                 resetIdleReadDeadline()
@@ -147,8 +169,14 @@ public final class ControlClientLineReader {
                 limitedBytesRead = totalBytesRead
             }
 
-            let chunk = String(bytes: buffer[0..<bytesRead], encoding: .utf8) ?? ""
-            pendingBytes.append(contentsOf: chunk.utf8)
+            if let chunk = String(bytes: buffer[0..<bytesRead], encoding: .utf8) {
+                pendingBytes.append(contentsOf: chunk.utf8)
+            } else {
+                let (droppedBytes, overflowed) = droppedRawBytesInCurrentFrame
+                    .addingReportingOverflow(bytesRead)
+                guard !overflowed, droppedBytes <= maximumFrameBytes else { return nil }
+                droppedRawBytesInCurrentFrame = droppedBytes
+            }
         }
     }
 

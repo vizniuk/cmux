@@ -2931,6 +2931,9 @@ struct CMUXCLI {
     private static let persistentCloudVMSlotID = "cmux-default-freestyle-sshd-v1"
     private static let persistentCloudVMWorkspaceName = "sshd"
     private static let claudeCodeStatusKey = "claude_code"
+    // Mirrored from AgentReportResourceLimits because the standalone CLI
+    // target cannot depend on the app's CmuxAgentChat package.
+    private static let agentReportMaximumBodyBytes = 2 * 1024 * 1024
 
     private static var allowedAgentLifecycleStatusKeys: Set<String> {
         var keys = Set(agentDefs.map(\.statusKey))
@@ -32165,6 +32168,10 @@ export default CMUXSessionRestore;
         turnID: String,
         transcriptPath: String?
     ) {
+        if let rawFinalReply = parsedInput.rawFinalReply,
+           rawFinalReply.utf8.count > Self.agentReportMaximumBodyBytes {
+            return
+        }
         var params: [String: Any] = [
             "provider": "codex",
             "workspace_id": workspaceID,

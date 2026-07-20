@@ -9,6 +9,15 @@ struct AgentReportCaptureStoreTests {
     private let stableSurfaceID = UUID(uuidString: "33333333-3333-3333-3333-333333333333")!
     private let lifecycleToken = UUID(uuidString: "44444444-4444-4444-4444-444444444444")!
 
+    @Test("Slice A resource ceilings are fixed byte contracts")
+    func resourcePolicyValues() {
+        let limits = AgentReportResourceLimits.sliceA
+        #expect(limits.maximumReportBodyBytes == 2 * 1024 * 1024)
+        #expect(limits.maximumJSONLRecordBytes == 8 * 1024 * 1024)
+        #expect(limits.maximumTranscriptBytes == 128 * 1024 * 1024)
+        #expect(limits.maximumAuthorizedSocketFrameBytes == 16 * 1024 * 1024)
+    }
+
     @Test("production policy defaults disabled and starts no recovery")
     func defaultPolicyIsDisabled() async {
         let recovery = StubAgentReportTranscriptRecovery(reply: "transcript reply")
@@ -46,6 +55,49 @@ struct AgentReportCaptureStoreTests {
         #expect(!request(raw: exact).description.contains("Synthetic report"))
         #expect(await recovery.callCount == 0)
         #expect(await recovery.primaryValidationCallCount == 1)
+    }
+
+    @Test("raw report body is accepted immediately below and rejected immediately above the byte ceiling")
+    func rawReportBodyBoundary() async throws {
+        let limit = AgentReportResourceLimits.sliceA.maximumReportBodyBytes
+        let below = String(repeating: "r", count: limit - 1)
+        let acceptedStore = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
+        )
+
+        #expect(await acceptedStore.capture(request(raw: below), target: target()) == .captured)
+        #expect(
+            await acceptedStore.latestReport(runtimeSurfaceID: surfaceID)?.finalReply.utf8.count
+                == limit - 1
+        )
+
+        let above = String(repeating: "r", count: limit + 1)
+        let rejectedStore = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
+        )
+        #expect(
+            await rejectedStore.capture(request(raw: above), target: target())
+                == .rejected(.exactReplyUnavailable)
+        )
+        #expect(await rejectedStore.latestReport(runtimeSurfaceID: surfaceID) == nil)
+    }
+
+    @Test("oversized extracted report is rejected before actor storage")
+    func extractedReportBodyBoundary() async {
+        let limit = AgentReportResourceLimits.sliceA.maximumReportBodyBytes
+        let oversized = String(repeating: "t", count: limit + 1)
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(reply: oversized)
+        )
+
+        #expect(
+            await store.capture(request(raw: nil), target: target())
+                == .rejected(.exactReplyUnavailable)
+        )
+        #expect(await store.latestReport(runtimeSurfaceID: surfaceID) == nil)
     }
 
     @Test("compact preview text is never substituted for the raw report")
@@ -557,15 +609,63 @@ struct CodexFinalReplyExtractorTests {
         #expect(extractor.extract(lines: lines, sessionID: "session-1", turnID: "turn-1") == nil)
     }
 
-    @Test("malformed trailing JSONL fragment cannot change an accepted result")
-    func incompleteTrailingFragmentIsIgnored() {
+    @Test("a completed requested turn survives later malformed and unrelated records")
+    func completedTurnIsFrozenBeforeLaterCorruption() {
         var lines = completedTurnLines(final: "exact complete reply")
         lines.append(#"{"type":"response_item","payload":{"type":"message""#)
+        lines.append(jsonLine(type: "turn_context", payload: ["turn_id": "turn-2"]))
+        lines.append(messageLine(role: "assistant", text: "later reply", turnID: nil))
+        lines.append(jsonLine(type: "event_msg", payload: ["type": "turn_complete"]))
 
         #expect(
             extractor.extract(lines: lines, sessionID: "session-1", turnID: "turn-1")
                 == "exact complete reply"
         )
+    }
+
+    @Test("malformed complete record clears inherited turn authority")
+    func malformedBoundaryCannotAttributeLaterTurnToRequestedTurn() {
+        let lines = [
+            jsonLine(type: "session_meta", payload: ["id": "session-1"]),
+            jsonLine(type: "turn_context", payload: ["turn_id": "turn-1"]),
+            #"{"type":"turn_context","payload":{"turn_id":"turn-2""#,
+            messageLine(role: "assistant", text: "turn two reply", turnID: nil),
+            jsonLine(type: "event_msg", payload: ["type": "turn_complete"]),
+        ]
+
+        #expect(extractor.extract(lines: lines, sessionID: "session-1", turnID: "turn-1") == nil)
+    }
+
+    @Test("explicit authoritative boundary restores authority only for the new turn")
+    func explicitBoundaryAfterMalformedRecordAllowsNewTurn() {
+        let lines = [
+            jsonLine(type: "session_meta", payload: ["id": "session-1"]),
+            jsonLine(type: "turn_context", payload: ["turn_id": "turn-1"]),
+            #"{"type":"turn_context","payload":{"turn_id":"turn-2""#,
+            jsonLine(type: "turn_context", payload: ["turn_id": "turn-2"]),
+            messageLine(role: "assistant", text: "authorized turn two", turnID: nil),
+            jsonLine(type: "event_msg", payload: ["type": "turn_complete"]),
+        ]
+
+        #expect(extractor.extract(lines: lines, sessionID: "session-1", turnID: "turn-1") == nil)
+        #expect(
+            extractor.extract(lines: lines, sessionID: "session-1", turnID: "turn-2")
+                == "authorized turn two"
+        )
+    }
+
+    @Test("malformed record without a new boundary remains fail closed")
+    func malformedRecordWithoutBoundaryInvalidatesCandidates() {
+        let lines = [
+            jsonLine(type: "session_meta", payload: ["id": "session-1"]),
+            jsonLine(type: "turn_context", payload: ["turn_id": "turn-1"]),
+            messageLine(role: "assistant", text: "stale candidate", turnID: nil),
+            #"{"malformed":true"#,
+            messageLine(role: "assistant", text: "must stay rejected", turnID: nil),
+            jsonLine(type: "event_msg", payload: ["type": "turn_complete"]),
+        ]
+
+        #expect(extractor.extract(lines: lines, sessionID: "session-1", turnID: "turn-1") == nil)
     }
 
     private func completedTurnLines(final: String, phase: String? = "final_answer") -> [String] {
@@ -580,15 +680,17 @@ struct CodexFinalReplyExtractorTests {
     private func messageLine(
         role: String,
         text: String,
-        turnID: String,
+        turnID: String?,
         phase: String? = "final_answer"
     ) -> String {
         var payload: [String: Any] = [
             "type": "message",
             "role": role,
             "content": [["type": role == "assistant" ? "output_text" : "input_text", "text": text]],
-            "internal_chat_message_metadata_passthrough": ["turn_id": turnID],
         ]
+        if let turnID {
+            payload["internal_chat_message_metadata_passthrough"] = ["turn_id": turnID]
+        }
         if let phase {
             payload["phase"] = phase
         }

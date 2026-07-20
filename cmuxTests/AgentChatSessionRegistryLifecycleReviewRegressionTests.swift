@@ -2,6 +2,7 @@ import CMUXAgentLaunch
 import CmuxAgentChat
 import Darwin
 import Foundation
+import os
 import Testing
 
 #if canImport(cmux_DEV)
@@ -115,6 +116,9 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
         let escapeSymlink = nestedDirectory.appendingPathComponent("rollout-escape-link.jsonl")
         try FileManager.default.createSymbolicLink(at: insideSymlink, withDestinationURL: valid)
         try FileManager.default.createSymbolicLink(at: escapeSymlink, withDestinationURL: outside)
+        let intermediateSymlink = sessionsRoot.appendingPathComponent("linked-day", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: intermediateSymlink, withDestinationURL: nestedDirectory)
+        let intermediateSymlinkTarget = intermediateSymlink.appendingPathComponent("rollout-valid.jsonl")
 
         let directoryTarget = nestedDirectory.appendingPathComponent("rollout-directory.jsonl", isDirectory: true)
         try FileManager.default.createDirectory(at: directoryTarget, withIntermediateDirectories: true)
@@ -127,9 +131,12 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
             resolver.codexTranscriptPath(recordedPath: valid.path, sessionID: noFallbackSession)
                 == valid.resolvingSymlinksInPath().path
         )
+        #expect(resolver.codexTranscriptPath(recordedPath: insideSymlink.path, sessionID: noFallbackSession) == nil)
         #expect(
-            resolver.codexTranscriptPath(recordedPath: insideSymlink.path, sessionID: noFallbackSession)
-                == valid.resolvingSymlinksInPath().path
+            resolver.codexTranscriptPath(
+                recordedPath: intermediateSymlinkTarget.path,
+                sessionID: noFallbackSession
+            ) == nil
         )
         #expect(resolver.codexTranscriptPath(recordedPath: outside.path, sessionID: noFallbackSession) == nil)
         #expect(resolver.codexTranscriptPath(recordedPath: sibling.path, sessionID: noFallbackSession) == nil)
@@ -140,6 +147,24 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
         #expect(
             resolver.codexTranscriptPath(
                 recordedPath: sessionsRoot.path + "/../../outside/rollout-outside.jsonl",
+                sessionID: noFallbackSession
+            ) == nil
+        )
+        #expect(
+            resolver.codexTranscriptPath(
+                recordedPath: nestedDirectory.path + "//rollout-valid.jsonl",
+                sessionID: noFallbackSession
+            ) == nil
+        )
+        #expect(
+            resolver.codexTranscriptPath(
+                recordedPath: nestedDirectory.path + "/./rollout-valid.jsonl",
+                sessionID: noFallbackSession
+            ) == nil
+        )
+        #expect(
+            resolver.codexTranscriptPath(
+                recordedPath: "2026/07/17/rollout-valid.jsonl",
                 sessionID: noFallbackSession
             ) == nil
         )
@@ -168,6 +193,262 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
                 turnID: "expected-turn"
             ) == nil
         )
+    }
+
+    @Test func trustedOpenRejectsLeafReplacementBeforeOpenAndClosesDescriptors() async throws {
+        let fixture = try trustedCodexFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.home) }
+        let original = fixture.transcript
+        let moved = original.deletingLastPathComponent().appendingPathComponent("moved-original.jsonl")
+        let replacement = codexTranscriptText(
+            sessionID: fixture.sessionID,
+            turnID: fixture.turnID,
+            finalReply: "replacement must not be read"
+        )
+        let events = TrustedOpenEventRecorder()
+        let resolver = AgentChatTranscriptResolver(
+            homeDirectory: fixture.home,
+            environment: [:],
+            trustedOpenCheckpoint: { checkpoint in
+                events.record(checkpoint)
+                guard checkpoint == .beforeOpeningLeaf else { return }
+                try! FileManager.default.moveItem(at: original, to: moved)
+                try! replacement.write(to: original, atomically: false, encoding: .utf8)
+            }
+        )
+
+        let recovered = await resolver.recoverCodexFinalReply(
+            recordedPath: original.path,
+            sessionID: fixture.sessionID,
+            turnID: fixture.turnID
+        )
+
+        #expect(recovered == nil)
+        #expect(events.count(of: .didCloseDescriptor) == 5)
+    }
+
+    @Test func trustedOpenRejectsIntermediateReplacementWithOutsideSymlink() async throws {
+        let fixture = try trustedCodexFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.home) }
+        let sessionsRoot = fixture.home.appendingPathComponent(".codex/sessions", isDirectory: true)
+        let year = sessionsRoot.appendingPathComponent("2026", isDirectory: true)
+        let movedYear = sessionsRoot.appendingPathComponent("held-2026", isDirectory: true)
+        let outside = fixture.home.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let events = TrustedOpenEventRecorder()
+        let resolver = AgentChatTranscriptResolver(
+            homeDirectory: fixture.home,
+            environment: [:],
+            trustedOpenCheckpoint: { checkpoint in
+                events.record(checkpoint)
+                guard checkpoint == .beforeOpeningIntermediate(0) else { return }
+                try! FileManager.default.moveItem(at: year, to: movedYear)
+                try! FileManager.default.createSymbolicLink(at: year, withDestinationURL: outside)
+            }
+        )
+
+        let recovered = await resolver.recoverCodexFinalReply(
+            recordedPath: fixture.transcript.path,
+            sessionID: fixture.sessionID,
+            turnID: fixture.turnID
+        )
+
+        #expect(recovered == nil)
+        #expect(events.count(of: .didCloseDescriptor) == 1)
+    }
+
+    @Test func trustedOpenRejectsLeafReplacementWithFIFOWithoutBlocking() async throws {
+        let fixture = try trustedCodexFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.home) }
+        let original = fixture.transcript
+        let moved = original.deletingLastPathComponent().appendingPathComponent("fifo-original.jsonl")
+        let events = TrustedOpenEventRecorder()
+        let resolver = AgentChatTranscriptResolver(
+            homeDirectory: fixture.home,
+            environment: [:],
+            trustedOpenCheckpoint: { checkpoint in
+                events.record(checkpoint)
+                guard checkpoint == .beforeOpeningLeaf else { return }
+                try! FileManager.default.moveItem(at: original, to: moved)
+                precondition(Darwin.mkfifo(original.path, S_IRUSR | S_IWUSR) == 0)
+            }
+        )
+
+        let recovered = await resolver.recoverCodexFinalReply(
+            recordedPath: original.path,
+            sessionID: fixture.sessionID,
+            turnID: fixture.turnID
+        )
+
+        #expect(recovered == nil)
+        #expect(events.count(of: .didCloseDescriptor) == 5)
+    }
+
+    @Test func openedLeafDescriptorSurvivesOutsideSymlinkReplacement() async throws {
+        let fixture = try trustedCodexFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.home) }
+        let original = fixture.transcript
+        let moved = original.deletingLastPathComponent().appendingPathComponent("opened-original.jsonl")
+        let outside = fixture.home.appendingPathComponent("outside.jsonl")
+        try codexTranscriptText(
+            sessionID: fixture.sessionID,
+            turnID: fixture.turnID,
+            finalReply: "outside replacement"
+        ).write(to: outside, atomically: false, encoding: .utf8)
+        let events = TrustedOpenEventRecorder()
+        let resolver = AgentChatTranscriptResolver(
+            homeDirectory: fixture.home,
+            environment: [:],
+            trustedOpenCheckpoint: { checkpoint in
+                events.record(checkpoint)
+                guard checkpoint == .afterOpeningLeaf else { return }
+                try! FileManager.default.moveItem(at: original, to: moved)
+                try! FileManager.default.createSymbolicLink(at: original, withDestinationURL: outside)
+            }
+        )
+
+        let recovered = await resolver.recoverCodexFinalReply(
+            recordedPath: original.path,
+            sessionID: fixture.sessionID,
+            turnID: fixture.turnID
+        )
+
+        #expect(recovered == fixture.finalReply)
+        #expect(events.count(of: .didCloseDescriptor) == 5)
+    }
+
+    @Test func openedIntermediateDescriptorSurvivesPathReplacement() async throws {
+        let fixture = try trustedCodexFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.home) }
+        let sessionsRoot = fixture.home.appendingPathComponent(".codex/sessions", isDirectory: true)
+        let year = sessionsRoot.appendingPathComponent("2026", isDirectory: true)
+        let movedYear = sessionsRoot.appendingPathComponent("opened-2026", isDirectory: true)
+        let outside = fixture.home.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let events = TrustedOpenEventRecorder()
+        let resolver = AgentChatTranscriptResolver(
+            homeDirectory: fixture.home,
+            environment: [:],
+            trustedOpenCheckpoint: { checkpoint in
+                events.record(checkpoint)
+                guard checkpoint == .afterOpeningIntermediate(0) else { return }
+                try! FileManager.default.moveItem(at: year, to: movedYear)
+                try! FileManager.default.createSymbolicLink(at: year, withDestinationURL: outside)
+            }
+        )
+
+        let recovered = await resolver.recoverCodexFinalReply(
+            recordedPath: fixture.transcript.path,
+            sessionID: fixture.sessionID,
+            turnID: fixture.turnID
+        )
+
+        #expect(recovered == fixture.finalReply)
+        #expect(events.count(of: .didCloseDescriptor) == 5)
+    }
+
+    @Test func transcriptAndJSONLRecordLimitsFailClosedAtByteBoundaries() async throws {
+        let home = try temporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let directory = home.appendingPathComponent(".codex/sessions/2026/07/17", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let sessionID = "resource-session"
+        let smallLimits = AgentReportResourceLimits(
+            maximumReportBodyBytes: 64,
+            maximumJSONLRecordBytes: 128,
+            maximumTranscriptBytes: 1_024,
+            maximumAuthorizedSocketFrameBytes: 256
+        )
+        let resolver = AgentChatTranscriptResolver(
+            homeDirectory: home,
+            environment: [:],
+            reportResourceLimits: smallLimits
+        )
+
+        let belowTranscript = directory.appendingPathComponent("below-transcript.jsonl")
+        let aboveTranscript = directory.appendingPathComponent("above-transcript.jsonl")
+        try writePrimaryTranscript(
+            to: belowTranscript,
+            sessionID: sessionID,
+            totalBytes: smallLimits.maximumTranscriptBytes - 1,
+            maximumRecordBytes: smallLimits.maximumJSONLRecordBytes
+        )
+        try writePrimaryTranscript(
+            to: aboveTranscript,
+            sessionID: sessionID,
+            totalBytes: smallLimits.maximumTranscriptBytes + 1,
+            maximumRecordBytes: smallLimits.maximumJSONLRecordBytes
+        )
+        #expect(await resolver.isPrimaryCodexSession(recordedPath: belowTranscript.path, sessionID: sessionID))
+        #expect(!(await resolver.isPrimaryCodexSession(recordedPath: aboveTranscript.path, sessionID: sessionID)))
+
+        let productionRecordLimit = AgentReportResourceLimits.sliceA.maximumJSONLRecordBytes
+        let recordResolver = AgentChatTranscriptResolver(homeDirectory: home, environment: [:])
+        let belowRecord = directory.appendingPathComponent("below-record.jsonl")
+        let aboveTerminatedRecord = directory.appendingPathComponent("above-terminated-record.jsonl")
+        let aboveUnterminatedRecord = directory.appendingPathComponent("above-unterminated-record.jsonl")
+        try writeRecordBoundaryTranscript(
+            to: belowRecord,
+            sessionID: sessionID,
+            recordBytes: productionRecordLimit - 1,
+            terminated: true
+        )
+        try writeRecordBoundaryTranscript(
+            to: aboveTerminatedRecord,
+            sessionID: sessionID,
+            recordBytes: productionRecordLimit + 1,
+            terminated: true
+        )
+        try writeRecordBoundaryTranscript(
+            to: aboveUnterminatedRecord,
+            sessionID: sessionID,
+            recordBytes: productionRecordLimit + 1,
+            terminated: false
+        )
+        #expect(await recordResolver.isPrimaryCodexSession(recordedPath: belowRecord.path, sessionID: sessionID))
+        #expect(!(await recordResolver.isPrimaryCodexSession(recordedPath: aboveTerminatedRecord.path, sessionID: sessionID)))
+        #expect(!(await recordResolver.isPrimaryCodexSession(recordedPath: aboveUnterminatedRecord.path, sessionID: sessionID)))
+    }
+
+    @Test func cumulativeTranscriptGrowthAfterOpenIsRejected() async throws {
+        let home = try temporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let transcript = home
+            .appendingPathComponent(".codex/sessions/2026/07/17", isDirectory: true)
+            .appendingPathComponent("growing.jsonl")
+        try FileManager.default.createDirectory(
+            at: transcript.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let sessionID = "growing-session"
+        let limits = AgentReportResourceLimits(
+            maximumReportBodyBytes: 64,
+            maximumJSONLRecordBytes: 256,
+            maximumTranscriptBytes: 1_024,
+            maximumAuthorizedSocketFrameBytes: 256
+        )
+        try writePrimaryTranscript(
+            to: transcript,
+            sessionID: sessionID,
+            totalBytes: 512,
+            maximumRecordBytes: limits.maximumJSONLRecordBytes
+        )
+        let resolver = AgentChatTranscriptResolver(
+            homeDirectory: home,
+            environment: [:],
+            reportResourceLimits: limits,
+            trustedOpenCheckpoint: { checkpoint in
+                guard checkpoint == .beforeReadingFirstChunk,
+                      let handle = try? FileHandle(forWritingTo: transcript) else {
+                    return
+                }
+                try? handle.seekToEnd()
+                try? handle.write(contentsOf: Data(repeating: 0x20, count: 600))
+                try? handle.close()
+            }
+        )
+
+        #expect(!(await resolver.isPrimaryCodexSession(recordedPath: transcript.path, sessionID: sessionID)))
     }
 
     @MainActor
@@ -423,10 +704,112 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
         })
     }
 
+    private func trustedCodexFixture() throws -> (
+        home: URL,
+        transcript: URL,
+        sessionID: String,
+        turnID: String,
+        finalReply: String
+    ) {
+        let home = try temporaryHomeDirectory()
+        let transcript = home
+            .appendingPathComponent(".codex/sessions/2026/07/17", isDirectory: true)
+            .appendingPathComponent("rollout-fixture.jsonl")
+        try FileManager.default.createDirectory(
+            at: transcript.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let sessionID = "descriptor-session"
+        let turnID = "descriptor-turn"
+        let finalReply = "descriptor-pinned exact reply"
+        try codexTranscriptText(
+            sessionID: sessionID,
+            turnID: turnID,
+            finalReply: finalReply
+        ).write(to: transcript, atomically: false, encoding: .utf8)
+        return (home, transcript, sessionID, turnID, finalReply)
+    }
+
+    private func codexTranscriptText(
+        sessionID: String,
+        turnID: String,
+        finalReply: String
+    ) -> String {
+        [
+            #"{"type":"session_meta","payload":{"id":"\#(sessionID)"}}"#,
+            #"{"type":"turn_context","payload":{"turn_id":"\#(turnID)"}}"#,
+            #"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"\#(finalReply)"}],"internal_chat_message_metadata_passthrough":{"turn_id":"\#(turnID)"}}}"#,
+            #"{"type":"event_msg","payload":{"type":"turn_complete","turn_id":"\#(turnID)"}}"#,
+        ].joined(separator: "\n") + "\n"
+    }
+
+    private func writePrimaryTranscript(
+        to url: URL,
+        sessionID: String,
+        totalBytes: Int,
+        maximumRecordBytes: Int
+    ) throws {
+        let header = Data(
+            (#"{"type":"session_meta","payload":{"id":"\#(sessionID)"}}"# + "\n").utf8
+        )
+        var data = header
+        while data.count < totalBytes {
+            let remaining = totalBytes - data.count
+            if remaining == 1 {
+                data.append(0x0A)
+                continue
+            }
+            let framedBytes = min(remaining, maximumRecordBytes + 1)
+            let recordBytes = framedBytes - 1
+            if recordBytes == 1 {
+                data.append(0x30)
+            } else {
+                data.append(contentsOf: Data("{}".utf8))
+                if recordBytes > 2 {
+                    data.append(contentsOf: Data(repeating: 0x20, count: recordBytes - 2))
+                }
+            }
+            data.append(0x0A)
+        }
+        try data.write(to: url)
+    }
+
+    private func writeRecordBoundaryTranscript(
+        to url: URL,
+        sessionID: String,
+        recordBytes: Int,
+        terminated: Bool
+    ) throws {
+        var data = Data(
+            (#"{"type":"session_meta","payload":{"id":"\#(sessionID)"}}"# + "\n").utf8
+        )
+        data.append(contentsOf: Data(repeating: 0x20, count: recordBytes))
+        if terminated {
+            data.append(0x0A)
+        }
+        try data.write(to: url)
+    }
+
     private func temporaryHomeDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("cmux-agent-chat-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+}
+
+/// Synchronous test checkpoints cross a detached reader task; this tiny lock
+/// records immutable enum values without exposing transcript or report data.
+private final class TrustedOpenEventRecorder: @unchecked Sendable {
+    private let storage = OSAllocatedUnfairLock(
+        initialState: [AgentChatTranscriptResolver.TrustedOpenCheckpoint]()
+    )
+
+    func record(_ checkpoint: AgentChatTranscriptResolver.TrustedOpenCheckpoint) {
+        storage.withLock { $0.append(checkpoint) }
+    }
+
+    func count(of checkpoint: AgentChatTranscriptResolver.TrustedOpenCheckpoint) -> Int {
+        storage.withLock { events in events.filter { $0 == checkpoint }.count }
     }
 }
