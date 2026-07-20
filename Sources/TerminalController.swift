@@ -5742,12 +5742,11 @@ class TerminalController {
               service.agentReportLifecycleToken(for: representedSurfaceID) == context.lifecycleToken else {
             return false
         }
-        guard await service.registry.agentReportCaptureBinding(
-            workspaceID: context.workspaceID.uuidString,
+        guard await service.registry.agentReportCopyBinding(
+            captureWorkspaceID: context.workspaceID.uuidString,
             surfaceID: context.runtimeSurfaceID.uuidString,
             sessionID: context.agentSessionID,
-            turnID: context.turnID,
-            requestedTranscriptPath: nil
+            turnID: context.turnID
         ) != nil,
               service.agentReportLifecycleToken(for: representedSurfaceID) == context.lifecycleToken,
               let currentManager = AppDelegate.shared?.tabManagerFor(tabId: representedWorkspaceID)
@@ -5769,11 +5768,13 @@ class TerminalController {
     /// - Parameter runtimeSurfaceID: Exact process-local closed surface.
     @MainActor
     func purgeAgentReport(runtimeSurfaceID: UUID) {
-        // Revoke commit authority synchronously. The actor purge remains
-        // asynchronous cleanup and is not the stale-capture correctness gate.
-        agentChatTranscriptService?.invalidateAgentReportSurfaceLifecycle(
+        // Revoke copy/commit authority and visible availability before a
+        // replacement can reuse this runtime id. One actor purge then orders
+        // pending invalidation and retained-body removal together.
+        agentChatTranscriptService?.rotateAgentReportSurfaceLifecycle(
             runtimeSurfaceID: runtimeSurfaceID
         )
+        AppDelegate.shared?.revokeAgentReportAvailability(runtimeSurfaceID: runtimeSurfaceID)
         guard let store = agentReportCaptureStore else { return }
         Task { [weak self] in
             await store.purge(runtimeSurfaceID: runtimeSurfaceID)

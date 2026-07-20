@@ -318,6 +318,15 @@ final class AgentChatTranscriptService {
         return token
     }
 
+    /// Synchronously rotates report authority for a surface that is being
+    /// truly removed or replaced. The owner separately removes UI availability
+    /// and queues one actor purge, rather than retaining the completed report.
+    ///
+    /// - Parameter runtimeSurfaceID: Surface lifecycle being replaced.
+    func rotateAgentReportSurfaceLifecycle(runtimeSurfaceID: UUID) {
+        agentReportLifecycleTokenBySurfaceID[runtimeSurfaceID] = UUID()
+    }
+
     /// Synchronously revokes commit authority before scheduling actor cleanup.
     ///
     /// Prompt, close, resume, and rebind paths call this on the main actor. A
@@ -326,7 +335,7 @@ final class AgentChatTranscriptService {
     ///
     /// - Parameter runtimeSurfaceID: Surface lifecycle being invalidated.
     func invalidateAgentReportSurfaceLifecycle(runtimeSurfaceID: UUID) {
-        agentReportLifecycleTokenBySurfaceID[runtimeSurfaceID] = UUID()
+        rotateAgentReportSurfaceLifecycle(runtimeSurfaceID: runtimeSurfaceID)
         invalidateAgentReportSurface(runtimeSurfaceID)
     }
 

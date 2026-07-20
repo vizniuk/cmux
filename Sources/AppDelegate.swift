@@ -2100,8 +2100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         agentChatTranscriptService.setAgentReportSurfaceInvalidator { [weak self, agentReportCaptureStore] surfaceID in
             // Cleanup may queue, but lifecycle authority was already revoked
             // synchronously by AgentChatTranscriptService on the main actor.
-            self?.agentReportAvailableRuntimeSurfaceIDs.remove(surfaceID)
-            NotificationCenter.default.post(name: .agentReportCopyAvailabilityDidChange, object: nil)
+            self?.revokeAgentReportAvailability(runtimeSurfaceID: surfaceID)
             Task { await agentReportCaptureStore.invalidatePendingCapture(runtimeSurfaceID: surfaceID) }
         }
         startAgentReportAvailabilityObservation(store: agentReportCaptureStore)
@@ -2206,6 +2205,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         } else {
             agentReportAvailableRuntimeSurfaceIDs.removeAll(keepingCapacity: false)
         }
+        NotificationCenter.default.post(name: .agentReportCopyAvailabilityDidChange, object: nil)
+    }
+
+    /// Synchronously removes content-free report availability for one runtime
+    /// surface before its lifecycle can be replaced or rebound.
+    func revokeAgentReportAvailability(runtimeSurfaceID: UUID) {
+        agentReportAvailableRuntimeSurfaceIDs.remove(runtimeSurfaceID)
         NotificationCenter.default.post(name: .agentReportCopyAvailabilityDidChange, object: nil)
     }
 

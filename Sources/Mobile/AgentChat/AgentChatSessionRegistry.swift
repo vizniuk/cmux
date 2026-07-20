@@ -281,9 +281,59 @@ final class AgentChatSessionRegistry {
         turnID: String,
         requestedTranscriptPath: String?
     ) async -> AgentReportCaptureBinding? {
+        await agentReportBinding(
+            captureWorkspaceID: workspaceID,
+            requiredRegistryWorkspaceID: workspaceID,
+            surfaceID: surfaceID,
+            sessionID: sessionID,
+            turnID: turnID,
+            requestedTranscriptPath: requestedTranscriptPath
+        )
+    }
+
+    /// Validates a retained report against its immutable hook-store capture
+    /// tuple while treating the registry workspace as mutable display scope.
+    ///
+    /// A genuine live-panel transfer may re-stamp the registry record to its
+    /// current workspace. Provider, session, runtime surface, active state,
+    /// capture workspace, and turn remain exact and are rechecked around the
+    /// off-main hook-store read.
+    ///
+    /// - Parameters:
+    ///   - captureWorkspaceID: Immutable workspace recorded at capture.
+    ///   - surfaceID: Exact live runtime surface recorded at capture.
+    ///   - sessionID: Exact provider session recorded at capture.
+    ///   - turnID: Exact provider turn recorded at capture.
+    /// - Returns: A content-free validated binding, or `nil` on any mismatch.
+    func agentReportCopyBinding(
+        captureWorkspaceID: String,
+        surfaceID: String,
+        sessionID: String,
+        turnID: String
+    ) async -> AgentReportCaptureBinding? {
+        await agentReportBinding(
+            captureWorkspaceID: captureWorkspaceID,
+            requiredRegistryWorkspaceID: nil,
+            surfaceID: surfaceID,
+            sessionID: sessionID,
+            turnID: turnID,
+            requestedTranscriptPath: nil
+        )
+    }
+
+    /// Resolves the shared immutable capture tuple with an optional stricter
+    /// registry-workspace requirement for initial capture only.
+    private func agentReportBinding(
+        captureWorkspaceID: String,
+        requiredRegistryWorkspaceID: String?,
+        surfaceID: String,
+        sessionID: String,
+        turnID: String,
+        requestedTranscriptPath: String?
+    ) async -> AgentReportCaptureBinding? {
         guard Self.sessionRecordAllowsAgentReportCapture(
             record(sessionID: sessionID),
-            workspaceID: workspaceID,
+            requiredWorkspaceID: requiredRegistryWorkspaceID,
             surfaceID: surfaceID,
             sessionID: sessionID
         ) else {
@@ -302,12 +352,12 @@ final class AgentChatSessionRegistry {
 
         guard let entry,
               entry.sessionID == sessionID,
-              Self.sameUUID(entry.workspaceID, workspaceID),
+              Self.sameUUID(entry.workspaceID, captureWorkspaceID),
               Self.sameUUID(entry.surfaceID, surfaceID),
               entry.lastPromptTurnID == turnID,
               Self.sessionRecordAllowsAgentReportCapture(
                   record(sessionID: sessionID),
-                  workspaceID: workspaceID,
+                  requiredWorkspaceID: requiredRegistryWorkspaceID,
                   surfaceID: surfaceID,
                   sessionID: sessionID
               ) else {
@@ -331,7 +381,7 @@ final class AgentChatSessionRegistry {
     /// session's Feed ownership for the same surface.
     private static func sessionRecordAllowsAgentReportCapture(
         _ record: AgentChatSessionRecord?,
-        workspaceID: String,
+        requiredWorkspaceID: String?,
         surfaceID: String,
         sessionID: String
     ) -> Bool {
@@ -343,11 +393,14 @@ final class AgentChatSessionRegistry {
         // surface's current Feed record here: a managed child can temporarily
         // own that preview index without owning the private capture boundary.
         guard let record else { return true }
-        return record.agentKind == .codex
+        guard record.agentKind == .codex
             && record.sessionID == sessionID
-            && sameUUID(record.workspaceID, workspaceID)
             && sameUUID(record.surfaceID, surfaceID)
-            && record.state != .ended
+            && record.state != .ended else {
+            return false
+        }
+        guard let requiredWorkspaceID else { return true }
+        return sameUUID(record.workspaceID, requiredWorkspaceID)
     }
 
     /// Compares required UUID strings canonically and fails closed on absence.

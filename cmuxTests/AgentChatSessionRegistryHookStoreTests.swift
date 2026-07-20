@@ -291,6 +291,121 @@ struct AgentChatSessionRegistryHookStoreTests {
     }
 
     @MainActor
+    @Test func reportCopyBindingSeparatesCaptureWorkspaceFromDisplayWorkspace() async throws {
+        let home = try temporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let captureWorkspaceID = UUID().uuidString
+        let displayWorkspaceID = UUID().uuidString
+        let surfaceID = UUID().uuidString
+        let sessionID = "synthetic-transferred-session"
+        let turnID = "synthetic-transferred-turn"
+        let transcriptPath = home.appendingPathComponent("transferred-rollout.jsonl").path
+        try writeCodexHookStore(
+            home: home,
+            sessionID: sessionID,
+            workspaceID: captureWorkspaceID,
+            surfaceID: surfaceID,
+            transcriptPath: transcriptPath,
+            lastPromptTurnID: turnID
+        )
+        let registry = AgentChatSessionRegistry(
+            hookStore: AgentChatHookSessionStore(homeDirectory: home)
+        )
+        _ = registry.noteHookEvent(WorkstreamEvent(
+            sessionId: sessionID,
+            hookEventName: .stop,
+            source: "codex",
+            workspaceId: captureWorkspaceID,
+            surfaceId: surfaceID,
+            transcriptPath: transcriptPath
+        ))
+        let service = AgentChatTranscriptService(registry: registry)
+
+        #expect(await registry.agentReportCaptureBinding(
+            workspaceID: captureWorkspaceID,
+            surfaceID: surfaceID,
+            sessionID: sessionID,
+            turnID: turnID,
+            requestedTranscriptPath: transcriptPath
+        ) != nil)
+
+        service.updateSessionWorkspace(sessionID: sessionID, workspaceID: displayWorkspaceID)
+        service.updateSessionWorkspace(sessionID: sessionID, workspaceID: displayWorkspaceID)
+        #expect(service.sessionRecord(sessionID: sessionID)?.workspaceID == displayWorkspaceID)
+        #expect(await registry.agentReportCaptureBinding(
+            workspaceID: captureWorkspaceID,
+            surfaceID: surfaceID,
+            sessionID: sessionID,
+            turnID: turnID,
+            requestedTranscriptPath: transcriptPath
+        ) == nil)
+        #expect(await registry.agentReportCopyBinding(
+            captureWorkspaceID: captureWorkspaceID,
+            surfaceID: surfaceID,
+            sessionID: sessionID,
+            turnID: turnID
+        )?.transcriptPath == transcriptPath)
+
+        #expect(await registry.agentReportCopyBinding(
+            captureWorkspaceID: displayWorkspaceID,
+            surfaceID: surfaceID,
+            sessionID: sessionID,
+            turnID: turnID
+        ) == nil)
+        #expect(await registry.agentReportCopyBinding(
+            captureWorkspaceID: captureWorkspaceID,
+            surfaceID: UUID().uuidString,
+            sessionID: sessionID,
+            turnID: turnID
+        ) == nil)
+        #expect(await registry.agentReportCopyBinding(
+            captureWorkspaceID: captureWorkspaceID,
+            surfaceID: surfaceID,
+            sessionID: "different-session",
+            turnID: turnID
+        ) == nil)
+        #expect(await registry.agentReportCopyBinding(
+            captureWorkspaceID: captureWorkspaceID,
+            surfaceID: surfaceID,
+            sessionID: sessionID,
+            turnID: "different-turn"
+        ) == nil)
+
+        service.noteHookEvent(WorkstreamEvent(
+            sessionId: sessionID,
+            hookEventName: .sessionEnd,
+            source: "codex",
+            workspaceId: displayWorkspaceID,
+            surfaceId: surfaceID,
+            transcriptPath: transcriptPath
+        ))
+        #expect(await registry.agentReportCopyBinding(
+            captureWorkspaceID: captureWorkspaceID,
+            surfaceID: surfaceID,
+            sessionID: sessionID,
+            turnID: turnID
+        ) == nil)
+
+        let wrongProviderRegistry = AgentChatSessionRegistry(
+            hookStore: AgentChatHookSessionStore(homeDirectory: home)
+        )
+        _ = wrongProviderRegistry.noteHookEvent(WorkstreamEvent(
+            sessionId: sessionID,
+            hookEventName: .stop,
+            source: "claude",
+            workspaceId: displayWorkspaceID,
+            surfaceId: surfaceID,
+            transcriptPath: transcriptPath
+        ))
+        #expect(await wrongProviderRegistry.agentReportCopyBinding(
+            captureWorkspaceID: captureWorkspaceID,
+            surfaceID: surfaceID,
+            sessionID: sessionID,
+            turnID: turnID
+        ) == nil)
+    }
+
+    @MainActor
     @Test func codexResumeRebindPreventsCaptureOnOldSurface() async throws {
         let home = try temporaryHomeDirectory()
         defer { try? FileManager.default.removeItem(at: home) }

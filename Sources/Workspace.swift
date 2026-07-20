@@ -7707,7 +7707,9 @@ final class Workspace: Identifiable, ObservableObject {
             clearSurfaceNotifications: false,
             requestTransferredRemoteCleanup: true,
             cleanupControllerSurfaceState: false,
-            purgeAgentReportForTrueRemoval: false
+            // Respawn preserves logical IDs but replaces the panel lifecycle.
+            // Purge report authority before constructing the replacement.
+            purgeAgentReportForTrueRemoval: true
         )
         GhosttyApp.terminalSurfaceRegistry.unregister(oldPanel.surface)
         oldPanel.removeOwnedSessionScrollbackReplayArtifact()
