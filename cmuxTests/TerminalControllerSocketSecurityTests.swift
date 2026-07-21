@@ -3,6 +3,7 @@ import CMUXAgentLaunch
 @_spi(AgentReportTranscript) import CmuxAgentChat
 @testable import CmuxControlSocket
 import CmuxCore
+import CmuxGit
 import Darwin
 import Foundation
 import Testing
@@ -941,6 +942,190 @@ final class TerminalControllerSocketSecurityTests {
         #expect(pasteboard.string(forType: .string) == "must remain")
     }
 
+    @Test func modernPatchApplyEndFullRunContentIsVisibleBoundedAndIdentifierFree() throws {
+        let line: (String, [String: Any]) -> String = { type, payload in
+            let data = try! JSONSerialization.data(
+                withJSONObject: ["type": type, "payload": payload],
+                options: [.sortedKeys]
+            )
+            return String(decoding: data, as: UTF8.self)
+        }
+        let lines = [
+            line("session_meta", ["id": "session-private"]),
+            line("turn_context", ["turn_id": "turn-private"]),
+            line("response_item", [
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "call_id": "call-private",
+                "input": "*** Begin Patch\n*** End Patch",
+            ]),
+            line("event_msg", [
+                "type": "patch_apply_end",
+                "turn_id": "turn-private",
+                "call_id": "call-private",
+                "success": true,
+                "stdout": "Applied ✅\n第二行",
+                "stderr": "",
+                "changes": ["Sources/App.swift": ["type": "update"]],
+            ]),
+            line("response_item", [
+                "type": "message",
+                "role": "assistant",
+                "content": [["type": "output_text", "text": "final"]],
+                "internal_chat_message_metadata_passthrough": ["turn_id": "turn-private"],
+            ]),
+            line("event_msg", [
+                "type": "task_complete",
+                "turn_id": "turn-private",
+                "last_agent_message": "final",
+            ]),
+        ]
+
+        let body = try #require(CodexFullRunExporter().export(
+            lines: lines,
+            sessionID: "session-private",
+            turnID: "turn-private"
+        ))
+        #expect(body.contains("TOOL\n\napply_patch\n*** Begin Patch"))
+        #expect(body.contains("TOOL RESULT\n\napply_patch\nApplied ✅\n第二行"))
+        #expect(body.hasSuffix("ASSISTANT\n\nfinal"))
+        #expect(!body.contains("call-private"))
+        #expect(!body.contains("session-private"))
+        #expect(!body.contains("turn-private"))
+        #expect(!body.contains("\"changes\""))
+    }
+
+    @Test func localizedFullRunUnavailableFeedbackCoversMenuAndCommandPaletteOnce() async throws {
+        let manager = TabManager()
+        let workspace = try #require(manager.selectedWorkspace)
+        let panel = try #require(workspace.focusedTerminalPanel)
+        let surfaceView = panel.hostedView.surfaceView
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: SuspendedEndpointAgentReportRecovery(reply: "unused")
+        )
+        let reportBody = "PRIVATE-REPORT /private/transcript call-private"
+        let request = agentReportRequest(workspace: workspace, panel: panel, raw: reportBody)
+        let target = agentReportTarget(workspace: workspace, panel: panel)
+        #expect(await store.capture(
+            request,
+            target: target,
+            revalidateTarget: { _ in target },
+            publishResolvedAuthority: { _ in true },
+            discardResolvedAuthority: { _ in }
+        ) == .captured)
+
+        let pasteboard = NSPasteboard(name: .init("cmux-full-run-feedback-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        pasteboard.setString("preserve", forType: .string)
+        let originalChangeCount = pasteboard.changeCount
+        var requestedTargets: [(UUID, UUID)] = []
+        var feedback: [String] = []
+        let (feedbackStream, feedbackContinuation) = AsyncStream<String>.makeStream()
+        surfaceView.agentReportFullRunCopyRequestHandler = { workspaceID, surfaceID in
+            requestedTargets.append((workspaceID, surfaceID))
+            var finalAuthorityIsCurrent = true
+            return await AppDelegate.copyFullAgentRun(
+                store: store,
+                runtimeSurfaceID: panel.id,
+                to: pasteboard,
+                generate: { context in
+                    AgentReportFullRunExport(
+                        body: "must not copy",
+                        transcriptBinding: context.transcriptBinding
+                    )
+                },
+                authorize: { context in
+                    context.writeAuthorizationReceipt(
+                        panelInstanceID: ObjectIdentifier(store)
+                    )
+                },
+                beforeFinalWrite: { _ in finalAuthorityIsCurrent = false },
+                shouldWrite: { _ in finalAuthorityIsCurrent }
+            )
+        }
+        surfaceView.agentReportFullRunUnavailablePresenter = { message in
+            feedback.append(message)
+            feedbackContinuation.yield(message)
+            feedbackContinuation.finish()
+        }
+        defer {
+            surfaceView.agentReportFullRunCopyRequestHandler = nil
+            surfaceView.agentReportFullRunUnavailablePresenter = nil
+            workspace.teardownAllPanels()
+        }
+
+        let enabledItem = surfaceView.makeAgentReportFullRunCopyMenuItem(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: panel.id,
+            isCaptureEnabled: true,
+            hasReport: true
+        )
+        var iterator = feedbackStream.makeAsyncIterator()
+        surfaceView.copyFullAgentRun(enabledItem)
+        let menuFeedback = try #require(await iterator.next())
+        let localizedUnavailable = String(
+            localized: "agentReport.fullRunUnavailable",
+            defaultValue: "Full Run is unavailable"
+        )
+        #expect(menuFeedback == localizedUnavailable)
+        #expect(feedback == [localizedUnavailable])
+        #expect(requestedTargets.count == 1)
+        #expect(requestedTargets.first?.0 == workspace.id)
+        #expect(requestedTargets.first?.1 == panel.id)
+        #expect(pasteboard.changeCount == originalChangeCount)
+        #expect(pasteboard.string(forType: .string) == "preserve")
+        for secret in [reportBody, workspace.id.uuidString, panel.id.uuidString, "must not copy"] {
+            #expect(!menuFeedback.contains(secret))
+        }
+
+        let disabledItem = surfaceView.makeAgentReportFullRunCopyMenuItem(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: panel.id,
+            isCaptureEnabled: false,
+            hasReport: true
+        )
+        #expect(!disabledItem.isEnabled)
+        #expect(feedback.count == 1)
+
+        surfaceView.agentReportFullRunCopyRequestHandler = { _, _ in true }
+        #expect(await surfaceView.performAgentReportFullRunCopyRequest(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: panel.id
+        ))
+        #expect(feedback.count == 1)
+
+        var paletteCopyCount = 0
+        #expect(await AppDelegate.performAgentReportFullRunUserAction(
+            copy: {
+                paletteCopyCount += 1
+                return false
+            },
+            presenter: { feedback.append($0) }
+        ) == false)
+        #expect(paletteCopyCount == 1)
+        #expect(feedback == [localizedUnavailable, localizedUnavailable])
+        #expect(pasteboard.changeCount == originalChangeCount)
+    }
+
+    @Test func boundedMalformedGitBranchMetadataRemainsHiddenAtAppEntrypoint() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-app-git-bound-\(UUID().uuidString)", isDirectory: true)
+        let gitDirectory = root.appendingPathComponent(".git", isDirectory: true)
+        try FileManager.default.createDirectory(at: gitDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("ref: refs/heads/safe\ninjected\n".utf8).write(
+            to: gitDirectory.appendingPathComponent("HEAD")
+        )
+
+        #expect(await GitMetadataService().branchDisplaySnapshot(forDirectory: root.path) == nil)
+
+        try Data(repeating: 0x61, count: 1 * 1024 * 1024 + 1).write(
+            to: gitDirectory.appendingPathComponent("HEAD")
+        )
+        #expect(await GitMetadataService().branchDisplaySnapshot(forDirectory: root.path) == nil)
+    }
+
     @Test func staleAgentReportAvailabilityCannotCrossSynchronousRevocation() throws {
         let previousAppDelegate = AppDelegate.shared
         let app = AppDelegate()
@@ -1368,16 +1553,22 @@ final class TerminalControllerSocketSecurityTests {
         #expect(count == 3)
     }
 
-    @Test func representedMenuAndSmallButtonExposeOnlyLocalizedContentFreeState() throws {
+    @Test func representedMenuAndSmallButtonExposeOnlyLocalizedContentFreeState() async throws {
         let manager = TabManager()
         let workspace = try #require(manager.selectedWorkspace)
         let panel = try #require(workspace.focusedTerminalPanel)
         let surfaceView = panel.hostedView.surfaceView
         var requests: [(UUID, UUID)] = []
         var fullRunRequests: [(UUID, UUID)] = []
+        let (fullRunRequestStream, fullRunRequestContinuation) = AsyncStream<(UUID, UUID)>.makeStream()
         surfaceView.agentReportCopyRequestHandler = { requests.append(($0, $1)) }
-        surfaceView.agentReportFullRunCopyRequestHandler = { fullRunRequests.append(($0, $1)) }
+        surfaceView.agentReportFullRunCopyRequestHandler = {
+            fullRunRequests.append(($0, $1))
+            fullRunRequestContinuation.yield(($0, $1))
+            return true
+        }
         defer {
+            fullRunRequestContinuation.finish()
             surfaceView.agentReportCopyRequestHandler = nil
             surfaceView.agentReportFullRunCopyRequestHandler = nil
             workspace.teardownAllPanels()
@@ -1424,13 +1615,15 @@ final class TerminalControllerSocketSecurityTests {
         #expect(requests.count == 1)
         #expect(requests.first?.0 == workspace.id)
         #expect(requests.first?.1 == panel.id)
+        var fullRunRequestIterator = fullRunRequestStream.makeAsyncIterator()
         surfaceView.copyFullAgentRun(fullRunItem)
+        _ = try #require(await fullRunRequestIterator.next())
         #expect(fullRunRequests.count == 1)
         #expect(fullRunRequests.first?.0 == workspace.id)
         #expect(fullRunRequests.first?.1 == panel.id)
 
         let hostedView = panel.hostedView
-        hostedView.frame = NSRect(x: 0, y: 0, width: 44, height: 40)
+        hostedView.frame = NSRect(x: 0, y: 0, width: 160, height: 120)
         hostedView.applyAgentReportCopyControlState(isCaptureEnabled: true, hasReport: true)
         hostedView.layoutSubtreeIfNeeded()
         let button = hostedView.agentReportCopyButtonForTesting
@@ -1466,8 +1659,26 @@ final class TerminalControllerSocketSecurityTests {
                 && button.frame.height == 22
                 && hostedView.bounds.contains(button.frame)
         }
+        func hasUpperRightButtonGeometry() -> Bool {
+            abs(hostedView.bounds.maxX - button.frame.maxX - 8) < 0.001
+                && abs(hostedView.bounds.maxY - button.frame.maxY - 8) < 0.001
+                && abs(button.frame.minY - 8) > 0.001
+        }
+        func overlayConstraintCount() -> Int {
+            hostedView.constraints.filter { constraint in
+                let first = constraint.firstItem as AnyObject?
+                let second = constraint.secondItem as AnyObject?
+                return first === button
+                    || second === button
+                    || first === branch.controls
+                    || second === branch.controls
+                    || first === branch.label
+                    || second === branch.label
+            }.count
+        }
 
         let initialButtons = reportCopyButtons(in: hostedView)
+        let initialOverlayConstraintCount = overlayConstraintCount()
         #expect(initialButtons.count == 1)
         #expect(initialButtons.first === button)
         #expect(initialButtons.filter { !$0.isHidden }.count == 1)
@@ -1481,6 +1692,7 @@ final class TerminalControllerSocketSecurityTests {
         #expect(button.title.isEmpty)
         #expect(button.image != nil)
         #expect(hasExactContainedButtonGeometry())
+        #expect(hasUpperRightButtonGeometry())
         #expect(branch.label.isHidden)
         #expect(branch.label.stringValue.isEmpty)
         #expect(!String(describing: button).contains("PRIVATE-REPORT"))
@@ -1495,6 +1707,7 @@ final class TerminalControllerSocketSecurityTests {
         #expect(!button.isHidden)
         #expect(!button.isEnabled)
         #expect(hasExactContainedButtonGeometry())
+        #expect(hasUpperRightButtonGeometry())
         hostedView.applyAgentReportCopyControlState(isCaptureEnabled: false, hasReport: false)
         hostedView.layoutSubtreeIfNeeded()
         #expect(button.isHidden)
@@ -1505,13 +1718,16 @@ final class TerminalControllerSocketSecurityTests {
         #expect(!button.isHidden)
         #expect(button.isEnabled)
         #expect(hasExactContainedButtonGeometry())
+        #expect(hasUpperRightButtonGeometry())
 
         hostedView.applyGitBranchDisplayForTesting("feat/short")
         hostedView.layoutSubtreeIfNeeded()
         #expect(!branch.label.isHidden)
         #expect(hostedView.bounds.contains(branch.controls.frame))
         #expect(hasExactContainedButtonGeometry())
+        #expect(hasUpperRightButtonGeometry())
         #expect(branch.controls.frame.maxX <= button.frame.minX)
+        #expect(abs(branch.controls.frame.midY - button.frame.midY) < 0.001)
 
         hostedView.applyGitBranchDisplayForTesting(
             "feature/this-is-a-deliberately-long-branch-name-for-narrow-layout"
@@ -1529,7 +1745,9 @@ final class TerminalControllerSocketSecurityTests {
         #expect(button.frame.minY >= 0)
         #expect(hostedView.bounds.contains(branch.controls.frame))
         #expect(hasExactContainedButtonGeometry())
+        #expect(hasUpperRightButtonGeometry())
         #expect(branch.controls.frame.maxX <= button.frame.minX)
+        #expect(abs(branch.controls.frame.midY - button.frame.midY) < 0.001)
 
         hostedView.applyGitBranchDisplayForTesting(nil)
         hostedView.layoutSubtreeIfNeeded()
@@ -1538,6 +1756,7 @@ final class TerminalControllerSocketSecurityTests {
         #expect(branch.label.toolTip == nil)
         #expect(branch.controls.frame.width == 0)
         #expect(hasExactContainedButtonGeometry())
+        #expect(hasUpperRightButtonGeometry())
 
         let replacementWorkspaceID = UUID()
         let replacementPanel = TerminalPanel(workspaceId: replacementWorkspaceID)
@@ -1556,6 +1775,8 @@ final class TerminalControllerSocketSecurityTests {
         #expect(requiredSizeConstraints(.width).count == 1)
         #expect(requiredSizeConstraints(.height).count == 1)
         #expect(hasExactContainedButtonGeometry())
+        #expect(hasUpperRightButtonGeometry())
+        #expect(overlayConstraintCount() == initialOverlayConstraintCount)
         reusedButton.performClick(nil)
         #expect(requests.count == 3)
         #expect(requests.last?.0 == replacementWorkspaceID)
@@ -1565,6 +1786,36 @@ final class TerminalControllerSocketSecurityTests {
         hostedView.layoutSubtreeIfNeeded()
         #expect(button.isHidden)
         #expect(button.frame.size == NSSize(width: 22, height: 22))
+
+        hostedView.frame = NSRect(x: 0, y: 0, width: 44, height: 40)
+        hostedView.applyAgentReportCopyControlState(isCaptureEnabled: true, hasReport: true)
+        hostedView.applyGitBranchDisplayForTesting("feat/short")
+        hostedView.layoutSubtreeIfNeeded()
+        #expect(hasExactContainedButtonGeometry())
+        #expect(hasUpperRightButtonGeometry())
+        #expect(hostedView.bounds.contains(branch.controls.frame))
+        #expect(branch.controls.frame.minX >= 0)
+        #expect(branch.controls.frame.maxX <= button.frame.minX)
+        #expect(abs(branch.controls.frame.midY - button.frame.midY) < 0.001)
+
+        hostedView.applyGitBranchDisplayForTesting(
+            "feature/this-is-a-deliberately-long-branch-name-for-narrow-layout"
+        )
+        hostedView.layoutSubtreeIfNeeded()
+        #expect(hasExactContainedButtonGeometry())
+        #expect(hasUpperRightButtonGeometry())
+        #expect(hostedView.bounds.contains(branch.controls.frame))
+        #expect(branch.label.frame.width < branch.label.intrinsicContentSize.width)
+        #expect(branch.controls.frame.minX >= 0)
+        #expect(branch.controls.frame.maxX <= button.frame.minX)
+
+        hostedView.applyGitBranchDisplayForTesting(nil)
+        hostedView.layoutSubtreeIfNeeded()
+        #expect(branch.label.isHidden)
+        #expect(branch.controls.frame.width == 0)
+        #expect(hasExactContainedButtonGeometry())
+        #expect(hasUpperRightButtonGeometry())
+        #expect(overlayConstraintCount() == initialOverlayConstraintCount)
     }
 
     @Test func gitBranchResolutionRejectsOlderCwdTransferRespawnAndClosedSurfaceResults() {

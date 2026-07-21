@@ -3541,7 +3541,9 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
     /// Test seam and single dispatch point for represented-surface copy UI.
     var agentReportCopyRequestHandler: ((UUID, UUID) -> Void)?
     /// Test seam and single dispatch point for represented-surface Full Run UI.
-    var agentReportFullRunCopyRequestHandler: ((UUID, UUID) -> Void)?
+    var agentReportFullRunCopyRequestHandler: ((UUID, UUID) async -> Bool)?
+    /// Test seam for the shared localized, body-free unavailable presentation.
+    var agentReportFullRunUnavailablePresenter: ((String) -> Void)?
     var backgroundColor: NSColor?
     private var appliedColorScheme: ghostty_color_scheme_e?
     private var lastLoggedSurfaceBackgroundSignature: String?
@@ -7421,16 +7423,34 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
 
     /// Routes every represented Full Run menu item to the central app action.
     func requestAgentReportFullRunCopy(workspaceID: UUID, runtimeSurfaceID: UUID) {
-        if let agentReportFullRunCopyRequestHandler {
-            agentReportFullRunCopyRequestHandler(workspaceID, runtimeSurfaceID)
-            return
-        }
-        Task { @MainActor in
-            await AppDelegate.shared?.copyFullAgentRun(
+        Task { @MainActor [weak self] in
+            await self?.performAgentReportFullRunCopyRequest(
                 workspaceID: workspaceID,
                 runtimeSurfaceID: runtimeSurfaceID
             )
         }
+    }
+
+    /// Executes one explicit represented-surface Full Run action and presents failure once.
+    @discardableResult
+    @MainActor
+    func performAgentReportFullRunCopyRequest(
+        workspaceID: UUID,
+        runtimeSurfaceID: UUID
+    ) async -> Bool {
+        await AppDelegate.performAgentReportFullRunUserAction(
+            copy: { [weak self] in
+                if let agentReportFullRunCopyRequestHandler = self?.agentReportFullRunCopyRequestHandler {
+                    return await agentReportFullRunCopyRequestHandler(workspaceID, runtimeSurfaceID)
+                }
+                guard let app = AppDelegate.shared else { return false }
+                return await app.copyFullAgentRun(
+                    workspaceID: workspaceID,
+                    runtimeSurfaceID: runtimeSurfaceID
+                )
+            },
+            presenter: agentReportFullRunUnavailablePresenter
+        )
     }
 
     /// Routes every represented UI control to the central app copy action.
@@ -8663,7 +8683,7 @@ final class GhosttySurfaceScrollView: NSView {
             terminalTopRightControls.centerYAnchor.constraint(equalTo: agentReportCopyButton.centerYAnchor),
             gitBranchLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 180),
             agentReportCopyButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            agentReportCopyButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+            agentReportCopyButton.topAnchor.constraint(equalTo: topAnchor, constant: 8),
             agentReportCopyButton.widthAnchor.constraint(equalToConstant: 22),
             agentReportCopyButton.heightAnchor.constraint(equalToConstant: 22),
         ])

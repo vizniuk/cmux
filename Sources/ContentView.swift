@@ -7838,10 +7838,12 @@ struct ContentView: View {
             let workspaceID = panelContext.workspace.id
             let surfaceID = panelContext.panelId
             Task { @MainActor in
-                _ = await app.copyFullAgentRun(
-                    workspaceID: workspaceID,
-                    runtimeSurfaceID: surfaceID
-                )
+                await AppDelegate.performAgentReportFullRunUserAction {
+                    await app.copyFullAgentRun(
+                        workspaceID: workspaceID,
+                        runtimeSurfaceID: surfaceID
+                    )
+                }
             }
         }
 

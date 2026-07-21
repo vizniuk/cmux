@@ -4,6 +4,166 @@ import Testing
 
 @Suite("Terminal Git branch display")
 struct GitBranchDisplaySnapshotTests {
+    @Test("metadata reader accepts exactly 1 MiB and rejects one byte above")
+    func metadataFileBoundary() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmuxgit-metadata-boundary-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("metadata")
+
+        try Data(repeating: 0x61, count: GitMetadataReadPolicy.maximumFileBytes).write(to: file)
+        #expect(GitMetadataReadPolicy.readFile(at: file)?.count == GitMetadataReadPolicy.maximumFileBytes)
+
+        try Data(repeating: 0x61, count: GitMetadataReadPolicy.maximumFileBytes + 1).write(to: file)
+        #expect(GitMetadataReadPolicy.readFile(at: file) == nil)
+    }
+
+    @Test("symbolic refs and display branches enforce their exact UTF-8 boundaries")
+    func refAndDisplayBoundaries() async throws {
+        let refPrefix = "refs/heads/"
+        let exactRef = refPrefix + String(
+            repeating: "r",
+            count: GitMetadataReadPolicy.maximumSymbolicRefBytes - refPrefix.utf8.count
+        )
+        #expect(GitMetadataReadPolicy.symbolicRef(exactRef) == exactRef)
+        #expect(GitMetadataReadPolicy.symbolicRef(exactRef + "r") == nil)
+
+        let exactBranch = String(repeating: "b", count: GitMetadataReadPolicy.maximumDisplayBranchBytes)
+        #expect(GitMetadataReadPolicy.displayBranch(exactBranch) == exactBranch)
+        #expect(GitMetadataReadPolicy.displayBranch(exactBranch + "b") == nil)
+
+        let fixture = try GitRepositoryFixture()
+        try "ref: refs/heads/\(exactBranch)\n".write(
+            to: fixture.gitDirectory.appendingPathComponent("HEAD"),
+            atomically: true,
+            encoding: .utf8
+        )
+        #expect(await GitMetadataService().branchDisplaySnapshot(
+            forDirectory: fixture.root.path
+        )?.displayName == exactBranch)
+        try "ref: refs/heads/\(exactBranch)b\n".write(
+            to: fixture.gitDirectory.appendingPathComponent("HEAD"),
+            atomically: true,
+            encoding: .utf8
+        )
+        #expect(await GitMetadataService().branchDisplaySnapshot(forDirectory: fixture.root.path) == nil)
+    }
+
+    @Test("control characters invalid UTF-8 and malformed branch refs remain hidden")
+    func malformedBranchValues() async throws {
+        let malformedBranches = [
+            "safe\ninjected",
+            "safe\rinjected",
+            "safe\tinjected",
+            "safe\u{0000}injected",
+            "safe\u{001F}injected",
+            "../outside",
+            "topic//double",
+            ".hidden",
+            "topic.lock",
+        ]
+        for branch in malformedBranches {
+            let fixture = try GitRepositoryFixture()
+            try Data("ref: refs/heads/\(branch)\n".utf8).write(
+                to: fixture.gitDirectory.appendingPathComponent("HEAD")
+            )
+            #expect(await GitMetadataService().branchDisplaySnapshot(
+                forDirectory: fixture.root.path
+            ) == nil)
+        }
+
+        let invalidUTF8 = try GitRepositoryFixture()
+        try Data([0x72, 0x65, 0x66, 0x3A, 0x20, 0xFF]).write(
+            to: invalidUTF8.gitDirectory.appendingPathComponent("HEAD")
+        )
+        #expect(await GitMetadataService().branchDisplaySnapshot(
+            forDirectory: invalidUTF8.root.path
+        ) == nil)
+    }
+
+    @Test("malformed git indirection and oversized commondir fail closed")
+    func malformedRepositoryIndirection() async throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmuxgit-indirection-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try "gitdir: /private/tmp/repository\ninjected".write(
+            to: base.appendingPathComponent(".git"),
+            atomically: true,
+            encoding: .utf8
+        )
+        #expect(await GitMetadataService().branchDisplaySnapshot(forDirectory: base.path) == nil)
+
+        let fixture = try GitRepositoryFixture()
+        try fixture.writeBranch("safe")
+        try Data(
+            repeating: 0x61,
+            count: GitMetadataReadPolicy.maximumFileBytes + 1
+        ).write(to: fixture.gitDirectory.appendingPathComponent("commondir"))
+        #expect(await GitMetadataService().branchDisplaySnapshot(forDirectory: fixture.root.path) == nil)
+    }
+
+    @Test("oversized and malformed packed refs cannot produce detached display")
+    func malformedPackedRefs() async throws {
+        let oversized = try GitRepositoryFixture()
+        try "ref: refs/tags/release\n".write(
+            to: oversized.gitDirectory.appendingPathComponent("HEAD"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try Data(
+            repeating: 0x61,
+            count: GitMetadataReadPolicy.maximumFileBytes + 1
+        ).write(to: oversized.gitDirectory.appendingPathComponent("packed-refs"))
+        #expect(await GitMetadataService().branchDisplaySnapshot(forDirectory: oversized.root.path) == nil)
+
+        let malformed = try GitRepositoryFixture()
+        try "ref: refs/tags/release\n".write(
+            to: malformed.gitDirectory.appendingPathComponent("HEAD"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "not-an-object refs/tags/release\n".write(
+            to: malformed.gitDirectory.appendingPathComponent("packed-refs"),
+            atomically: true,
+            encoding: .utf8
+        )
+        #expect(await GitMetadataService().branchDisplaySnapshot(forDirectory: malformed.root.path) == nil)
+
+        let valid = try GitRepositoryFixture()
+        try "ref: refs/tags/release\n".write(
+            to: valid.gitDirectory.appendingPathComponent("HEAD"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "\(String(repeating: "d", count: 40)) refs/tags/release\n".write(
+            to: valid.gitDirectory.appendingPathComponent("packed-refs"),
+            atomically: true,
+            encoding: .utf8
+        )
+        #expect(await GitMetadataService().branchDisplaySnapshot(
+            forDirectory: valid.root.path
+        )?.displayName == "detached@ddddddd")
+    }
+
+    @Test("detached heads reject malformed object IDs")
+    func malformedDetachedHeads() async throws {
+        for commit in [
+            String(repeating: "a", count: 39),
+            String(repeating: "a", count: 41),
+            String(repeating: "g", count: 40),
+            String(repeating: "a", count: 63),
+            String(repeating: "a", count: 65),
+        ] {
+            let fixture = try GitRepositoryFixture()
+            try fixture.writeDetachedHead(commit: commit)
+            #expect(await GitMetadataService().branchDisplaySnapshot(
+                forDirectory: fixture.root.path
+            ) == nil)
+        }
+    }
+
     @Test("normal branch resolves from a nested directory without normalization")
     func normalNestedBranch() async throws {
         let fixture = try GitRepositoryFixture()

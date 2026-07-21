@@ -181,6 +181,16 @@ public struct CodexFullRunExporter: Sendable {
                     if isInsideRequestedTurn, boundaryTurnID != turnID { return nil }
                     currentTurnID = boundaryTurnID
                     isInsideRequestedTurn = sawMatchingSession && boundaryTurnID == turnID
+                case "patch_apply_end":
+                    guard isInsideRequestedTurn, sawMatchingSession, let payload else { continue }
+                    let eventTurnID = Self.turnID(from: payload) ?? currentTurnID
+                    guard eventTurnID == turnID else { continue }
+                    guard let succeeded = payload["success"]?.bool else { return nil }
+                    guard succeeded else { continue }
+                    guard let result = Self.visiblePatchApplyResult(payload),
+                          renderer.append(heading: "TOOL RESULT", body: result) else {
+                        return nil
+                    }
                 case "task_complete", "turn_complete":
                     let completedTurnID = Self.turnID(from: payload) ?? currentTurnID
                     guard isInsideRequestedTurn, completedTurnID == turnID else { continue }
@@ -289,6 +299,37 @@ public struct CodexFullRunExporter: Sendable {
         case .number, .bool, .null:
             return nil
         }
+    }
+
+    /// Mirrors the transcript parser's successful modern patch semantics while
+    /// exporting only its visible textual result and stable tool name.
+    private static func visiblePatchApplyResult(_ payload: TranscriptJSONValue) -> String? {
+        guard payload["changes"]?.object != nil,
+              let stdout = payload["stdout"]?.string,
+              let stderr = payload["stderr"]?.string else {
+            return nil
+        }
+        var visibleText = ""
+        for rawText in [stdout, stderr]
+            where !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let text: String
+            if let nested = TranscriptJSONValue(jsonLine: rawText) {
+                guard let nestedText = visibleToolOutput(
+                    nested["output"] ?? nested["content"] ?? nested["text"]
+                ) else {
+                    return nil
+                }
+                text = nestedText
+            } else {
+                guard let plainText = visibleToolOutput(.string(rawText)) else { return nil }
+                text = plainText
+            }
+            if !visibleText.isEmpty, !visibleText.hasSuffix("\n") {
+                visibleText.append("\n")
+            }
+            visibleText.append(text)
+        }
+        return visibleText.isEmpty ? "apply_patch" : "apply_patch\n\(visibleText)"
     }
 
     private static func turnID(from payload: TranscriptJSONValue?) -> String? {

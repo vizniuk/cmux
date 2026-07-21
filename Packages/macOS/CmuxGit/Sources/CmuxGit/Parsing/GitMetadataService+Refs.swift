@@ -13,16 +13,14 @@ extension GitMetadataService {
     /// for a detached HEAD or unreadable `HEAD`.
     nonisolated static func gitBranchName(repository: ResolvedGitRepository) -> String? {
         let headURL = URL(fileURLWithPath: repository.gitDirectory).appendingPathComponent("HEAD")
-        guard let contents = try? String(contentsOf: headURL, encoding: .utf8) else {
-            return nil
-        }
-        let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let contents = GitMetadataReadPolicy.readString(at: headURL),
+              let line = GitMetadataReadPolicy.metadataLine(contents) else { return nil }
         let branchPrefix = "ref: refs/heads/"
-        guard trimmed.hasPrefix(branchPrefix) else {
+        guard line.hasPrefix(branchPrefix),
+              GitMetadataReadPolicy.symbolicRef(String(line.dropFirst("ref: ".count))) != nil else {
             return nil
         }
-        let branch = String(trimmed.dropFirst(branchPrefix.count))
-        return branch.isEmpty ? nil : branch
+        return GitMetadataReadPolicy.displayBranch(String(line.dropFirst(branchPrefix.count)))
     }
 
     /// Classifies the repository's `HEAD` into a ``GitCheckedOutBranch``,
@@ -30,50 +28,44 @@ extension GitMetadataService {
     /// symbolic ref) distinct from a missing/unreadable/malformed `HEAD`.
     nonisolated static func gitCheckedOutBranch(repository: ResolvedGitRepository) -> GitCheckedOutBranch {
         let headURL = URL(fileURLWithPath: repository.gitDirectory).appendingPathComponent("HEAD")
-        guard let contents = try? String(contentsOf: headURL, encoding: .utf8) else {
-            return .unreadable
-        }
-        let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let contents = GitMetadataReadPolicy.readString(at: headURL),
+              let line = GitMetadataReadPolicy.metadataLine(contents) else { return .unreadable }
         let branchPrefix = "ref: refs/heads/"
-        if trimmed.hasPrefix(branchPrefix) {
-            guard let branch = normalizedBranchName(String(trimmed.dropFirst(branchPrefix.count))) else {
+        if line.hasPrefix(branchPrefix) {
+            guard GitMetadataReadPolicy.symbolicRef(String(line.dropFirst("ref: ".count))) != nil,
+                  let branch = GitMetadataReadPolicy.displayBranch(
+                      String(line.dropFirst(branchPrefix.count))
+                  ) else {
                 return .unreadable
             }
             return .branch(branch)
         }
-        if trimmed.hasPrefix("ref: ") {
-            return .detached
+        if line.hasPrefix("ref: ") {
+            return GitMetadataReadPolicy.symbolicRef(String(line.dropFirst("ref: ".count))) == nil
+                ? .unreadable
+                : .detached
         }
-        if isLikelyCommitSHA(trimmed) {
+        if GitMetadataReadPolicy.objectID(line) != nil {
             return .detached
         }
         return .unreadable
-    }
-
-    /// Whether `value` looks like a full git object id (40-hex SHA-1 or
-    /// 64-hex SHA-256).
-    private nonisolated static func isLikelyCommitSHA(_ value: String) -> Bool {
-        guard value.count == 40 || value.count == 64 else { return false }
-        return value.allSatisfy(\.isHexDigit)
     }
 
     /// A signature of `HEAD` plus the commit it resolves to: the symbolic ref
     /// text and the resolved ref value joined, or the detached SHA directly.
     nonisolated static func gitHeadSignature(repository: ResolvedGitRepository) -> String? {
         let headURL = URL(fileURLWithPath: repository.gitDirectory).appendingPathComponent("HEAD")
-        guard let contents = try? String(contentsOf: headURL, encoding: .utf8) else {
-            return nil
-        }
-        let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let contents = GitMetadataReadPolicy.readString(at: headURL),
+              let line = GitMetadataReadPolicy.metadataLine(contents) else { return nil }
         let refPrefix = "ref: "
-        guard trimmed.hasPrefix(refPrefix) else {
-            return trimmed.isEmpty ? nil : trimmed
+        guard line.hasPrefix(refPrefix) else {
+            return GitMetadataReadPolicy.objectID(line)
         }
 
-        let refName = String(trimmed.dropFirst(refPrefix.count))
-        guard !refName.isEmpty else { return trimmed }
+        let refName = String(line.dropFirst(refPrefix.count))
+        guard GitMetadataReadPolicy.symbolicRef(refName) != nil else { return nil }
         let refValue = gitRefValue(repository: repository, refName: refName) ?? ""
-        return "\(trimmed)\n\(refValue)"
+        return "\(line)\n\(refValue)"
     }
 
     /// Resolves a ref name to its value, checking the loose ref under the git
@@ -81,6 +73,7 @@ extension GitMetadataService {
     /// input from `HEAD`; names whose standardized path escapes the directory
     /// they are joined to (e.g. `../../outside`) are ignored rather than read.
     nonisolated static func gitRefValue(repository: ResolvedGitRepository, refName: String) -> String? {
+        guard GitMetadataReadPolicy.symbolicRef(refName) != nil else { return nil }
         let lookups = [
             (base: repository.gitDirectory, refURL: URL(fileURLWithPath: repository.gitDirectory).appendingPathComponent(refName)),
             (base: repository.commonDirectory, refURL: URL(fileURLWithPath: repository.commonDirectory).appendingPathComponent(refName)),
@@ -90,55 +83,41 @@ extension GitMetadataService {
             let basePath = URL(fileURLWithPath: base).standardizedFileURL.path
             let path = refURL.standardizedFileURL.path
             guard path.hasPrefix(basePath + "/"),
-                  seenPaths.insert(path).inserted,
-                  let contents = try? String(contentsOf: refURL, encoding: .utf8) else {
+                  seenPaths.insert(path).inserted else {
                 continue
             }
-            let value = contents.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !value.isEmpty {
+            guard FileManager.default.fileExists(atPath: path) else { continue }
+            guard let contents = GitMetadataReadPolicy.readString(at: refURL),
+                  let line = GitMetadataReadPolicy.metadataLine(contents) else { return nil }
+            if let value = GitMetadataReadPolicy.objectID(line) {
                 return value
             }
+            return nil
         }
 
         let packedRefsURL = URL(fileURLWithPath: repository.commonDirectory).appendingPathComponent("packed-refs")
-        guard let packedRefs = try? String(contentsOf: packedRefsURL, encoding: .utf8) else {
-            return nil
-        }
-        for rawLine in packedRefs.components(separatedBy: .newlines) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !line.isEmpty, !line.hasPrefix("#"), !line.hasPrefix("^") else { continue }
-            let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
-            guard parts.count == 2, String(parts[1]) == refName else { continue }
-            return String(parts[0])
-        }
-        return nil
+        guard let packedRefs = GitMetadataReadPolicy.readString(at: packedRefsURL) else { return nil }
+        return GitMetadataReadPolicy.packedRefValue(in: packedRefs, matching: refName)
     }
 
     /// The current commit SHA the repository's `HEAD` resolves to (40- or
     /// 64-character lowercase hex), or `nil` if it cannot be resolved.
     nonisolated static func gitCurrentCommit(repository: ResolvedGitRepository) -> String? {
         let headURL = URL(fileURLWithPath: repository.gitDirectory).appendingPathComponent("HEAD")
-        guard let contents = try? String(contentsOf: headURL, encoding: .utf8) else {
-            return nil
-        }
-        let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let contents = GitMetadataReadPolicy.readString(at: headURL),
+              let line = GitMetadataReadPolicy.metadataLine(contents) else { return nil }
         let refPrefix = "ref: "
         let value: String
-        if trimmed.hasPrefix(refPrefix) {
-            let refName = String(trimmed.dropFirst(refPrefix.count))
-            guard !refName.isEmpty, let refValue = gitRefValue(repository: repository, refName: refName) else {
+        if line.hasPrefix(refPrefix) {
+            let refName = String(line.dropFirst(refPrefix.count))
+            guard GitMetadataReadPolicy.symbolicRef(refName) != nil,
+                  let refValue = gitRefValue(repository: repository, refName: refName) else {
                 return nil
             }
             value = refValue
         } else {
-            value = trimmed
+            value = line
         }
-
-        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard (normalized.count == 40 || normalized.count == 64),
-              normalized.allSatisfy({ $0.isHexDigit }) else {
-            return nil
-        }
-        return normalized
+        return GitMetadataReadPolicy.objectID(value)
     }
 }

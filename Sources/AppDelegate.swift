@@ -2465,6 +2465,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return true
     }
 
+    /// Presents one localized, body-free response after an explicit Full Run action fails.
+    @discardableResult
+    @MainActor
+    static func presentAgentReportFullRunUnavailableIfNeeded(
+        copied: Bool,
+        presenter: ((String) -> Void)? = nil
+    ) -> Bool {
+        guard !copied else { return true }
+        let message = String(
+            localized: "agentReport.fullRunUnavailable",
+            defaultValue: "Full Run is unavailable"
+        )
+        if let presenter {
+            presenter(message)
+            return false
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = message
+        alert.informativeText = ""
+        alert.addButton(withTitle: String(localized: "common.ok", defaultValue: "OK"))
+        _ = runCmuxModalAlert(alert)
+        return false
+    }
+
+    /// Shared explicit-action wrapper used by Full Run UI entrypoints.
+    @discardableResult
+    @MainActor
+    static func performAgentReportFullRunUserAction(
+        copy: @MainActor () async -> Bool,
+        presenter: ((String) -> Void)? = nil
+    ) async -> Bool {
+        let copied = await copy()
+        return presentAgentReportFullRunUnavailableIfNeeded(
+            copied: copied,
+            presenter: presenter
+        )
+    }
+
     /// Resolves one exact current terminal panel without focus fallbacks.
     private func agentReportTerminalPanel(
         workspaceID: UUID,

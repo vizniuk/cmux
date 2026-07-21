@@ -13,6 +13,7 @@ extension GitMetadataService {
         }
         switch Self.gitCheckedOutBranch(repository: repository) {
         case .branch(let branch):
+            guard let branch = GitMetadataReadPolicy.displayBranch(branch) else { return nil }
             return GitBranchDisplaySnapshot(displayName: branch)
         case .detached:
             guard let commit = Self.gitCurrentCommit(repository: repository) else { return nil }

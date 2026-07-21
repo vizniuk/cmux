@@ -91,6 +91,98 @@ struct CodexFullRunExporterTests {
         #expect(!body.contains("{\"type\""))
     }
 
+    @Test("renders modern patch completion in invocation-result-answer order")
+    func modernPatchApplyEnd() throws {
+        let lines = [
+            jsonLine(type: "session_meta", payload: ["id": "s"]),
+            jsonLine(type: "turn_context", payload: ["turn_id": "t"]),
+            jsonLine(type: "response_item", payload: [
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "call_id": "PRIVATE-CALL-ID",
+                "input": "*** Begin Patch\n*** End Patch",
+            ]),
+            patchCompletion(
+                turnID: "t",
+                stdout: "Applied Unicode ✅\n第二行",
+                callID: "PRIVATE-CALL-ID"
+            ),
+            message(role: "assistant", text: "Visible final", turnID: "t"),
+            completion(turnID: "t", final: "Visible final"),
+        ]
+
+        let body = try #require(exporter.export(lines: lines, sessionID: "s", turnID: "t"))
+
+        #expect(body == """
+        TOOL
+
+        apply_patch
+        *** Begin Patch
+        *** End Patch
+
+        TOOL RESULT
+
+        apply_patch
+        Applied Unicode ✅
+        第二行
+
+        ASSISTANT
+
+        Visible final
+        """)
+        #expect(!body.contains("PRIVATE-CALL-ID"))
+        #expect(!body.contains("call_id"))
+        #expect(!body.contains("\"changes\""))
+        #expect(!body.contains("\"success\""))
+    }
+
+    @Test("malformed modern patch results fail closed and failed results stay excluded")
+    func malformedAndFailedPatchApplyEnd() throws {
+        let prefix = [
+            jsonLine(type: "session_meta", payload: ["id": "s"]),
+            jsonLine(type: "turn_context", payload: ["turn_id": "t"]),
+        ]
+        let suffix = [
+            message(role: "assistant", text: "done", turnID: "t"),
+            completion(turnID: "t", final: "done"),
+        ]
+        let malformed = jsonLine(type: "event_msg", payload: [
+            "type": "patch_apply_end",
+            "turn_id": "t",
+            "success": true,
+            "stdout": ["raw": "structure"],
+            "stderr": "",
+            "changes": [:],
+        ])
+        #expect(exporter.export(lines: prefix + [malformed] + suffix, sessionID: "s", turnID: "t") == nil)
+
+        let rawJSON = jsonLine(type: "event_msg", payload: [
+            "type": "patch_apply_end",
+            "turn_id": "t",
+            "success": true,
+            "stdout": #"{"private":"raw structure"}"#,
+            "stderr": "",
+            "changes": [:],
+        ])
+        #expect(exporter.export(lines: prefix + [rawJSON] + suffix, sessionID: "s", turnID: "t") == nil)
+
+        let failed = jsonLine(type: "event_msg", payload: [
+            "type": "patch_apply_end",
+            "turn_id": "t",
+            "success": false,
+            "stdout": "",
+            "stderr": "private failure detail",
+            "changes": [:],
+        ])
+        let body = try #require(exporter.export(
+            lines: prefix + [failed] + suffix,
+            sessionID: "s",
+            turnID: "t"
+        ))
+        #expect(body == "ASSISTANT\n\ndone")
+        #expect(!body.contains("private failure detail"))
+    }
+
     @Test("malformed and incomplete requested turns fail closed")
     func malformedAndIncompleteAreRejected() {
         let prefix = [
@@ -180,23 +272,23 @@ struct CodexFullRunExporterTests {
         #expect(AgentReportResourceLimits.maximumFullRunExportBytes == 8 * 1024 * 1024)
     }
 
-    @Test("the production 8 MiB boundary accepts exact output and rejects one byte above")
+    @Test("the production 8 MiB boundary counts modern patch results without truncation")
     func productionRenderedByteBoundary() throws {
         let maximum = AgentReportResourceLimits.maximumFullRunExportBytes
-        let firstText = String(repeating: "x", count: 4 * 1024 * 1024)
-        let renderedSectionOverhead = "ASSISTANT\n\n\n\nASSISTANT\n\n".utf8.count
-        let secondText = String(
+        let patchText = String(repeating: "x", count: 4 * 1024 * 1024)
+        let renderedSectionOverhead = "TOOL RESULT\n\napply_patch\n\n\nASSISTANT\n\n".utf8.count
+        let assistantText = String(
             repeating: "y",
-            count: maximum - renderedSectionOverhead - firstText.utf8.count
+            count: maximum - renderedSectionOverhead - patchText.utf8.count
         )
         let prefix = [
             jsonLine(type: "session_meta", payload: ["id": "s"]),
             jsonLine(type: "turn_context", payload: ["turn_id": "t"]),
-            message(role: "assistant", text: firstText, turnID: "t"),
+            patchCompletion(turnID: "t", stdout: patchText),
         ]
         let exactLines = prefix + [
-            message(role: "assistant", text: secondText, turnID: "t"),
-            completion(turnID: "t", final: secondText),
+            message(role: "assistant", text: assistantText, turnID: "t"),
+            completion(turnID: "t", final: assistantText),
         ]
 
         let exact = try #require(exporter.export(
@@ -206,11 +298,11 @@ struct CodexFullRunExporterTests {
         ))
         #expect(exact.utf8.count == maximum)
 
-        let oversizedSecondText = secondText + "y"
+        let oversizedAssistantText = assistantText + "y"
         #expect(exporter.export(
             lines: prefix + [
-                message(role: "assistant", text: oversizedSecondText, turnID: "t"),
-                completion(turnID: "t", final: oversizedSecondText),
+                message(role: "assistant", text: oversizedAssistantText, turnID: "t"),
+                completion(turnID: "t", final: oversizedAssistantText),
             ],
             sessionID: "s",
             turnID: "t"
@@ -235,6 +327,23 @@ struct CodexFullRunExporterTests {
             "type": "task_complete",
             "turn_id": turnID,
             "last_agent_message": final,
+        ])
+    }
+
+    private func patchCompletion(
+        turnID: String,
+        stdout: String,
+        stderr: String = "",
+        callID: String = "patch-call"
+    ) -> String {
+        jsonLine(type: "event_msg", payload: [
+            "type": "patch_apply_end",
+            "turn_id": turnID,
+            "call_id": callID,
+            "success": true,
+            "stdout": stdout,
+            "stderr": stderr,
+            "changes": ["Sources/App.swift": ["type": "update"]],
         ])
     }
 

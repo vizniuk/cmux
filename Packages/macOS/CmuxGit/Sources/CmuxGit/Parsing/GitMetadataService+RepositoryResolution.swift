@@ -30,8 +30,8 @@ extension GitMetadataService {
                     gitDirectory = gitDirectoryFromDotGitFile(dotGitURL, relativeTo: currentURL)
                 }
 
-                if let gitDirectory {
-                    let commonDirectory = gitCommonDirectory(gitDirectory: gitDirectory)
+                if let gitDirectory,
+                   let commonDirectory = gitCommonDirectory(gitDirectory: gitDirectory) {
                     return ResolvedGitRepository(
                         workTreeRoot: currentURL.standardizedFileURL.path,
                         gitDirectory: gitDirectory,
@@ -71,16 +71,16 @@ extension GitMetadataService {
         _ dotGitURL: URL,
         relativeTo workTreeRootURL: URL
     ) -> String? {
-        guard let contents = try? String(contentsOf: dotGitURL, encoding: .utf8) else {
+        guard let contents = GitMetadataReadPolicy.readString(at: dotGitURL),
+              let line = GitMetadataReadPolicy.metadataLine(contents) else {
             return nil
         }
-        let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
         let prefix = "gitdir:"
-        guard trimmed.lowercased().hasPrefix(prefix) else {
+        guard line.lowercased().hasPrefix(prefix) else {
             return nil
         }
 
-        let rawPath = trimmed.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawPath = line.dropFirst(prefix.count).drop(while: { $0 == " " })
         guard !rawPath.isEmpty else { return nil }
         if rawPath.hasPrefix("/") {
             return URL(fileURLWithPath: String(rawPath)).standardizedFileURL.path
@@ -92,16 +92,17 @@ extension GitMetadataService {
     }
 
     /// Resolves the shared common directory for `gitDirectory` by reading its
-    /// `commondir` file, falling back to `gitDirectory` itself.
-    nonisolated static func gitCommonDirectory(gitDirectory: String) -> String {
+    /// `commondir` file, falling back to `gitDirectory` only when the file is absent.
+    nonisolated static func gitCommonDirectory(gitDirectory: String) -> String? {
         let gitDirectoryURL = URL(fileURLWithPath: gitDirectory)
         let commonDirURL = gitDirectoryURL.appendingPathComponent("commondir")
-        guard let contents = try? String(contentsOf: commonDirURL, encoding: .utf8) else {
+        guard FileManager.default.fileExists(atPath: commonDirURL.path) else {
             return gitDirectory
         }
-
-        let rawPath = contents.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rawPath.isEmpty else { return gitDirectory }
+        guard let contents = GitMetadataReadPolicy.readString(at: commonDirURL),
+              let rawPath = GitMetadataReadPolicy.metadataLine(contents) else {
+            return nil
+        }
         if rawPath.hasPrefix("/") {
             return URL(fileURLWithPath: rawPath).standardizedFileURL.path
         }
