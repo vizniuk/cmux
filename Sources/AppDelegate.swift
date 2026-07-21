@@ -2159,6 +2159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func applyAgentReportCapturePolicy(_ enabled: Bool) {
         agentReportCaptureEnabled = enabled
         if !enabled {
+            agentChatTranscriptService.invalidateAllAgentReportResolvedAuthorities()
             let revisionBarrier = agentReportCaptureStore?
                 .advanceAvailabilityRevisionBarrier()
                 ?? agentReportAvailabilityRevisionAuthority.advance()

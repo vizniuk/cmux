@@ -226,7 +226,9 @@ public actor AgentReportCaptureStore {
     public func capture(
         _ request: AgentReportCaptureRequest,
         target: AgentReportCaptureTarget?,
-        revalidateTarget: @escaping @Sendable () async -> AgentReportCaptureTarget?
+        revalidateTarget: @escaping @Sendable (
+            AgentReportTranscriptBinding
+        ) async -> AgentReportCaptureTarget?
     ) async -> AgentReportCaptureResult {
         guard policy.isEnabled else { return .disabled }
         guard request.provider == .codex, request.completionKind == .primaryStop else {
@@ -254,36 +256,39 @@ public actor AgentReportCaptureStore {
         let lifecycleGeneration = lifecycleGenerationByRuntimeSurfaceID[request.runtimeSurfaceID, default: 0]
         let exactReply: String
         let source: AgentReportCaptureSource
+        let transcriptBinding: AgentReportTranscriptBinding
         if let raw = Self.usableExactReply(request.rawFinalReply) {
             // Raw Stop text is already exact, but session metadata is still
             // required to prove this is the primary rollout rather than a
             // sidechain or managed subagent completion.
-            guard await transcriptRecovery.isPrimaryCodexSession(
-                recordedPath: target.transcriptPath,
+            guard let authority = await transcriptRecovery.validatePrimaryCodexSession(
+                recordedPath: target.recordedTranscriptPathHint,
                 sessionID: request.agentSessionID
             ) else {
                 return .rejected(.nonPrimarySession)
             }
             exactReply = raw
             source = .rawHook
+            transcriptBinding = authority.transcriptBinding
         } else {
             // Recovery is the only fallback in Slice A. It remains tied to the
             // exact session and turn; terminal/scrollback guessing is forbidden.
             guard let recovered = await transcriptRecovery.recoverCodexFinalReply(
-                recordedPath: target.transcriptPath,
+                recordedPath: target.recordedTranscriptPathHint,
                 sessionID: request.agentSessionID,
                 turnID: request.turnID
             ) else {
                 return .rejected(.exactReplyUnavailable)
             }
-            guard AgentReportResourceLimits.sliceA.permitsReportBody(recovered) else {
+            guard AgentReportResourceLimits.sliceA.permitsReportBody(recovered.body) else {
                 return .rejected(.exactReplyUnavailable)
             }
-            guard let usable = Self.usableExactReply(recovered) else {
+            guard let usable = Self.usableExactReply(recovered.body) else {
                 return .rejected(.exactReplyUnavailable)
             }
             exactReply = usable
             source = .structuredTranscript
+            transcriptBinding = recovered.transcriptBinding
         }
 
         // Recovery suspends actor execution. Recheck both policy and lifecycle
@@ -294,7 +299,7 @@ public actor AgentReportCaptureStore {
                 == lifecycleGenerationByRuntimeSurfaceID[request.runtimeSurfaceID, default: 0] else {
             return .rejected(.inaccessibleSurface)
         }
-        guard let currentTarget = await revalidateTarget() else {
+        guard let currentTarget = await revalidateTarget(transcriptBinding) else {
             return .rejected(.inaccessibleSurface)
         }
         guard policy.isEnabled, generation == policyGeneration else { return .disabled }
@@ -308,7 +313,8 @@ public actor AgentReportCaptureStore {
         guard currentTarget.lifecycleToken == target.lifecycleToken else {
             return .rejected(.inaccessibleSurface)
         }
-        guard currentTarget.transcriptBinding == target.transcriptBinding else {
+        guard currentTarget.recordedTranscriptPathHint == target.recordedTranscriptPathHint,
+              currentTarget.authorityRevision == target.authorityRevision else {
             return .rejected(.inaccessibleSurface)
         }
         if let existing = latestByRuntimeSurfaceID[request.runtimeSurfaceID] {
@@ -336,7 +342,8 @@ public actor AgentReportCaptureStore {
             turnID: request.turnID,
             completionKind: request.completionKind,
             lifecycleToken: currentTarget.lifecycleToken,
-            transcriptBinding: currentTarget.transcriptBinding,
+            transcriptBinding: transcriptBinding,
+            authorityRevision: currentTarget.authorityRevision,
             finalReply: exactReply,
             captureSource: source,
             capturedAt: now(),
@@ -363,7 +370,7 @@ public actor AgentReportCaptureStore {
         _ request: AgentReportCaptureRequest,
         target: AgentReportCaptureTarget?
     ) async -> AgentReportCaptureResult {
-        await capture(request, target: target, revalidateTarget: { target })
+        await capture(request, target: target, revalidateTarget: { _ in target })
     }
 
     /// Compares every identity component required for cross-surface isolation.

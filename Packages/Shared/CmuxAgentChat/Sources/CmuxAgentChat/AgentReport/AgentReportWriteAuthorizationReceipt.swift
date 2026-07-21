@@ -35,7 +35,10 @@ public struct AgentReportWriteAuthorizationReceipt: Sendable,
     public let completionKind: AgentReportCompletionKind
 
     /// Immutable opaque capture-time transcript identity.
-    public let transcriptBinding: AgentReportTranscriptBinding?
+    public let transcriptBinding: AgentReportTranscriptBinding
+
+    /// Exact active hook-entry revision proven during authorization.
+    public let authorityRevision: UUID
 
     /// Report-actor policy generation observed during authorization.
     public let captureStorePolicyGeneration: UInt64
@@ -71,6 +74,7 @@ public struct AgentReportWriteAuthorizationReceipt: Sendable,
         turnID = context.turnID
         completionKind = context.completionKind
         transcriptBinding = context.transcriptBinding
+        authorityRevision = context.authorityRevision
         captureStorePolicyGeneration = context.captureStorePolicyGeneration
         capturePolicyRevision = context.capturePolicyRevision
         availabilityRevision = context.availabilityRevision
@@ -87,6 +91,7 @@ public struct AgentReportWriteAuthorizationReceipt: Sendable,
             && turnID == context.turnID
             && completionKind == context.completionKind
             && transcriptBinding == context.transcriptBinding
+            && authorityRevision == context.authorityRevision
             && captureStorePolicyGeneration == context.captureStorePolicyGeneration
             && capturePolicyRevision == context.capturePolicyRevision
             && availabilityRevision == context.availabilityRevision

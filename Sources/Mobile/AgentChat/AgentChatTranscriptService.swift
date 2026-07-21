@@ -324,7 +324,13 @@ final class AgentChatTranscriptService {
     ///
     /// - Parameter runtimeSurfaceID: Surface lifecycle being replaced.
     func rotateAgentReportSurfaceLifecycle(runtimeSurfaceID: UUID) {
+        registry.invalidateAgentReportResolvedAuthority(runtimeSurfaceID: runtimeSurfaceID)
         agentReportLifecycleTokenBySurfaceID[runtimeSurfaceID] = UUID()
+    }
+
+    /// Clears all process-local transcript authority, including revision history.
+    func invalidateAllAgentReportResolvedAuthorities() {
+        registry.invalidateAllAgentReportResolvedAuthorities()
     }
 
     /// Synchronously revokes commit authority before scheduling actor cleanup.
@@ -507,6 +513,11 @@ final class AgentChatTranscriptService {
             invalidateAgentReport(previous?.surfaceID)
             invalidateAgentReport(record.surfaceID)
         }
+        if let previous,
+           previous.surfaceID == record.surfaceID,
+           previous.transcriptPath != record.transcriptPath {
+            invalidateAgentReport(record.surfaceID)
+        }
         let endedRecordIsListable: Bool
         if record.state == .ended {
             endedRecordIsListable = record.agentKind == .codex
@@ -516,6 +527,9 @@ final class AgentChatTranscriptService {
             endedRecordIsListable = true
         }
         let stateChanged = previous?.state != record.state
+        if stateChanged, record.state == .ended {
+            invalidateAgentReport(record.surfaceID)
+        }
         let transcriptBecameAvailable = previous?.transcriptPath == nil && record.transcriptPath != nil
         if stateChanged, record.state == .ended {
             // The transcript can no longer grow; stop any live preview loop so

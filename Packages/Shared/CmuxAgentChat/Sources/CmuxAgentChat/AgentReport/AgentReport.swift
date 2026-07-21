@@ -36,7 +36,10 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
     public let lifecycleToken: UUID
 
     /// Immutable opaque identity of the validated capture transcript.
-    public let transcriptBinding: AgentReportTranscriptBinding?
+    public let transcriptBinding: AgentReportTranscriptBinding
+
+    /// Capture-time active hook-entry mutation identity.
+    public let authorityRevision: UUID
 
     /// Exact final reply text. This value is never suitable for diagnostics.
     public let finalReply: String
@@ -78,6 +81,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
     ///   - completionKind: Accepted provider lifecycle boundary.
     ///   - lifecycleToken: Capture-time live lifecycle authority.
     ///   - transcriptBinding: Opaque validated transcript identity.
+    ///   - authorityRevision: Active hook-entry revision proven at capture.
     ///   - finalReply: Unmodified private final reply text.
     ///   - captureSource: Authoritative source of `finalReply`.
     ///   - capturedAt: Time the actor committed the record.
@@ -94,7 +98,8 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
         turnID: String,
         completionKind: AgentReportCompletionKind,
         lifecycleToken: UUID,
-        transcriptBinding: AgentReportTranscriptBinding?,
+        transcriptBinding: AgentReportTranscriptBinding,
+        authorityRevision: UUID,
         finalReply: String,
         captureSource: AgentReportCaptureSource,
         capturedAt: Date,
@@ -112,6 +117,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
         self.completionKind = completionKind
         self.lifecycleToken = lifecycleToken
         self.transcriptBinding = transcriptBinding
+        self.authorityRevision = authorityRevision
         self.finalReply = finalReply
         self.captureSource = captureSource
         self.capturedAt = capturedAt

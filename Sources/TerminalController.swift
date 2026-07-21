@@ -5639,7 +5639,7 @@ class TerminalController {
                 let result = await store.capture(
                     request,
                     target: nil,
-                    revalidateTarget: { nil }
+                    revalidateTarget: { _ in nil }
                 )
 #if DEBUG
                 await self?.observeAgentReportCaptureResultForTesting(result)
@@ -5649,9 +5649,12 @@ class TerminalController {
             let result = await store.capture(
                 request,
                 target: target,
-                revalidateTarget: { [weak self] in
+                revalidateTarget: { [weak self] transcriptBinding in
                     guard let self else { return nil }
-                    return await self.agentReportCaptureTarget(for: request)
+                    return await self.agentReportCaptureTarget(
+                        for: request,
+                        resolvedTranscriptBinding: transcriptBinding
+                    )
                 }
             )
 #if DEBUG
@@ -5674,7 +5677,8 @@ class TerminalController {
     /// - Returns: Fresh authoritative target, or `nil` on any mismatch.
     @MainActor
     private func agentReportCaptureTarget(
-        for request: AgentReportCaptureRequest
+        for request: AgentReportCaptureRequest,
+        resolvedTranscriptBinding: AgentReportTranscriptBinding? = nil
     ) async -> AgentReportCaptureTarget? {
         guard request.provider == .codex,
               let targetManager = AppDelegate.shared?.tabManagerFor(tabId: request.workspaceID)
@@ -5688,12 +5692,14 @@ class TerminalController {
             return nil
         }
         let lifecycleToken = service.agentReportLifecycleToken(for: request.runtimeSurfaceID)
-        guard let binding = await service.registry.agentReportCaptureBinding(
+        guard let route = await service.registry.agentReportCaptureRoute(
                   workspaceID: request.workspaceID.uuidString,
                   surfaceID: request.runtimeSurfaceID.uuidString,
                   sessionID: request.agentSessionID,
                   turnID: request.turnID,
-                  requestedTranscriptPath: request.transcriptPath
+                  requestedTranscriptPath: request.transcriptPath,
+                  lifecycleToken: lifecycleToken,
+                  resolvedTranscriptBinding: resolvedTranscriptBinding
               ),
               service.agentReportLifecycleToken(for: request.runtimeSurfaceID) == lifecycleToken,
               let currentManager = AppDelegate.shared?.tabManagerFor(tabId: request.workspaceID)
@@ -5713,7 +5719,8 @@ class TerminalController {
             agentSessionID: request.agentSessionID,
             turnID: request.turnID,
             lifecycleToken: lifecycleToken,
-            transcriptPath: binding.transcriptPath
+            recordedTranscriptPathHint: route.recordedTranscriptPathHint,
+            authorityRevision: route.authorityRevision
         )
     }
 
@@ -5751,14 +5758,17 @@ class TerminalController {
               service.agentReportLifecycleToken(for: representedSurfaceID) == context.lifecycleToken else {
             return nil
         }
-        guard let binding = await service.registry.agentReportCopyBinding(
+        guard let authority = await service.registry.agentReportCopyAuthority(
             captureWorkspaceID: context.workspaceID.uuidString,
             surfaceID: context.runtimeSurfaceID.uuidString,
             sessionID: context.agentSessionID,
             turnID: context.turnID,
+            lifecycleToken: context.lifecycleToken,
+            authorityRevision: context.authorityRevision,
             transcriptBinding: context.transcriptBinding
         ),
-              binding.transcriptBinding == context.transcriptBinding,
+              authority.transcriptBinding == context.transcriptBinding,
+              authority.authorityRevision == context.authorityRevision,
               service.agentReportLifecycleToken(for: representedSurfaceID) == context.lifecycleToken,
               let currentManager = AppDelegate.shared?.tabManagerFor(tabId: representedWorkspaceID)
                 ?? (targetManager.tabs.contains(where: { $0.id == representedWorkspaceID })

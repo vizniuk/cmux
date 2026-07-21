@@ -1,6 +1,6 @@
 import AppKit
 import CMUXAgentLaunch
-import CmuxAgentChat
+@_spi(AgentReportTranscript) import CmuxAgentChat
 @testable import CmuxControlSocket
 import CmuxCore
 import Darwin
@@ -779,7 +779,7 @@ final class TerminalControllerSocketSecurityTests {
         let exact = "  ## 完了 ✅\n\nUnicode: Привіт\nno-extra-newline"
         let request = agentReportRequest(workspace: workspace, panel: panel, raw: exact)
         let target = agentReportTarget(workspace: workspace, panel: panel)
-        #expect(await store.capture(request, target: target, revalidateTarget: { target }) == .captured)
+        #expect(await store.capture(request, target: target, revalidateTarget: { _ in target }) == .captured)
         let pasteboard = NSPasteboard(name: .init("cmux-agent-report-copy-\(UUID().uuidString)"))
         pasteboard.clearContents()
         pasteboard.setString("stale clipboard", forType: .string)
@@ -1168,7 +1168,7 @@ final class TerminalControllerSocketSecurityTests {
         let request = agentReportRequest(workspace: workspace, panel: panel, raw: "completed")
         let target = agentReportTarget(workspace: workspace, panel: panel)
         #expect(
-            await store.capture(request, target: target, revalidateTarget: { target })
+            await store.capture(request, target: target, revalidateTarget: { _ in target })
                 == .captured
         )
 
@@ -1215,7 +1215,7 @@ final class TerminalControllerSocketSecurityTests {
         let request = agentReportRequest(workspace: workspace, panel: panel, raw: nil)
         let target = agentReportTarget(workspace: workspace, panel: panel)
         let capture = Task {
-            await store.capture(request, target: target, revalidateTarget: { target })
+            await store.capture(request, target: target, revalidateTarget: { _ in target })
         }
         await recovery.waitUntilRecoveryStarted()
 
@@ -1313,17 +1313,14 @@ final class TerminalControllerSocketSecurityTests {
         var snapshotIterator = snapshots.makeAsyncIterator()
         _ = try #require(await snapshotIterator.next())
         let request = agentReportRequest(workspace: source, panel: panel, raw: exact)
-        let target = AgentReportCaptureTarget(
-            workspaceID: source.id,
-            runtimeSurfaceID: panel.id,
-            stableSurfaceID: panel.stableSurfaceId,
-            agentSessionID: request.agentSessionID,
-            turnID: request.turnID,
-            lifecycleToken: service.agentReportLifecycleToken(for: panel.id),
-            transcriptPath: request.transcriptPath
-        )
         #expect(
-            await store.capture(request, target: target, revalidateTarget: { target })
+            await captureAgentReportWithCurrentResolverAuthority(
+                request,
+                workspace: source,
+                panel: panel,
+                service: service,
+                store: store
+            )
                 == .captured
         )
         let capturedReport = try #require(await store.latestReport(runtimeSurfaceID: panel.id))
@@ -1681,16 +1678,13 @@ final class TerminalControllerSocketSecurityTests {
         var snapshotIterator = snapshots.makeAsyncIterator()
         _ = try #require(await snapshotIterator.next())
         let request = agentReportRequest(workspace: source, panel: panel, raw: "retained before revoke")
-        let target = AgentReportCaptureTarget(
-            workspaceID: source.id,
-            runtimeSurfaceID: panel.id,
-            stableSurfaceID: panel.stableSurfaceId,
-            agentSessionID: request.agentSessionID,
-            turnID: request.turnID,
-            lifecycleToken: service.agentReportLifecycleToken(for: panel.id),
-            transcriptPath: request.transcriptPath
-        )
-        #expect(await store.capture(request, target: target, revalidateTarget: { target }) == .captured)
+        #expect(await captureAgentReportWithCurrentResolverAuthority(
+            request,
+            workspace: source,
+            panel: panel,
+            service: service,
+            store: store
+        ) == .captured)
         let capturedSnapshot = try #require(await snapshotIterator.next())
         app.acceptAgentReportAvailability(capturedSnapshot)
         let detached = try #require(source.detachSurface(panelId: panel.id))
@@ -1929,19 +1923,12 @@ final class TerminalControllerSocketSecurityTests {
         _ = try #require(await snapshotIterator.next())
         let oldRequest = agentReportRequest(workspace: workspace, panel: originalPanel, raw: exactOldBody)
         let oldLifecycleToken = service.agentReportLifecycleToken(for: runtimeSurfaceID)
-        let oldTarget = AgentReportCaptureTarget(
-            workspaceID: workspaceID,
-            runtimeSurfaceID: runtimeSurfaceID,
-            stableSurfaceID: stableSurfaceID,
-            agentSessionID: oldRequest.agentSessionID,
-            turnID: oldRequest.turnID,
-            lifecycleToken: oldLifecycleToken,
-            transcriptPath: oldRequest.transcriptPath
-        )
-        #expect(await store.capture(
+        #expect(await captureAgentReportWithCurrentResolverAuthority(
             oldRequest,
-            target: oldTarget,
-            revalidateTarget: { oldTarget }
+            workspace: workspace,
+            panel: originalPanel,
+            service: service,
+            store: store
         ) == .captured)
         let oldAvailabilitySnapshot = try #require(await snapshotIterator.next())
         app.acceptAgentReportAvailability(oldAvailabilitySnapshot)
@@ -1985,13 +1972,14 @@ final class TerminalControllerSocketSecurityTests {
             agentSessionID: pendingRequest.agentSessionID,
             turnID: pendingRequest.turnID,
             lifecycleToken: oldLifecycleToken,
-            transcriptPath: pendingRequest.transcriptPath
+            recordedTranscriptPathHint: pendingRequest.transcriptPath,
+            authorityRevision: UUID()
         )
         let pendingCapture = Task {
             await store.capture(
                 pendingRequest,
                 target: pendingTarget,
-                revalidateTarget: { pendingTarget }
+                revalidateTarget: { _ in pendingTarget }
             )
         }
         await recovery.waitUntilRecoveryStarted()
@@ -2116,19 +2104,12 @@ final class TerminalControllerSocketSecurityTests {
         #expect(await store.latestReport(runtimeSurfaceID: runtimeSurfaceID) == nil)
 
         let freshRequest = agentReportRequest(workspace: workspace, panel: replacementPanel, raw: exactFreshBody)
-        let freshTarget = AgentReportCaptureTarget(
-            workspaceID: workspaceID,
-            runtimeSurfaceID: runtimeSurfaceID,
-            stableSurfaceID: replacementPanel.stableSurfaceId,
-            agentSessionID: freshRequest.agentSessionID,
-            turnID: freshRequest.turnID,
-            lifecycleToken: service.agentReportLifecycleToken(for: runtimeSurfaceID),
-            transcriptPath: freshRequest.transcriptPath
-        )
-        #expect(await store.capture(
+        #expect(await captureAgentReportWithCurrentResolverAuthority(
             freshRequest,
-            target: freshTarget,
-            revalidateTarget: { freshTarget }
+            workspace: workspace,
+            panel: replacementPanel,
+            service: service,
+            store: store
         ) == .captured)
         let freshSnapshots = await store.availabilitySnapshots()
         var freshSnapshotIterator = freshSnapshots.makeAsyncIterator()
@@ -2199,7 +2180,7 @@ final class TerminalControllerSocketSecurityTests {
         let request = agentReportRequest(workspace: workspace, panel: panel, raw: "completed")
         let target = agentReportTarget(workspace: workspace, panel: panel)
         #expect(
-            await store.capture(request, target: target, revalidateTarget: { target })
+            await store.capture(request, target: target, revalidateTarget: { _ in target })
                 == .captured
         )
         workspace.teardownAllPanels()
@@ -2290,14 +2271,15 @@ final class TerminalControllerSocketSecurityTests {
         #expect(controller.tabManager === tabManager)
         #expect(workspace.panels[panel.id] === panel)
         #expect(workspace.surfaceIdFromPanelId(panel.id) != nil)
-        let directBinding = await registry.agentReportCaptureBinding(
+        let directRoute = await registry.agentReportCaptureRoute(
             workspaceID: workspace.id.uuidString,
             surfaceID: panel.id.uuidString,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: transcriptURL.path
+            requestedTranscriptPath: transcriptURL.path,
+            lifecycleToken: service.agentReportLifecycleToken(for: panel.id)
         )
-        #expect(directBinding?.transcriptPath == transcriptURL.path)
+        #expect(directRoute?.recordedTranscriptPathHint == transcriptURL.path)
 
         let params: [String: Any] = [
             "provider": "codex",
@@ -2341,6 +2323,311 @@ final class TerminalControllerSocketSecurityTests {
         let report = try #require(await store.latestReport(runtimeSurfaceID: panel.id))
         #expect(report.finalReply == exact)
         #expect(report.captureSource == .rawHook)
+    }
+
+    @Test(
+        "production fallback captures and copies with missing or stale hook hints",
+        arguments: ["missing", "stale"]
+    )
+    func productionFallbackCaptureAndCopy(hintCase: String) async throws {
+        let previousAppDelegate = AppDelegate.shared
+        let controller = TerminalController.shared
+        let previousTabManager = controller.tabManager
+        let previousService = controller.agentChatTranscriptService
+        let previousStore = controller.agentReportCaptureStore
+        let socketPath = makeSocketPath("report-fallback-\(hintCase)")
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "cmux-report-fallback-\(hintCase)-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let manager = TabManager()
+        let workspace = try #require(manager.selectedWorkspace)
+        let panel = try #require(workspace.focusedTerminalPanel)
+        let sessionID = "fallback-\(hintCase)-session"
+        let turnID = "fallback-\(hintCase)-turn"
+        let body = "  fallback \(hintCase) body ✅\nexact-end"
+        let transcript = home
+            .appendingPathComponent(".codex/sessions/2026/07/21", isDirectory: true)
+            .appendingPathComponent("rollout-\(sessionID).jsonl")
+        try FileManager.default.createDirectory(
+            at: transcript.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try agentReportCodexTranscriptText(
+            sessionID: sessionID,
+            turnID: turnID,
+            body: body
+        ).write(to: transcript, atomically: false, encoding: .utf8)
+        let recordedHint = hintCase == "missing"
+            ? nil
+            : transcript.deletingLastPathComponent().appendingPathComponent("stale.jsonl").path
+        try writeAgentReportHookStore(
+            home: home,
+            workspaceID: workspace.id,
+            surfaceID: panel.id,
+            sessionID: sessionID,
+            turnID: turnID,
+            transcriptPath: recordedHint,
+            updatedAt: 100
+        )
+        let resolver = AgentChatTranscriptResolver(homeDirectory: home, environment: [:])
+        let expectedAuthority = try #require(await resolver.recoverCodexFinalReply(
+            recordedPath: recordedHint,
+            sessionID: sessionID,
+            turnID: turnID
+        ))
+        let registry = AgentChatSessionRegistry(
+            hookStore: AgentChatHookSessionStore(homeDirectory: home)
+        )
+        let service = AgentChatTranscriptService(registry: registry, resolver: resolver)
+        let store = AgentReportCaptureStore(policy: .enabled, transcriptRecovery: resolver)
+        let app = AppDelegate()
+        app.tabManager = manager
+        app.applyAgentReportCapturePolicy(true)
+        AppDelegate.shared = app
+        controller.agentChatTranscriptService = service
+        controller.agentReportCaptureStore = store
+        controller.start(tabManager: manager, socketPath: socketPath, accessMode: .allowAll)
+        defer {
+            controller.agentReportCaptureResultObserverForTesting = nil
+            controller.tabManager = previousTabManager
+            controller.agentChatTranscriptService = previousService
+            controller.agentReportCaptureStore = previousStore
+            AppDelegate.shared = previousAppDelegate
+            for remainingWorkspace in manager.tabs {
+                remainingWorkspace.teardownAllPanels()
+            }
+            try? FileManager.default.removeItem(at: home)
+        }
+        try waitForSocket(at: socketPath)
+        let results = AsyncStream<AgentReportCaptureResult> { continuation in
+            controller.agentReportCaptureResultObserverForTesting = { continuation.yield($0) }
+        }
+        var resultIterator = results.makeAsyncIterator()
+        var params: [String: Any] = [
+            "provider": "codex",
+            "workspace_id": workspace.id.uuidString,
+            "surface_id": panel.id.uuidString,
+            "session_id": sessionID,
+            "turn_id": turnID,
+            "completion_kind": "primaryStop",
+            "completion_timestamp": 100.0,
+        ]
+        if let recordedHint {
+            params["transcript_path"] = recordedHint
+        }
+        if hintCase == "missing" {
+            params["raw_final_reply"] = body
+        }
+
+        let envelope = try await sendV2RequestAsync(
+            method: "agent.report.capture",
+            params: params,
+            to: socketPath
+        )
+        #expect(envelope["ok"] as? Bool == true)
+        #expect(await resultIterator.next() == .captured)
+        let report = try #require(await store.latestReport(runtimeSurfaceID: panel.id))
+        #expect(report.transcriptBinding == expectedAuthority.transcriptBinding)
+        #expect(report.finalReply == body)
+        #expect(report.captureSource == (hintCase == "missing" ? .rawHook : .structuredTranscript))
+
+        let pasteboard = NSPasteboard(
+            name: .init("cmux-fallback-copy-\(hintCase)-\(UUID().uuidString)")
+        )
+        #expect(await AppDelegate.copyLatestAgentReport(
+            store: store,
+            runtimeSurfaceID: panel.id,
+            to: pasteboard,
+            authorize: { context in
+                await controller.authorizesAgentReportCopy(
+                    context,
+                    representedWorkspaceID: workspace.id,
+                    representedSurfaceID: panel.id
+                )
+            }
+        ))
+        #expect(pasteboard.string(forType: .string) == body)
+    }
+
+    @Test func fallbackBindingReplacementDeniesOldReportAndFreshCaptureCopiesF2() async throws {
+        let previousAppDelegate = AppDelegate.shared
+        let controller = TerminalController.shared
+        let previousTabManager = controller.tabManager
+        let previousService = controller.agentChatTranscriptService
+        let previousStore = controller.agentReportCaptureStore
+        let socketPath = makeSocketPath("report-fallback-replacement")
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "cmux-report-fallback-replacement-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let manager = TabManager()
+        let workspace = try #require(manager.selectedWorkspace)
+        let panel = try #require(workspace.focusedTerminalPanel)
+        let sessionID = "fallback-replacement-session"
+        let firstTurnID = "fallback-replacement-turn-f1"
+        let secondTurnID = "fallback-replacement-turn-f2"
+        let firstBody = "fallback F1 body"
+        let secondBody = "fallback F2 body ✅"
+        let transcript = home
+            .appendingPathComponent(".codex/sessions/2026/07/21", isDirectory: true)
+            .appendingPathComponent("rollout-\(sessionID).jsonl")
+        try FileManager.default.createDirectory(
+            at: transcript.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try agentReportCodexTranscriptText(
+            sessionID: sessionID,
+            turnID: firstTurnID,
+            body: firstBody
+        ).write(to: transcript, atomically: false, encoding: .utf8)
+        try writeAgentReportHookStore(
+            home: home,
+            workspaceID: workspace.id,
+            surfaceID: panel.id,
+            sessionID: sessionID,
+            turnID: firstTurnID,
+            transcriptPath: nil,
+            updatedAt: 100
+        )
+        let resolver = AgentChatTranscriptResolver(homeDirectory: home, environment: [:])
+        let registry = AgentChatSessionRegistry(
+            hookStore: AgentChatHookSessionStore(homeDirectory: home)
+        )
+        let service = AgentChatTranscriptService(registry: registry, resolver: resolver)
+        let store = AgentReportCaptureStore(policy: .enabled, transcriptRecovery: resolver)
+        let app = AppDelegate()
+        app.tabManager = manager
+        app.applyAgentReportCapturePolicy(true)
+        AppDelegate.shared = app
+        controller.agentChatTranscriptService = service
+        controller.agentReportCaptureStore = store
+        controller.start(tabManager: manager, socketPath: socketPath, accessMode: .allowAll)
+        defer {
+            controller.agentReportCaptureResultObserverForTesting = nil
+            controller.tabManager = previousTabManager
+            controller.agentChatTranscriptService = previousService
+            controller.agentReportCaptureStore = previousStore
+            AppDelegate.shared = previousAppDelegate
+            for remainingWorkspace in manager.tabs {
+                remainingWorkspace.teardownAllPanels()
+            }
+            try? FileManager.default.removeItem(at: home)
+        }
+        try waitForSocket(at: socketPath)
+        let results = AsyncStream<AgentReportCaptureResult> { continuation in
+            controller.agentReportCaptureResultObserverForTesting = { continuation.yield($0) }
+        }
+        var resultIterator = results.makeAsyncIterator()
+        let firstEnvelope = try await sendV2RequestAsync(
+            method: "agent.report.capture",
+            params: [
+                "provider": "codex",
+                "workspace_id": workspace.id.uuidString,
+                "surface_id": panel.id.uuidString,
+                "session_id": sessionID,
+                "turn_id": firstTurnID,
+                "completion_kind": "primaryStop",
+                "completion_timestamp": 100.0,
+                "raw_final_reply": firstBody,
+            ],
+            to: socketPath
+        )
+        #expect(firstEnvelope["ok"] as? Bool == true)
+        #expect(await resultIterator.next() == .captured)
+        let firstReport = try #require(await store.latestReport(runtimeSurfaceID: panel.id))
+
+        try FileManager.default.removeItem(at: transcript)
+        try agentReportCodexTranscriptText(
+            sessionID: sessionID,
+            turnID: firstTurnID,
+            body: "replacement authority body"
+        ).write(to: transcript, atomically: false, encoding: .utf8)
+        let fallbackF2 = try #require(await resolver.validatePrimaryCodexSession(
+            recordedPath: nil,
+            sessionID: sessionID
+        )).transcriptBinding
+        #expect(fallbackF2 != firstReport.transcriptBinding)
+        _ = try #require(await registry.agentReportCaptureRoute(
+            workspaceID: workspace.id.uuidString,
+            surfaceID: panel.id.uuidString,
+            sessionID: sessionID,
+            turnID: firstTurnID,
+            requestedTranscriptPath: nil,
+            lifecycleToken: service.agentReportLifecycleToken(for: panel.id),
+            resolvedTranscriptBinding: fallbackF2
+        ))
+
+        let deniedPasteboard = NSPasteboard(
+            name: .init("cmux-fallback-replacement-denied-\(UUID().uuidString)")
+        )
+        deniedPasteboard.clearContents()
+        deniedPasteboard.setString("preserve mismatch", forType: .string)
+        let deniedChangeCount = deniedPasteboard.changeCount
+        #expect(await AppDelegate.copyLatestAgentReport(
+            store: store,
+            runtimeSurfaceID: panel.id,
+            to: deniedPasteboard,
+            authorize: { context in
+                await controller.authorizesAgentReportCopy(
+                    context,
+                    representedWorkspaceID: workspace.id,
+                    representedSurfaceID: panel.id
+                )
+            }
+        ) == false)
+        #expect(deniedPasteboard.changeCount == deniedChangeCount)
+        #expect(deniedPasteboard.string(forType: .string) == "preserve mismatch")
+
+        try agentReportCodexTranscriptText(
+            sessionID: sessionID,
+            turnID: secondTurnID,
+            body: secondBody
+        ).write(to: transcript, atomically: false, encoding: .utf8)
+        try writeAgentReportHookStore(
+            home: home,
+            workspaceID: workspace.id,
+            surfaceID: panel.id,
+            sessionID: sessionID,
+            turnID: secondTurnID,
+            transcriptPath: nil,
+            updatedAt: 101
+        )
+        let secondEnvelope = try await sendV2RequestAsync(
+            method: "agent.report.capture",
+            params: [
+                "provider": "codex",
+                "workspace_id": workspace.id.uuidString,
+                "surface_id": panel.id.uuidString,
+                "session_id": sessionID,
+                "turn_id": secondTurnID,
+                "completion_kind": "primaryStop",
+                "completion_timestamp": 101.0,
+            ],
+            to: socketPath
+        )
+        #expect(secondEnvelope["ok"] as? Bool == true)
+        #expect(await resultIterator.next() == .captured)
+        let secondReport = try #require(await store.latestReport(runtimeSurfaceID: panel.id))
+        #expect(secondReport.transcriptBinding == fallbackF2)
+        #expect(secondReport.finalReply == secondBody)
+
+        let freshPasteboard = NSPasteboard(
+            name: .init("cmux-fallback-replacement-fresh-\(UUID().uuidString)")
+        )
+        #expect(await AppDelegate.copyLatestAgentReport(
+            store: store,
+            runtimeSurfaceID: panel.id,
+            to: freshPasteboard,
+            authorize: { context in
+                await controller.authorizesAgentReportCopy(
+                    context,
+                    representedWorkspaceID: workspace.id,
+                    representedSurfaceID: panel.id
+                )
+            }
+        ))
+        #expect(freshPasteboard.string(forType: .string) == secondBody)
     }
 
     @Test func queuedLifecycleCleanupCannotCommitAfterPromptOrResumeTransition() async throws {
@@ -3662,6 +3949,132 @@ final class TerminalControllerSocketSecurityTests {
         return url.path
     }
 
+    private func agentReportCodexTranscriptText(
+        sessionID: String,
+        turnID: String,
+        body: String
+    ) throws -> String {
+        let records: [[String: Any]] = [
+            ["type": "session_meta", "payload": ["id": sessionID]],
+            ["type": "turn_context", "payload": ["turn_id": turnID]],
+            ["type": "response_item", "payload": [
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [["type": "output_text", "text": body]],
+                "internal_chat_message_metadata_passthrough": ["turn_id": turnID],
+            ]],
+            ["type": "event_msg", "payload": [
+                "type": "turn_complete",
+                "turn_id": turnID,
+            ]],
+        ]
+        return try records.map { record in
+            String(
+                decoding: try JSONSerialization.data(
+                    withJSONObject: record,
+                    options: [.sortedKeys]
+                ),
+                as: UTF8.self
+            )
+        }.joined(separator: "\n") + "\n"
+    }
+
+    private func writeAgentReportHookStore(
+        home: URL,
+        workspaceID: UUID,
+        surfaceID: UUID,
+        sessionID: String,
+        turnID: String,
+        transcriptPath: String?,
+        updatedAt: TimeInterval
+    ) throws {
+        let directory = home.appendingPathComponent(".cmuxterm", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var session: [String: Any] = [
+            "workspaceId": workspaceID.uuidString,
+            "surfaceId": surfaceID.uuidString,
+            "lastPromptTurnId": turnID,
+            "updatedAt": updatedAt,
+        ]
+        if let transcriptPath {
+            session["transcriptPath"] = transcriptPath
+        }
+        let payload: [String: Any] = [
+            "sessions": [sessionID: session],
+            "activeSessionsBySurface": [
+                surfaceID.uuidString: [
+                    "sessionId": sessionID,
+                    "turnId": turnID,
+                    "updatedAt": updatedAt,
+                ],
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+            .write(to: directory.appendingPathComponent("codex-hook-sessions.json"))
+    }
+
+    @MainActor
+    private func captureAgentReportWithCurrentResolverAuthority(
+        _ request: AgentReportCaptureRequest,
+        workspace: Workspace,
+        panel: TerminalPanel,
+        service: AgentChatTranscriptService,
+        store: AgentReportCaptureStore
+    ) async -> AgentReportCaptureResult {
+        let workspaceID = workspace.id
+        let runtimeSurfaceID = panel.id
+        let stableSurfaceID = panel.stableSurfaceId
+        let lifecycleToken = service.agentReportLifecycleToken(for: runtimeSurfaceID)
+        guard let initialRoute = await service.registry.agentReportCaptureRoute(
+            workspaceID: workspaceID.uuidString,
+            surfaceID: runtimeSurfaceID.uuidString,
+            sessionID: request.agentSessionID,
+            turnID: request.turnID,
+            requestedTranscriptPath: request.transcriptPath,
+            lifecycleToken: lifecycleToken
+        ) else {
+            return .rejected(.inaccessibleSurface)
+        }
+        let target = AgentReportCaptureTarget(
+            workspaceID: workspaceID,
+            runtimeSurfaceID: runtimeSurfaceID,
+            stableSurfaceID: stableSurfaceID,
+            agentSessionID: request.agentSessionID,
+            turnID: request.turnID,
+            lifecycleToken: lifecycleToken,
+            recordedTranscriptPathHint: initialRoute.recordedTranscriptPathHint,
+            authorityRevision: initialRoute.authorityRevision
+        )
+        return await store.capture(
+            request,
+            target: target,
+            revalidateTarget: { transcriptBinding in
+                guard let route = await service.registry.agentReportCaptureRoute(
+                    workspaceID: workspaceID.uuidString,
+                    surfaceID: runtimeSurfaceID.uuidString,
+                    sessionID: request.agentSessionID,
+                    turnID: request.turnID,
+                    requestedTranscriptPath: request.transcriptPath,
+                    lifecycleToken: lifecycleToken,
+                    resolvedTranscriptBinding: transcriptBinding
+                ) else {
+                    return nil
+                }
+                return AgentReportCaptureTarget(
+                    workspaceID: workspaceID,
+                    runtimeSurfaceID: runtimeSurfaceID,
+                    stableSurfaceID: stableSurfaceID,
+                    agentSessionID: request.agentSessionID,
+                    turnID: request.turnID,
+                    lifecycleToken: lifecycleToken,
+                    recordedTranscriptPathHint: route.recordedTranscriptPathHint,
+                    authorityRevision: route.authorityRevision
+                )
+            }
+        )
+    }
+
     private func agentReportRequest(
         workspace: Workspace,
         panel: TerminalPanel,
@@ -3691,7 +4104,8 @@ final class TerminalControllerSocketSecurityTests {
             agentSessionID: "lifecycle-session",
             turnID: "lifecycle-turn",
             lifecycleToken: UUID(),
-            transcriptPath: "/synthetic/lifecycle.jsonl"
+            recordedTranscriptPathHint: "/synthetic/lifecycle.jsonl",
+            authorityRevision: UUID()
         )
     }
 
@@ -3729,23 +4143,31 @@ final class TerminalControllerSocketSecurityTests {
 
 private actor SuspendedEndpointAgentReportRecovery: AgentReportTranscriptRecovering {
     private let reply: String
+    private let transcriptBinding = AgentReportTranscriptBinding(
+        descriptorPinnedCanonicalPath: "/synthetic/resolver-authorized-transcript.jsonl",
+        fileSystemDevice: 1,
+        fileSystemInode: 1
+    )
     private var recoveryStarted = false
     private var startWaiters: [CheckedContinuation<Void, Never>] = []
-    private var recoveryContinuation: CheckedContinuation<String?, Never>?
+    private var recoveryContinuation: CheckedContinuation<AgentReportRecoveryResult?, Never>?
 
     init(reply: String) {
         self.reply = reply
     }
 
-    func isPrimaryCodexSession(recordedPath: String?, sessionID: String) async -> Bool {
-        true
+    func validatePrimaryCodexSession(
+        recordedPath: String?,
+        sessionID: String
+    ) async -> ValidatedCodexTranscriptAuthority? {
+        ValidatedCodexTranscriptAuthority(transcriptBinding: transcriptBinding)
     }
 
     func recoverCodexFinalReply(
         recordedPath: String?,
         sessionID: String,
         turnID: String
-    ) async -> String? {
+    ) async -> AgentReportRecoveryResult? {
         recoveryStarted = true
         let waiters = startWaiters
         startWaiters.removeAll()
@@ -3759,7 +4181,10 @@ private actor SuspendedEndpointAgentReportRecovery: AgentReportTranscriptRecover
     }
 
     func resumeRecovery() {
-        recoveryContinuation?.resume(returning: reply)
+        recoveryContinuation?.resume(returning: AgentReportRecoveryResult(
+            body: reply,
+            transcriptBinding: transcriptBinding
+        ))
         recoveryContinuation = nil
     }
 }

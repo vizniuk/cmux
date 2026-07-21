@@ -37,7 +37,10 @@ public struct AgentReportCopyAuthorizationContext: Sendable, Equatable,
     public let lifecycleToken: UUID
 
     /// Immutable opaque capture-time transcript identity.
-    public let transcriptBinding: AgentReportTranscriptBinding?
+    public let transcriptBinding: AgentReportTranscriptBinding
+
+    /// Capture-time active hook-entry mutation identity.
+    public let authorityRevision: UUID
 
     /// Report-actor policy generation observed before authorization suspended.
     public let captureStorePolicyGeneration: UInt64
@@ -73,6 +76,7 @@ public struct AgentReportCopyAuthorizationContext: Sendable, Equatable,
         completionKind = report.completionKind
         lifecycleToken = report.lifecycleToken
         transcriptBinding = report.transcriptBinding
+        authorityRevision = report.authorityRevision
         self.captureStorePolicyGeneration = captureStorePolicyGeneration
         self.capturePolicyRevision = capturePolicyRevision
         self.availabilityRevision = availabilityRevision
@@ -107,6 +111,7 @@ public struct AgentReportCopyAuthorizationContext: Sendable, Equatable,
             && lhs.completionKind == rhs.completionKind
             && lhs.lifecycleToken == rhs.lifecycleToken
             && lhs.transcriptBinding == rhs.transcriptBinding
+            && lhs.authorityRevision == rhs.authorityRevision
             && lhs.captureStorePolicyGeneration == rhs.captureStorePolicyGeneration
             && lhs.capturePolicyRevision == rhs.capturePolicyRevision
             && lhs.availabilityRevision == rhs.availabilityRevision

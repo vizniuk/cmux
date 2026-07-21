@@ -25,11 +25,14 @@ public struct AgentReportCaptureTarget: Sendable, Equatable, CustomStringConvert
     /// Opaque process-local lifecycle authority for this exact surface binding.
     public let lifecycleToken: UUID
 
-    /// Transcript path validated against that session, when recorded.
-    public let transcriptPath: String?
+    /// Optional hook-recorded transcript lookup hint.
+    ///
+    /// This value has no read or report authority. It may be absent, stale, or
+    /// rejected by the resolver before exact-session fallback succeeds.
+    public let recordedTranscriptPathHint: String?
 
-    /// Opaque immutable identity derived from the validated transcript path.
-    public let transcriptBinding: AgentReportTranscriptBinding?
+    /// Opaque process-local identity of the exact active hook-entry snapshot.
+    public let authorityRevision: UUID
 
     /// A content-free diagnostic description that omits all private metadata.
     public var description: String {
@@ -48,7 +51,8 @@ public struct AgentReportCaptureTarget: Sendable, Equatable, CustomStringConvert
     ///   - agentSessionID: Provider session currently bound to the surface.
     ///   - turnID: Latest primary turn authorized by the hook lifecycle store.
     ///   - lifecycleToken: Current process-local surface lifecycle authority.
-    ///   - transcriptPath: Session-validated transcript path, when recorded.
+    ///   - recordedTranscriptPathHint: Optional hook-recorded lookup hint.
+    ///   - authorityRevision: Exact active hook-entry mutation identity.
     public init(
         workspaceID: UUID,
         runtimeSurfaceID: UUID,
@@ -56,7 +60,8 @@ public struct AgentReportCaptureTarget: Sendable, Equatable, CustomStringConvert
         agentSessionID: String,
         turnID: String,
         lifecycleToken: UUID,
-        transcriptPath: String?
+        recordedTranscriptPathHint: String?,
+        authorityRevision: UUID
     ) {
         self.workspaceID = workspaceID
         self.runtimeSurfaceID = runtimeSurfaceID
@@ -64,7 +69,7 @@ public struct AgentReportCaptureTarget: Sendable, Equatable, CustomStringConvert
         self.agentSessionID = agentSessionID
         self.turnID = turnID
         self.lifecycleToken = lifecycleToken
-        self.transcriptPath = transcriptPath
-        transcriptBinding = transcriptPath.map(AgentReportTranscriptBinding.init(validatedTranscriptPath:))
+        self.recordedTranscriptPathHint = recordedTranscriptPathHint
+        self.authorityRevision = authorityRevision
     }
 }

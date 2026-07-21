@@ -6,15 +6,54 @@ import Foundation
 /// hook events and the on-disk hook session stores.
 @MainActor
 final class AgentChatSessionRegistry {
-    /// Content-free transcript binding proven for an exact active capture tuple.
-    struct AgentReportCaptureBinding: Sendable {
-        /// Hook-recorded transcript candidate. This routing equality does not
-        /// authorize a read; the off-main resolver independently enforces the
-        /// app-authoritative Codex root and regular-file policy.
-        let transcriptPath: String?
+    /// Content-free routing state for one exact active capture tuple.
+    struct AgentReportCaptureRoute: Sendable, Equatable,
+        CustomStringConvertible, CustomDebugStringConvertible
+    {
+        /// Optional hook-recorded lookup hint. This never authorizes a read.
+        let recordedTranscriptPathHint: String?
 
-        /// Opaque canonical identity of ``transcriptPath`` when present.
-        let transcriptBinding: AgentReportTranscriptBinding?
+        /// Process-local revision for the exact active hook-entry snapshot.
+        let authorityRevision: UUID
+
+        var description: String { "AgentReportCaptureRoute" }
+        var debugDescription: String { description }
+    }
+
+    /// Current resolver-proven transcript authority for one exact tuple.
+    struct AgentReportResolvedAuthority: Sendable, Equatable,
+        CustomStringConvertible, CustomDebugStringConvertible
+    {
+        /// Opaque binding returned by the descriptor-pinned resolver.
+        let transcriptBinding: AgentReportTranscriptBinding
+
+        /// Exact active hook-entry revision associated with the binding.
+        let authorityRevision: UUID
+
+        var description: String { "AgentReportResolvedAuthority" }
+        var debugDescription: String { description }
+    }
+
+    /// Content-free snapshot used to detect active-entry mutation.
+    private struct AgentReportActiveEntrySnapshot: Equatable {
+        let workspaceID: UUID
+        let surfaceID: UUID
+        let sessionID: String
+        let turnID: String
+        let recordedTranscriptPathHint: String?
+        let updatedAt: Date?
+        let pid: Int?
+    }
+
+    /// Process-local resolved authority keyed by the exact capture tuple.
+    private struct AgentReportResolvedAuthorityState {
+        let captureWorkspaceID: UUID
+        let surfaceID: UUID
+        let sessionID: String
+        let turnID: String
+        let lifecycleToken: UUID
+        let authorityRevision: UUID
+        let transcriptBinding: AgentReportTranscriptBinding
     }
 
     private var records: [String: AgentChatSessionRecord] = [:]
@@ -27,6 +66,13 @@ final class AgentChatSessionRegistry {
         _ surfaceID: String,
         _ turnID: String
     ) async -> AgentChatHookSessionStore.Entry?
+    private var agentReportActiveEntrySnapshotBySurfaceID: [
+        UUID: AgentReportActiveEntrySnapshot
+    ] = [:]
+    private var agentReportAuthorityRevisionBySurfaceID: [UUID: UUID] = [:]
+    private var agentReportResolvedAuthorityBySurfaceID: [
+        UUID: AgentReportResolvedAuthorityState
+    ] = [:]
 
     /// Called after a record mutation with the previous value (nil for a
     /// brand-new record), so the owner derives state/descriptor deltas in
@@ -304,24 +350,45 @@ final class AgentChatSessionRegistry {
     ///   - turnID: Exact provider turn claimed by the request.
     ///   - requestedTranscriptPath: Hook-supplied path to compare syntactically
     ///     with the lifecycle record, when present. Equality cannot authorize I/O.
-    /// - Returns: A content-free validated binding, or `nil` on any mismatch.
-    func agentReportCaptureBinding(
+    ///   - lifecycleToken: Exact process-local surface lifecycle authority.
+    ///   - resolvedTranscriptBinding: Binding returned by the resolver during
+    ///     post-I/O revalidation, or `nil` during initial route lookup.
+    /// - Returns: A content-free validated route, or `nil` on any mismatch.
+    func agentReportCaptureRoute(
         workspaceID: String,
         surfaceID: String,
         sessionID: String,
         turnID: String,
-        requestedTranscriptPath: String?
-    ) async -> AgentReportCaptureBinding? {
-        await agentReportBinding(
+        requestedTranscriptPath: String?,
+        lifecycleToken: UUID,
+        resolvedTranscriptBinding: AgentReportTranscriptBinding? = nil
+    ) async -> AgentReportCaptureRoute? {
+        guard let route = await validatedAgentReportRoute(
             captureWorkspaceID: workspaceID,
             requiredRegistryWorkspaceID: workspaceID,
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: turnID,
             requestedTranscriptPath: requestedTranscriptPath,
-            requiredTranscriptBinding: nil,
-            requiresExactTranscriptBinding: false
-        )
+            invalidateAuthorityOnFailure: false
+        ) else {
+            return nil
+        }
+        if let resolvedTranscriptBinding,
+           let captureWorkspaceID = UUID(uuidString: workspaceID),
+           let runtimeSurfaceID = UUID(uuidString: surfaceID) {
+            agentReportResolvedAuthorityBySurfaceID[runtimeSurfaceID] =
+                AgentReportResolvedAuthorityState(
+                    captureWorkspaceID: captureWorkspaceID,
+                    surfaceID: runtimeSurfaceID,
+                    sessionID: sessionID,
+                    turnID: turnID,
+                    lifecycleToken: lifecycleToken,
+                    authorityRevision: route.authorityRevision,
+                    transcriptBinding: resolvedTranscriptBinding
+                )
+        }
+        return route
     }
 
     /// Validates a retained report against its immutable hook-store capture
@@ -337,45 +404,85 @@ final class AgentChatSessionRegistry {
     ///   - surfaceID: Exact live runtime surface recorded at capture.
     ///   - sessionID: Exact provider session recorded at capture.
     ///   - turnID: Exact provider turn recorded at capture.
-    ///   - transcriptBinding: Immutable capture-time transcript identity.
-    /// - Returns: A content-free validated binding, or `nil` on any mismatch.
-    func agentReportCopyBinding(
+    ///   - lifecycleToken: Immutable capture-time surface lifecycle authority.
+    ///   - authorityRevision: Immutable capture-time active-entry revision.
+    ///   - transcriptBinding: Resolver-proven capture-time transcript identity.
+    /// - Returns: Current content-free authority, or `nil` on any mismatch.
+    func agentReportCopyAuthority(
         captureWorkspaceID: String,
         surfaceID: String,
         sessionID: String,
         turnID: String,
-        transcriptBinding: AgentReportTranscriptBinding?
-    ) async -> AgentReportCaptureBinding? {
-        await agentReportBinding(
+        lifecycleToken: UUID,
+        authorityRevision: UUID,
+        transcriptBinding: AgentReportTranscriptBinding
+    ) async -> AgentReportResolvedAuthority? {
+        guard let route = await validatedAgentReportRoute(
             captureWorkspaceID: captureWorkspaceID,
             requiredRegistryWorkspaceID: nil,
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: turnID,
             requestedTranscriptPath: nil,
-            requiredTranscriptBinding: transcriptBinding,
-            requiresExactTranscriptBinding: true
+            invalidateAuthorityOnFailure: true
+        ),
+            let captureWorkspaceUUID = UUID(uuidString: captureWorkspaceID),
+            let runtimeSurfaceID = UUID(uuidString: surfaceID),
+            route.authorityRevision == authorityRevision,
+            let current = agentReportResolvedAuthorityBySurfaceID[runtimeSurfaceID],
+            current.captureWorkspaceID == captureWorkspaceUUID,
+            current.surfaceID == runtimeSurfaceID,
+            current.sessionID == sessionID,
+            current.turnID == turnID,
+            current.lifecycleToken == lifecycleToken,
+            current.authorityRevision == authorityRevision,
+            current.transcriptBinding == transcriptBinding else {
+            return nil
+        }
+        return AgentReportResolvedAuthority(
+            transcriptBinding: current.transcriptBinding,
+            authorityRevision: current.authorityRevision
         )
     }
 
-    /// Resolves the shared immutable capture tuple with an optional stricter
-    /// registry-workspace requirement for initial capture only.
-    private func agentReportBinding(
+    /// Clears current resolved authority and revision history for one surface.
+    ///
+    /// A later restoration of otherwise identical hook state receives a new
+    /// revision, so a pre-invalidation report remains unauthorized.
+    func invalidateAgentReportResolvedAuthority(runtimeSurfaceID: UUID) {
+        agentReportResolvedAuthorityBySurfaceID.removeValue(forKey: runtimeSurfaceID)
+        agentReportActiveEntrySnapshotBySurfaceID.removeValue(forKey: runtimeSurfaceID)
+        agentReportAuthorityRevisionBySurfaceID.removeValue(forKey: runtimeSurfaceID)
+    }
+
+    /// Clears every process-local resolved transcript authority.
+    func invalidateAllAgentReportResolvedAuthorities() {
+        agentReportResolvedAuthorityBySurfaceID.removeAll(keepingCapacity: false)
+        agentReportActiveEntrySnapshotBySurfaceID.removeAll(keepingCapacity: false)
+        agentReportAuthorityRevisionBySurfaceID.removeAll(keepingCapacity: false)
+    }
+
+    /// Resolves the shared active route with an optional stricter registry
+    /// workspace requirement for initial capture only.
+    private func validatedAgentReportRoute(
         captureWorkspaceID: String,
         requiredRegistryWorkspaceID: String?,
         surfaceID: String,
         sessionID: String,
         turnID: String,
         requestedTranscriptPath: String?,
-        requiredTranscriptBinding: AgentReportTranscriptBinding?,
-        requiresExactTranscriptBinding: Bool
-    ) async -> AgentReportCaptureBinding? {
+        invalidateAuthorityOnFailure: Bool
+    ) async -> AgentReportCaptureRoute? {
+        guard let runtimeSurfaceID = UUID(uuidString: surfaceID) else { return nil }
         guard Self.sessionRecordAllowsAgentReportCapture(
             record(sessionID: sessionID),
             requiredWorkspaceID: requiredRegistryWorkspaceID,
             surfaceID: surfaceID,
             sessionID: sessionID
         ) else {
+            if invalidateAuthorityOnFailure {
+                invalidateAgentReportResolvedAuthority(runtimeSurfaceID: runtimeSurfaceID)
+            }
             return nil
         }
 
@@ -399,24 +506,33 @@ final class AgentChatSessionRegistry {
                   surfaceID: surfaceID,
                   sessionID: sessionID
               ) else {
+            if invalidateAuthorityOnFailure {
+                invalidateAgentReportResolvedAuthority(runtimeSurfaceID: runtimeSurfaceID)
+            }
             return nil
         }
 
         let firstRecordedTranscriptPath = firstEntry.transcriptPath
             ?? record(sessionID: sessionID)?.transcriptPath
-        let firstTranscriptBinding = firstRecordedTranscriptPath.map(
-            AgentReportTranscriptBinding.init(validatedTranscriptPath:)
-        )
+        guard let firstSnapshot = Self.agentReportActiveEntrySnapshot(
+            entry: firstEntry,
+            recordedTranscriptPathHint: firstRecordedTranscriptPath,
+            turnID: turnID
+        ) else {
+            if invalidateAuthorityOnFailure {
+                invalidateAgentReportResolvedAuthority(runtimeSurfaceID: runtimeSurfaceID)
+            }
+            return nil
+        }
         if let requestedTranscriptPath {
             guard let firstRecordedTranscriptPath,
                   Self.normalizedPath(requestedTranscriptPath)
                     == Self.normalizedPath(firstRecordedTranscriptPath) else {
+                if invalidateAuthorityOnFailure {
+                    invalidateAgentReportResolvedAuthority(runtimeSurfaceID: runtimeSurfaceID)
+                }
                 return nil
             }
-        }
-        if requiresExactTranscriptBinding,
-           firstTranscriptBinding != requiredTranscriptBinding {
-            return nil
         }
 
         // Read the atomic hook-store snapshot again and recheck registry state.
@@ -442,28 +558,77 @@ final class AgentChatSessionRegistry {
                   surfaceID: surfaceID,
                   sessionID: sessionID
               ) else {
+            if invalidateAuthorityOnFailure {
+                invalidateAgentReportResolvedAuthority(runtimeSurfaceID: runtimeSurfaceID)
+            }
             return nil
         }
         let recordedTranscriptPath = secondEntry.transcriptPath
             ?? record(sessionID: sessionID)?.transcriptPath
-        let transcriptBinding = recordedTranscriptPath.map(
-            AgentReportTranscriptBinding.init(validatedTranscriptPath:)
-        )
-        guard transcriptBinding == firstTranscriptBinding else { return nil }
+        guard let snapshot = Self.agentReportActiveEntrySnapshot(
+            entry: secondEntry,
+            recordedTranscriptPathHint: recordedTranscriptPath,
+            turnID: turnID
+        ), snapshot == firstSnapshot else {
+            if invalidateAuthorityOnFailure {
+                invalidateAgentReportResolvedAuthority(runtimeSurfaceID: runtimeSurfaceID)
+            }
+            return nil
+        }
         if let requestedTranscriptPath {
             guard let recordedTranscriptPath,
                   Self.normalizedPath(requestedTranscriptPath)
                     == Self.normalizedPath(recordedTranscriptPath) else {
+                if invalidateAuthorityOnFailure {
+                    invalidateAgentReportResolvedAuthority(runtimeSurfaceID: runtimeSurfaceID)
+                }
                 return nil
             }
         }
-        if requiresExactTranscriptBinding,
-           transcriptBinding != requiredTranscriptBinding {
+        return AgentReportCaptureRoute(
+            recordedTranscriptPathHint: recordedTranscriptPath,
+            authorityRevision: agentReportAuthorityRevision(
+                for: snapshot,
+                runtimeSurfaceID: runtimeSurfaceID
+            )
+        )
+    }
+
+    /// Returns a stable revision for unchanged active state and replaces it on
+    /// any mutation, clearing prior resolver authority synchronously.
+    private func agentReportAuthorityRevision(
+        for snapshot: AgentReportActiveEntrySnapshot,
+        runtimeSurfaceID: UUID
+    ) -> UUID {
+        if agentReportActiveEntrySnapshotBySurfaceID[runtimeSurfaceID] == snapshot,
+           let revision = agentReportAuthorityRevisionBySurfaceID[runtimeSurfaceID] {
+            return revision
+        }
+        agentReportResolvedAuthorityBySurfaceID.removeValue(forKey: runtimeSurfaceID)
+        agentReportActiveEntrySnapshotBySurfaceID[runtimeSurfaceID] = snapshot
+        let revision = UUID()
+        agentReportAuthorityRevisionBySurfaceID[runtimeSurfaceID] = revision
+        return revision
+    }
+
+    /// Builds a content-free mutation snapshot from one validated active entry.
+    private static func agentReportActiveEntrySnapshot(
+        entry: AgentChatHookSessionStore.Entry,
+        recordedTranscriptPathHint: String?,
+        turnID: String
+    ) -> AgentReportActiveEntrySnapshot? {
+        guard let workspaceID = entry.workspaceID.flatMap(UUID.init(uuidString:)),
+              let surfaceID = entry.surfaceID.flatMap(UUID.init(uuidString:)) else {
             return nil
         }
-        return AgentReportCaptureBinding(
-            transcriptPath: recordedTranscriptPath,
-            transcriptBinding: transcriptBinding
+        return AgentReportActiveEntrySnapshot(
+            workspaceID: workspaceID,
+            surfaceID: surfaceID,
+            sessionID: entry.sessionID,
+            turnID: turnID,
+            recordedTranscriptPathHint: recordedTranscriptPathHint,
+            updatedAt: entry.updatedAt,
+            pid: entry.pid
         )
     }
 

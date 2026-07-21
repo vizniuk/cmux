@@ -90,7 +90,146 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
             turnID: turnID
         )
 
-        #expect(recovered == exact)
+        #expect(recovered?.body == exact)
+    }
+
+    @Test func resolverReturnsExactBindingForRecordedMissingAndStaleFallbacks() async throws {
+        let home = try temporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let directory = home.appendingPathComponent(
+            ".codex/sessions/2026/07/21",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let sessionID = "resolver-binding-session"
+        let turnID = "resolver-binding-turn"
+        let first = directory.appendingPathComponent("rollout-a-\(sessionID).jsonl")
+        let second = directory.appendingPathComponent("rollout-b-\(sessionID).jsonl")
+        try codexTranscriptText(
+            sessionID: sessionID,
+            turnID: turnID,
+            finalReply: "fallback F1"
+        ).write(to: first, atomically: false, encoding: .utf8)
+        try codexTranscriptText(
+            sessionID: sessionID,
+            turnID: turnID,
+            finalReply: "fallback F2"
+        ).write(to: second, atomically: false, encoding: .utf8)
+        let resolver = AgentChatTranscriptResolver(homeDirectory: home, environment: [:])
+        let firstDirect = try #require(await resolver.recoverCodexFinalReply(
+            recordedPath: first.path,
+            sessionID: sessionID,
+            turnID: turnID
+        ))
+        let secondDirect = try #require(await resolver.recoverCodexFinalReply(
+            recordedPath: second.path,
+            sessionID: sessionID,
+            turnID: turnID
+        ))
+        #expect(firstDirect.transcriptBinding != secondDirect.transcriptBinding)
+
+        let missingFallback = try #require(await resolver.recoverCodexFinalReply(
+            recordedPath: nil,
+            sessionID: sessionID,
+            turnID: turnID
+        ))
+        let repeatedFallback = try #require(await resolver.recoverCodexFinalReply(
+            recordedPath: nil,
+            sessionID: sessionID,
+            turnID: turnID
+        ))
+        #expect(missingFallback.transcriptBinding == repeatedFallback.transcriptBinding)
+        #expect([
+            firstDirect.transcriptBinding,
+            secondDirect.transcriptBinding,
+        ].contains(missingFallback.transcriptBinding))
+
+        let staleFallback = try #require(await resolver.recoverCodexFinalReply(
+            recordedPath: directory.appendingPathComponent("missing.jsonl").path,
+            sessionID: sessionID,
+            turnID: turnID
+        ))
+        let outsideFallback = try #require(await resolver.recoverCodexFinalReply(
+            recordedPath: home.appendingPathComponent("outside.jsonl").path,
+            sessionID: sessionID,
+            turnID: turnID
+        ))
+        #expect(staleFallback.transcriptBinding == missingFallback.transcriptBinding)
+        #expect(outsideFallback.transcriptBinding == missingFallback.transcriptBinding)
+
+        let primaryAuthority = try #require(await resolver.validatePrimaryCodexSession(
+            recordedPath: nil,
+            sessionID: sessionID
+        ))
+        #expect(primaryAuthority.transcriptBinding == missingFallback.transcriptBinding)
+
+        let selectedURL = missingFallback.transcriptBinding == firstDirect.transcriptBinding
+            ? first
+            : second
+        let replacementURL = selectedURL == first ? second : first
+        try FileManager.default.removeItem(at: selectedURL)
+        let changedSelection = try #require(await resolver.recoverCodexFinalReply(
+            recordedPath: nil,
+            sessionID: sessionID,
+            turnID: turnID
+        ))
+        #expect(changedSelection.transcriptBinding != missingFallback.transcriptBinding)
+        #expect(
+            changedSelection.transcriptBinding
+                == (replacementURL == first
+                    ? firstDirect.transcriptBinding
+                    : secondDirect.transcriptBinding)
+        )
+
+        try FileManager.default.removeItem(at: replacementURL)
+        #expect(await resolver.recoverCodexFinalReply(
+            recordedPath: nil,
+            sessionID: sessionID,
+            turnID: turnID
+        ) == nil)
+    }
+
+    @Test func canonicallyEquivalentTrustedResolutionProducesOneBinding() async throws {
+        let home = try temporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let realCodexRoot = home.appendingPathComponent("real-codex", isDirectory: true)
+        let configuredCodexRoot = home.appendingPathComponent("configured-codex", isDirectory: true)
+        let canonicalTranscript = realCodexRoot
+            .appendingPathComponent("sessions/2026/07/21", isDirectory: true)
+            .appendingPathComponent("rollout-canonical-session.jsonl")
+        try FileManager.default.createDirectory(
+            at: canonicalTranscript.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try codexTranscriptText(
+            sessionID: "canonical-session",
+            turnID: "canonical-turn",
+            finalReply: "canonical body"
+        ).write(to: canonicalTranscript, atomically: false, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            at: configuredCodexRoot,
+            withDestinationURL: realCodexRoot
+        )
+        let configuredTranscript = configuredCodexRoot
+            .appendingPathComponent("sessions/2026/07/21", isDirectory: true)
+            .appendingPathComponent("rollout-canonical-session.jsonl")
+        let resolver = AgentChatTranscriptResolver(
+            homeDirectory: home,
+            environment: ["CODEX_HOME": configuredCodexRoot.path]
+        )
+
+        let configured = try #require(await resolver.recoverCodexFinalReply(
+            recordedPath: configuredTranscript.path,
+            sessionID: "canonical-session",
+            turnID: "canonical-turn"
+        ))
+        let canonical = try #require(await resolver.recoverCodexFinalReply(
+            recordedPath: canonicalTranscript.path,
+            sessionID: "canonical-session",
+            turnID: "canonical-turn"
+        ))
+
+        #expect(configured.transcriptBinding == canonical.transcriptBinding)
     }
 
     @Test func invalidUTF8CompleteRecordClearsInheritedAuthorityAndCandidates() async throws {
@@ -168,7 +307,7 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
                 recordedPath: fixture.transcript.path,
                 sessionID: fixture.sessionID,
                 turnID: "turn-b"
-            ) == "authorized turn B"
+            )?.body == "authorized turn B"
         )
     }
 
@@ -201,7 +340,7 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
             turnID: "turn-a"
         )
 
-        #expect(recovered == "complete before tail")
+        #expect(recovered?.body == "complete before tail")
     }
 
     @Test func completedTurnIsFrozenBeforeLaterInvalidUTF8() async throws {
@@ -242,7 +381,7 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
             turnID: "turn-a"
         )
 
-        #expect(recovered == "frozen turn A")
+        #expect(recovered?.body == "frozen turn A")
     }
 
     @Test func codexReportPathValidationRejectsUntrustedAndNonRegularTargets() async throws {
@@ -507,7 +646,7 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
             turnID: fixture.turnID
         )
 
-        #expect(recovered == fixture.finalReply)
+        #expect(recovered?.body == fixture.finalReply)
         #expect(events.count(of: .didCloseDescriptor) == 5)
     }
 
@@ -537,7 +676,7 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
             turnID: fixture.turnID
         )
 
-        #expect(recovered == fixture.finalReply)
+        #expect(recovered?.body == fixture.finalReply)
         #expect(events.count(of: .didCloseDescriptor) == 5)
     }
 
@@ -573,8 +712,14 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
             totalBytes: smallLimits.maximumTranscriptBytes + 1,
             maximumRecordBytes: smallLimits.maximumJSONLRecordBytes
         )
-        #expect(await resolver.isPrimaryCodexSession(recordedPath: belowTranscript.path, sessionID: sessionID))
-        #expect(!(await resolver.isPrimaryCodexSession(recordedPath: aboveTranscript.path, sessionID: sessionID)))
+        #expect(await resolver.validatePrimaryCodexSession(
+            recordedPath: belowTranscript.path,
+            sessionID: sessionID
+        ) != nil)
+        #expect(await resolver.validatePrimaryCodexSession(
+            recordedPath: aboveTranscript.path,
+            sessionID: sessionID
+        ) == nil)
 
         let productionRecordLimit = AgentReportResourceLimits.sliceA.maximumJSONLRecordBytes
         let recordResolver = AgentChatTranscriptResolver(homeDirectory: home, environment: [:])
@@ -599,9 +744,18 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
             recordBytes: productionRecordLimit + 1,
             terminated: false
         )
-        #expect(await recordResolver.isPrimaryCodexSession(recordedPath: belowRecord.path, sessionID: sessionID))
-        #expect(!(await recordResolver.isPrimaryCodexSession(recordedPath: aboveTerminatedRecord.path, sessionID: sessionID)))
-        #expect(!(await recordResolver.isPrimaryCodexSession(recordedPath: aboveUnterminatedRecord.path, sessionID: sessionID)))
+        #expect(await recordResolver.validatePrimaryCodexSession(
+            recordedPath: belowRecord.path,
+            sessionID: sessionID
+        ) != nil)
+        #expect(await recordResolver.validatePrimaryCodexSession(
+            recordedPath: aboveTerminatedRecord.path,
+            sessionID: sessionID
+        ) == nil)
+        #expect(await recordResolver.validatePrimaryCodexSession(
+            recordedPath: aboveUnterminatedRecord.path,
+            sessionID: sessionID
+        ) == nil)
     }
 
     @Test func cumulativeTranscriptGrowthAfterOpenIsRejected() async throws {
@@ -642,7 +796,10 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
             }
         )
 
-        #expect(!(await resolver.isPrimaryCodexSession(recordedPath: transcript.path, sessionID: sessionID)))
+        #expect(await resolver.validatePrimaryCodexSession(
+            recordedPath: transcript.path,
+            sessionID: sessionID
+        ) == nil)
     }
 
     @MainActor

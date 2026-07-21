@@ -11,10 +11,10 @@ public protocol AgentReportTranscriptRecovering: Sendable {
     /// emitting session is the primary agent. Capture therefore fails closed
     /// unless the structured rollout supplies matching, non-subagent session
     /// metadata.
-    func isPrimaryCodexSession(
+    func validatePrimaryCodexSession(
         recordedPath: String?,
         sessionID: String
-    ) async -> Bool
+    ) async -> ValidatedCodexTranscriptAuthority?
 
     /// Recovers one exact Codex final reply.
     ///
@@ -23,11 +23,11 @@ public protocol AgentReportTranscriptRecovering: Sendable {
     ///     `nil` when the conventional session resolver must be used.
     ///   - sessionID: Exact Codex session identifier.
     ///   - turnID: Exact accepted Codex turn identifier.
-    /// - Returns: Exact final reply text, or `nil` when correspondence cannot
-    ///   be proven.
+    /// - Returns: Exact final reply and its resolver-proven transcript binding,
+    ///   or `nil` when correspondence cannot be proven.
     func recoverCodexFinalReply(
         recordedPath: String?,
         sessionID: String,
         turnID: String
-    ) async -> String?
+    ) async -> AgentReportRecoveryResult?
 }

@@ -207,10 +207,28 @@ struct AgentChatTranscriptResolver: Sendable {
 
     /// Canonical root authorized by app configuration, never by hook payload.
     private var canonicalCodexSessionsRoot: URL {
-        codexConfigRoot
+        let configuredRoot = codexConfigRoot
             .appendingPathComponent("sessions", isDirectory: true)
             .standardizedFileURL
-            .resolvingSymlinksInPath()
+        return URL(
+            fileURLWithPath: Self.canonicalFileSystemPath(configuredRoot),
+            isDirectory: true
+        )
+    }
+
+    /// Resolves the app-authoritative root using the filesystem's canonical
+    /// spelling. Foundation can preserve `/var` while directory enumeration
+    /// returns `/private/var`, so URL-only normalization is not sufficient for
+    /// strict containment of descriptor-backed fallback candidates.
+    private static func canonicalFileSystemPath(_ url: URL) -> String {
+        let standardizedPath = url.standardizedFileURL.path
+        guard let resolvedPath = standardizedPath.withCString({ pointer in
+            Darwin.realpath(pointer, nil)
+        }) else {
+            return standardizedPath
+        }
+        defer { Darwin.free(resolvedPath) }
+        return String(cString: resolvedPath)
     }
 
     /// Validates one untrusted candidate by opening and closing the exact
@@ -338,10 +356,21 @@ struct AgentChatTranscriptResolver: Sendable {
         }
 
         ownsLeafDescriptor = false
+        let canonicalTranscriptPath = relativeComponents.reduce(
+            canonicalCodexSessionsRoot
+        ) { partialPath, component in
+            partialPath.appendingPathComponent(component, isDirectory: false)
+        }.path
+        let transcriptBinding = AgentReportTranscriptBinding(
+            descriptorPinnedCanonicalPath: canonicalTranscriptPath,
+            fileSystemDevice: UInt64(openedStat.st_dev),
+            fileSystemInode: UInt64(openedStat.st_ino)
+        )
         return CompleteJSONLLineSequence(
             descriptor: leafDescriptor,
             expectedDevice: openedStat.st_dev,
             expectedInode: openedStat.st_ino,
+            transcriptBinding: transcriptBinding,
             limits: reportResourceLimits,
             beforeFirstRead: { self.trustedOpenCheckpoint?(.beforeReadingFirstChunk) },
             onClose: { self.trustedOpenCheckpoint?(.didCloseDescriptor) }
@@ -426,25 +455,32 @@ extension AgentChatTranscriptResolver: AgentReportTranscriptRecovering {
     ///   - recordedPath: Untrusted hook path, accepted only after canonical
     ///     root containment and regular-file validation.
     ///   - sessionID: Exact Codex session expected in rollout metadata.
-    /// - Returns: `true` only for a matching primary rollout.
-    func isPrimaryCodexSession(
+    /// - Returns: Resolver-proven authority only for a matching primary rollout.
+    func validatePrimaryCodexSession(
         recordedPath: String?,
         sessionID: String
-    ) async -> Bool {
+    ) async -> ValidatedCodexTranscriptAuthority? {
         let resolver = self
         return await Task.detached(priority: .utility) {
             guard let lines = resolver.openCodexTranscript(
                 recordedPath: recordedPath,
                 sessionID: sessionID
             ) else {
-                return false
+                return nil
             }
             defer { lines.close() }
             let result = CodexFinalReplyExtractor().isPrimarySession(
                 records: lines,
                 sessionID: sessionID
             )
-            return !lines.didFailTrustedRead && !lines.didViolateResourceLimit && result
+            guard !lines.didFailTrustedRead,
+                  !lines.didViolateResourceLimit,
+                  result else {
+                return nil
+            }
+            return ValidatedCodexTranscriptAuthority(
+                transcriptBinding: lines.transcriptBinding
+            )
         }.value
     }
 
@@ -455,12 +491,13 @@ extension AgentChatTranscriptResolver: AgentReportTranscriptRecovering {
     ///     root containment and regular-file validation.
     ///   - sessionID: Exact Codex session expected in rollout metadata.
     ///   - turnID: Exact terminal turn to extract.
-    /// - Returns: Unmodified final assistant text, or `nil` if unprovable.
+    /// - Returns: Unmodified final assistant text and exact transcript authority,
+    ///   or `nil` if unprovable.
     func recoverCodexFinalReply(
         recordedPath: String?,
         sessionID: String,
         turnID: String
-    ) async -> String? {
+    ) async -> AgentReportRecoveryResult? {
         let resolver = self
         return await Task.detached(priority: .utility) {
             guard let lines = resolver.openCodexTranscript(
@@ -475,8 +512,15 @@ extension AgentChatTranscriptResolver: AgentReportTranscriptRecovering {
                 sessionID: sessionID,
                 turnID: turnID
             )
-            guard !lines.didFailTrustedRead, !lines.didViolateResourceLimit else { return nil }
-            return result
+            guard !lines.didFailTrustedRead,
+                  !lines.didViolateResourceLimit,
+                  let result else {
+                return nil
+            }
+            return AgentReportRecoveryResult(
+                body: result,
+                transcriptBinding: lines.transcriptBinding
+            )
         }.value
     }
 }
@@ -493,6 +537,7 @@ private final class CompleteJSONLLineSequence: Sequence, IteratorProtocol {
     private var descriptor: Int32
     private let expectedDevice: dev_t
     private let expectedInode: ino_t
+    let transcriptBinding: AgentReportTranscriptBinding
     private let limits: AgentReportResourceLimits
     private let beforeFirstRead: @Sendable () -> Void
     private let onClose: @Sendable () -> Void
@@ -508,6 +553,7 @@ private final class CompleteJSONLLineSequence: Sequence, IteratorProtocol {
         descriptor: Int32,
         expectedDevice: dev_t,
         expectedInode: ino_t,
+        transcriptBinding: AgentReportTranscriptBinding,
         limits: AgentReportResourceLimits,
         beforeFirstRead: @escaping @Sendable () -> Void,
         onClose: @escaping @Sendable () -> Void
@@ -515,6 +561,7 @@ private final class CompleteJSONLLineSequence: Sequence, IteratorProtocol {
         self.descriptor = descriptor
         self.expectedDevice = expectedDevice
         self.expectedInode = expectedInode
+        self.transcriptBinding = transcriptBinding
         self.limits = limits
         self.beforeFirstRead = beforeFirstRead
         self.onClose = onClose

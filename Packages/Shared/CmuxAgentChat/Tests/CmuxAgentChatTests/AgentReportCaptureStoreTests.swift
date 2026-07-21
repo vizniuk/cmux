@@ -8,6 +8,8 @@ struct AgentReportCaptureStoreTests {
     private let surfaceID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
     private let stableSurfaceID = UUID(uuidString: "33333333-3333-3333-3333-333333333333")!
     private let lifecycleToken = UUID(uuidString: "44444444-4444-4444-4444-444444444444")!
+    private let authorityRevision = UUID(uuidString: "55555555-5555-5555-5555-555555555555")!
+    private let transcriptBinding = AgentReportTranscriptBinding(testIdentity: "fixture-transcript-f1")
 
     @Test("Slice A resource ceilings are fixed byte contracts")
     func resourcePolicyValues() {
@@ -51,12 +53,7 @@ struct AgentReportCaptureStoreTests {
         #expect(report.captureSource == .rawHook)
         #expect(report.capturedAt == capturedAt)
         #expect(report.stableSurfaceID == stableSurfaceID)
-        #expect(
-            report.transcriptBinding
-                == AgentReportTranscriptBinding(
-                    validatedTranscriptPath: "/synthetic/session-1.jsonl"
-                )
-        )
+        #expect(report.transcriptBinding == transcriptBinding)
         #expect(!report.description.contains("Synthetic report"))
         #expect(!request(raw: exact).description.contains("Synthetic report"))
         #expect(await recovery.callCount == 0)
@@ -88,6 +85,112 @@ struct AgentReportCaptureStoreTests {
                 == .rejected(.exactReplyUnavailable)
         )
         #expect(await rejectedStore.latestReport(runtimeSurfaceID: surfaceID) == nil)
+    }
+
+    @Test(
+        "raw Stop retains resolver authority for missing and stale recorded hints",
+        arguments: [nil, "/stale/unusable-rollout.jsonl"] as [String?]
+    )
+    func rawCaptureUsesResolverBinding(recordedHint: String?) async throws {
+        let fallbackBinding = AgentReportTranscriptBinding(testIdentity: "fallback-f1")
+        let recovery = StubAgentReportTranscriptRecovery(
+            reply: nil,
+            transcriptBinding: fallbackBinding
+        )
+        let store = AgentReportCaptureStore(policy: .enabled, transcriptRecovery: recovery)
+        let captureRequest = request(
+            raw: "exact raw Stop body",
+            transcriptPath: recordedHint
+        )
+
+        #expect(await store.capture(
+            captureRequest,
+            target: target(recordedTranscriptPathHint: recordedHint)
+        ) == .captured)
+        let report = try #require(await store.latestReport(runtimeSurfaceID: surfaceID))
+        #expect(report.transcriptBinding == fallbackBinding)
+        #expect(report.finalReply == "exact raw Stop body")
+    }
+
+    @Test("structured recovery retains the binding returned with its body")
+    func structuredRecoveryUsesResolverBinding() async throws {
+        let fallbackBinding = AgentReportTranscriptBinding(testIdentity: "fallback-f1")
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(
+                reply: "structured fallback body",
+                transcriptBinding: fallbackBinding
+            )
+        )
+
+        #expect(await store.capture(
+            request(raw: nil, transcriptPath: nil),
+            target: target(recordedTranscriptPathHint: nil)
+        ) == .captured)
+        let report = try #require(await store.latestReport(runtimeSurfaceID: surfaceID))
+        #expect(report.transcriptBinding == fallbackBinding)
+        #expect(report.captureSource == .structuredTranscript)
+        #expect(report.finalReply == "structured fallback body")
+    }
+
+    @Test("resolver failure cannot create a report without transcript authority")
+    func resolverFailureHasNoBindingAuthorization() async {
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(
+                reply: nil,
+                isPrimarySession: false
+            )
+        )
+
+        #expect(await store.capture(
+            request(raw: "must not retain", transcriptPath: nil),
+            target: target(recordedTranscriptPathHint: nil)
+        ) == .rejected(.nonPrimarySession))
+        #expect(await store.latestReport(runtimeSurfaceID: surfaceID) == nil)
+    }
+
+    @Test("copy requires exact non-null resolver authority equality")
+    func copyRequiresResolverBindingEquality() async throws {
+        let fallbackBinding = AgentReportTranscriptBinding(testIdentity: "fallback-f1")
+        let replacementBinding = AgentReportTranscriptBinding(testIdentity: "fallback-f2")
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(
+                reply: nil,
+                transcriptBinding: fallbackBinding
+            )
+        )
+        #expect(await store.capture(
+            request(raw: "private fallback body", transcriptPath: nil),
+            target: target(recordedTranscriptPathHint: nil)
+        ) == .captured)
+
+        let accepted = try #require(await store.authorizedReport(
+            runtimeSurfaceID: surfaceID,
+            capturePolicyRevision: 1,
+            availabilityRevision: AgentReportAvailabilityRevisionAuthority().advance(),
+            authorize: { context in
+                guard context.transcriptBinding == fallbackBinding else { return nil }
+                return context.writeAuthorizationReceipt(
+                    panelInstanceID: ObjectIdentifier(store)
+                )
+            }
+        ))
+        #expect(accepted.body == "private fallback body")
+        #expect(accepted.receipt.transcriptBinding == fallbackBinding)
+
+        #expect(await store.authorizedReport(
+            runtimeSurfaceID: surfaceID,
+            capturePolicyRevision: 1,
+            availabilityRevision: AgentReportAvailabilityRevisionAuthority().advance(),
+            authorize: { context in
+                guard context.transcriptBinding == replacementBinding else { return nil }
+                return context.writeAuthorizationReceipt(
+                    panelInstanceID: ObjectIdentifier(store)
+                )
+            }
+        ) == nil)
     }
 
     @Test("oversized extracted report is rejected before actor storage")
@@ -207,7 +310,7 @@ struct AgentReportCaptureStoreTests {
             await store.capture(
                 older,
                 target: target(turnID: "turn-1"),
-                revalidateTarget: { target(turnID: "turn-2") }
+                revalidateTarget: { _ in target(turnID: "turn-2") }
             ) == .rejected(.identityMismatch)
         )
         #expect(await store.latestReport(runtimeSurfaceID: surfaceID)?.finalReply == "newest")
@@ -221,7 +324,7 @@ struct AgentReportCaptureStoreTests {
             await store.capture(
                 request(raw: nil),
                 target: target(),
-                revalidateTarget: { target() }
+                revalidateTarget: { _ in target() }
             )
         }
         await recovery.waitUntilRecoveryStarted()
@@ -241,7 +344,7 @@ struct AgentReportCaptureStoreTests {
             await store.capture(
                 request(raw: nil),
                 target: target(),
-                revalidateTarget: { target() }
+                revalidateTarget: { _ in target() }
             )
         }
         await recovery.waitUntilRecoveryStarted()
@@ -263,7 +366,7 @@ struct AgentReportCaptureStoreTests {
             await store.capture(
                 request(raw: nil),
                 target: target(),
-                revalidateTarget: { await targetBox.value }
+                revalidateTarget: { _ in await targetBox.value }
             )
         }
         await recovery.waitUntilRecoveryStarted()
@@ -274,32 +377,33 @@ struct AgentReportCaptureStoreTests {
         #expect(await store.latestReport(runtimeSurfaceID: surfaceID) == nil)
     }
 
-    @Test("capture transcript binding is immutable but canonical spelling is accepted")
+    @Test("recorded transcript hint or active-entry revision mutation rejects commit")
     func captureTranscriptBindingIsImmutable() async {
-        let canonicalStore = AgentReportCaptureStore(
+        let hintMutationStore = AgentReportCaptureStore(
             policy: .enabled,
             transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
         )
-        let canonicalTarget = target(transcriptPath: "/synthetic/session-1.jsonl")
-        let alternateSpellingTarget = target(
-            transcriptPath: "/synthetic/nested/../session-1.jsonl"
-        )
-        #expect(await canonicalStore.capture(
-            request(raw: "canonical"),
-            target: canonicalTarget,
-            revalidateTarget: { alternateSpellingTarget }
-        ) == .captured)
-
-        let changedStore = AgentReportCaptureStore(
-            policy: .enabled,
-            transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
-        )
-        #expect(await changedStore.capture(
+        let originalTarget = target(recordedTranscriptPathHint: "/synthetic/session-1.jsonl")
+        #expect(await hintMutationStore.capture(
             request(raw: "must not commit"),
-            target: canonicalTarget,
-            revalidateTarget: { target(transcriptPath: "/synthetic/session-2.jsonl") }
+            target: originalTarget,
+            revalidateTarget: { _ in
+                target(recordedTranscriptPathHint: "/synthetic/session-2.jsonl")
+            }
         ) == .rejected(.inaccessibleSurface))
-        #expect(await changedStore.latestReport(runtimeSurfaceID: surfaceID) == nil)
+
+        let revisionMutationStore = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
+        )
+        #expect(await revisionMutationStore.capture(
+            request(raw: "must not commit"),
+            target: originalTarget,
+            revalidateTarget: { _ in
+                target(authorityRevision: UUID())
+            }
+        ) == .rejected(.inaccessibleSurface))
+        #expect(await revisionMutationStore.latestReport(runtimeSurfaceID: surfaceID) == nil)
     }
 
     @Test("later receipt wins when an older transcript recovery finishes late")
@@ -310,7 +414,7 @@ struct AgentReportCaptureStoreTests {
             await store.capture(
                 request(raw: nil, turnID: "turn-1", completionTimestamp: 9_999),
                 target: target(turnID: "turn-1"),
-                revalidateTarget: { target(turnID: "turn-1") }
+                revalidateTarget: { _ in target(turnID: "turn-1") }
             )
         }
         await recovery.waitUntilRecoveryStarted()
@@ -319,7 +423,7 @@ struct AgentReportCaptureStoreTests {
             await store.capture(
                 request(raw: "newer exact reply", turnID: "turn-2", completionTimestamp: 1),
                 target: target(turnID: "turn-2"),
-                revalidateTarget: { target(turnID: "turn-2") }
+                revalidateTarget: { _ in target(turnID: "turn-2") }
             ) == .captured
         )
         await recovery.resumeRecovery()
@@ -378,7 +482,7 @@ struct AgentReportCaptureStoreTests {
             await store.capture(
                 request(raw: nil, turnID: "turn-2"),
                 target: target(turnID: "turn-2"),
-                revalidateTarget: { target(turnID: "turn-2") }
+                revalidateTarget: { _ in target(turnID: "turn-2") }
             )
         }
         await recovery.waitUntilRecoveryStarted()
@@ -601,7 +705,8 @@ struct AgentReportCaptureStoreTests {
             agentSessionID: longRequest.agentSessionID,
             turnID: longRequest.turnID,
             lifecycleToken: UUID(),
-            transcriptPath: longRequest.transcriptPath
+            recordedTranscriptPathHint: longRequest.transcriptPath,
+            authorityRevision: UUID()
         )
         let shortIdentity = shortRequest.duplicateIdentity
         let longIdentity = longRequest.duplicateIdentity
@@ -611,14 +716,23 @@ struct AgentReportCaptureStoreTests {
             target: longTarget,
             reply: String(repeating: "secret", count: 10_000)
         )
+        let validatedAuthority = ValidatedCodexTranscriptAuthority(
+            transcriptBinding: transcriptBinding
+        )
+        let recoveryResult = AgentReportRecoveryResult(
+            body: "private recovery body",
+            transcriptBinding: transcriptBinding
+        )
 
         let descriptions = [
             shortRequest.description, shortRequest.debugDescription,
             shortTarget.description, shortTarget.debugDescription,
             shortIdentity.description, shortIdentity.debugDescription,
             shortReport.description, shortReport.debugDescription,
-            shortReport.transcriptBinding?.description ?? "",
-            longReport.transcriptBinding?.debugDescription ?? "",
+            shortReport.transcriptBinding.description,
+            longReport.transcriptBinding.debugDescription,
+            validatedAuthority.description, validatedAuthority.debugDescription,
+            recoveryResult.description, recoveryResult.debugDescription,
         ]
         for description in descriptions {
             #expect(!description.contains("session-1"))
@@ -641,7 +755,8 @@ struct AgentReportCaptureStoreTests {
     private func request(
         raw: String?,
         turnID: String = "turn-1",
-        completionTimestamp: TimeInterval = 100
+        completionTimestamp: TimeInterval = 100,
+        transcriptPath: String? = "/synthetic/session-1.jsonl"
     ) -> AgentReportCaptureRequest {
         AgentReportCaptureRequest(
             provider: .codex,
@@ -650,7 +765,7 @@ struct AgentReportCaptureStoreTests {
             agentSessionID: "session-1",
             turnID: turnID,
             completionKind: .primaryStop,
-            transcriptPath: "/synthetic/session-1.jsonl",
+            transcriptPath: transcriptPath,
             rawFinalReply: raw,
             completionTimestamp: Date(timeIntervalSince1970: completionTimestamp)
         )
@@ -661,7 +776,8 @@ struct AgentReportCaptureStoreTests {
         surfaceID: UUID? = nil,
         sessionID: String = "session-1",
         turnID: String = "turn-1",
-        transcriptPath: String = "/synthetic/session-1.jsonl"
+        recordedTranscriptPathHint: String? = "/synthetic/session-1.jsonl",
+        authorityRevision: UUID? = nil
     ) -> AgentReportCaptureTarget {
         AgentReportCaptureTarget(
             workspaceID: workspaceID ?? self.workspaceID,
@@ -670,7 +786,8 @@ struct AgentReportCaptureStoreTests {
             agentSessionID: sessionID,
             turnID: turnID,
             lifecycleToken: lifecycleToken,
-            transcriptPath: transcriptPath
+            recordedTranscriptPathHint: recordedTranscriptPathHint,
+            authorityRevision: authorityRevision ?? self.authorityRevision
         )
     }
 
@@ -689,7 +806,8 @@ struct AgentReportCaptureStoreTests {
             turnID: request.turnID,
             completionKind: request.completionKind,
             lifecycleToken: target.lifecycleToken,
-            transcriptBinding: target.transcriptBinding,
+            transcriptBinding: transcriptBinding,
+            authorityRevision: target.authorityRevision,
             finalReply: reply,
             captureSource: .rawHook,
             capturedAt: Date(timeIntervalSince1970: 1),
@@ -957,52 +1075,72 @@ struct CodexFinalReplyExtractorTests {
 private actor StubAgentReportTranscriptRecovery: AgentReportTranscriptRecovering {
     private let reply: String?
     private let primarySession: Bool
+    private let transcriptBinding: AgentReportTranscriptBinding
     private(set) var callCount = 0
     private(set) var primaryValidationCallCount = 0
     private(set) var lastSessionID: String?
     private(set) var lastTurnID: String?
 
-    init(reply: String?, isPrimarySession: Bool = true) {
+    init(
+        reply: String?,
+        isPrimarySession: Bool = true,
+        transcriptBinding: AgentReportTranscriptBinding = AgentReportTranscriptBinding(
+            testIdentity: "fixture-transcript-f1"
+        )
+    ) {
         self.reply = reply
         self.primarySession = isPrimarySession
+        self.transcriptBinding = transcriptBinding
     }
 
-    func isPrimaryCodexSession(recordedPath: String?, sessionID: String) async -> Bool {
+    func validatePrimaryCodexSession(
+        recordedPath: String?,
+        sessionID: String
+    ) async -> ValidatedCodexTranscriptAuthority? {
         primaryValidationCallCount += 1
-        return primarySession
+        guard primarySession else { return nil }
+        return ValidatedCodexTranscriptAuthority(transcriptBinding: transcriptBinding)
     }
 
     func recoverCodexFinalReply(
         recordedPath: String?,
         sessionID: String,
         turnID: String
-    ) async -> String? {
+    ) async -> AgentReportRecoveryResult? {
         callCount += 1
         lastSessionID = sessionID
         lastTurnID = turnID
-        return reply
+        return reply.map {
+            AgentReportRecoveryResult(body: $0, transcriptBinding: transcriptBinding)
+        }
     }
 }
 
 private actor SuspendedAgentReportTranscriptRecovery: AgentReportTranscriptRecovering {
     private let reply: String
+    private let transcriptBinding = AgentReportTranscriptBinding(
+        testIdentity: "suspended-fixture-transcript"
+    )
     private var started = false
     private var startWaiters: [CheckedContinuation<Void, Never>] = []
-    private var recoveryContinuation: CheckedContinuation<String?, Never>?
+    private var recoveryContinuation: CheckedContinuation<AgentReportRecoveryResult?, Never>?
 
     init(reply: String) {
         self.reply = reply
     }
 
-    func isPrimaryCodexSession(recordedPath: String?, sessionID: String) async -> Bool {
-        true
+    func validatePrimaryCodexSession(
+        recordedPath: String?,
+        sessionID: String
+    ) async -> ValidatedCodexTranscriptAuthority? {
+        ValidatedCodexTranscriptAuthority(transcriptBinding: transcriptBinding)
     }
 
     func recoverCodexFinalReply(
         recordedPath: String?,
         sessionID: String,
         turnID: String
-    ) async -> String? {
+    ) async -> AgentReportRecoveryResult? {
         started = true
         let waiters = startWaiters
         startWaiters.removeAll()
@@ -1020,7 +1158,10 @@ private actor SuspendedAgentReportTranscriptRecovery: AgentReportTranscriptRecov
     }
 
     func resumeRecovery() {
-        recoveryContinuation?.resume(returning: reply)
+        recoveryContinuation?.resume(returning: AgentReportRecoveryResult(
+            body: reply,
+            transcriptBinding: transcriptBinding
+        ))
         recoveryContinuation = nil
     }
 }
