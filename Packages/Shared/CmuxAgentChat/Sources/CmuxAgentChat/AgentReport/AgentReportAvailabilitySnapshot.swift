@@ -6,6 +6,9 @@ import Foundation
 /// bodies, provider/session/turn metadata, timestamps, and capture diagnostics
 /// remain actor-owned and never enter observation payloads.
 public struct AgentReportAvailabilitySnapshot: Sendable, Equatable {
+    /// Monotonic content-free ordering authority for this exact snapshot.
+    public let revision: AgentReportAvailabilityRevision
+
     /// Whether the process-local capture policy is currently enabled.
     public let isCaptureEnabled: Bool
 
@@ -20,12 +23,15 @@ public struct AgentReportAvailabilitySnapshot: Sendable, Equatable {
     /// Creates a content-free availability snapshot.
     ///
     /// - Parameters:
+    ///   - revision: Monotonic snapshot ordering authority.
     ///   - isCaptureEnabled: Current process-local capture policy.
     ///   - availableRuntimeSurfaceIDs: Exact surfaces with available reports.
     public init(
+        revision: AgentReportAvailabilityRevision,
         isCaptureEnabled: Bool,
         availableRuntimeSurfaceIDs: Set<UUID>
     ) {
+        self.revision = revision
         self.isCaptureEnabled = isCaptureEnabled
         self.availableRuntimeSurfaceIDs = availableRuntimeSurfaceIDs
     }

@@ -2,6 +2,7 @@ import Foundation
 import Testing
 import Darwin
 import CMUXAgentLaunch
+import CmuxAgentChat
 
 #if canImport(cmux_DEV)
 @testable import cmux_DEV
@@ -321,13 +322,30 @@ struct AgentChatSessionRegistryHookStoreTests {
         ))
         let service = AgentChatTranscriptService(registry: registry)
 
-        #expect(await registry.agentReportCaptureBinding(
+        let captureBinding = try #require(await registry.agentReportCaptureBinding(
             workspaceID: captureWorkspaceID,
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: turnID,
             requestedTranscriptPath: transcriptPath
-        ) != nil)
+        ))
+        let transcriptBinding = captureBinding.transcriptBinding
+        #expect(
+            transcriptBinding
+                == AgentReportTranscriptBinding(validatedTranscriptPath: transcriptPath)
+        )
+        let alternateSpelling = home
+            .appendingPathComponent("spelling", isDirectory: true)
+            .appendingPathComponent("..", isDirectory: true)
+            .appendingPathComponent("transferred-rollout.jsonl")
+            .path
+        #expect(await registry.agentReportCaptureBinding(
+            workspaceID: captureWorkspaceID,
+            surfaceID: surfaceID,
+            sessionID: sessionID,
+            turnID: turnID,
+            requestedTranscriptPath: alternateSpelling
+        )?.transcriptBinding == transcriptBinding)
 
         service.updateSessionWorkspace(sessionID: sessionID, workspaceID: displayWorkspaceID)
         service.updateSessionWorkspace(sessionID: sessionID, workspaceID: displayWorkspaceID)
@@ -343,32 +361,37 @@ struct AgentChatSessionRegistryHookStoreTests {
             captureWorkspaceID: captureWorkspaceID,
             surfaceID: surfaceID,
             sessionID: sessionID,
-            turnID: turnID
+            turnID: turnID,
+            transcriptBinding: transcriptBinding
         )?.transcriptPath == transcriptPath)
 
         #expect(await registry.agentReportCopyBinding(
             captureWorkspaceID: displayWorkspaceID,
             surfaceID: surfaceID,
             sessionID: sessionID,
-            turnID: turnID
+            turnID: turnID,
+            transcriptBinding: transcriptBinding
         ) == nil)
         #expect(await registry.agentReportCopyBinding(
             captureWorkspaceID: captureWorkspaceID,
             surfaceID: UUID().uuidString,
             sessionID: sessionID,
-            turnID: turnID
+            turnID: turnID,
+            transcriptBinding: transcriptBinding
         ) == nil)
         #expect(await registry.agentReportCopyBinding(
             captureWorkspaceID: captureWorkspaceID,
             surfaceID: surfaceID,
             sessionID: "different-session",
-            turnID: turnID
+            turnID: turnID,
+            transcriptBinding: transcriptBinding
         ) == nil)
         #expect(await registry.agentReportCopyBinding(
             captureWorkspaceID: captureWorkspaceID,
             surfaceID: surfaceID,
             sessionID: sessionID,
-            turnID: "different-turn"
+            turnID: "different-turn",
+            transcriptBinding: transcriptBinding
         ) == nil)
 
         service.noteHookEvent(WorkstreamEvent(
@@ -383,7 +406,8 @@ struct AgentChatSessionRegistryHookStoreTests {
             captureWorkspaceID: captureWorkspaceID,
             surfaceID: surfaceID,
             sessionID: sessionID,
-            turnID: turnID
+            turnID: turnID,
+            transcriptBinding: transcriptBinding
         ) == nil)
 
         let wrongProviderRegistry = AgentChatSessionRegistry(
@@ -401,8 +425,59 @@ struct AgentChatSessionRegistryHookStoreTests {
             captureWorkspaceID: captureWorkspaceID,
             surfaceID: surfaceID,
             sessionID: sessionID,
-            turnID: turnID
+            turnID: turnID,
+            transcriptBinding: transcriptBinding
         ) == nil)
+    }
+
+    @MainActor
+    @Test func reportCopyBindingRejectsTranscriptMutationDuringLookup() async throws {
+        let captureWorkspaceID = UUID().uuidString
+        let surfaceID = UUID().uuidString
+        let sessionID = "synthetic-binding-mutation-session"
+        let turnID = "synthetic-binding-mutation-turn"
+        let firstPath = "/synthetic/binding-one.jsonl"
+        let secondPath = "/synthetic/binding-two.jsonl"
+        let firstEntry = AgentChatHookSessionStore.Entry(
+            sessionID: sessionID,
+            workspaceID: captureWorkspaceID,
+            surfaceID: surfaceID,
+            workingDirectory: nil,
+            transcriptPath: firstPath,
+            pid: nil,
+            updatedAt: Date(timeIntervalSince1970: 1),
+            lastPromptTurnID: turnID
+        )
+        let gate = AgentReportActiveEntryMutationGate(firstEntry: firstEntry)
+        let registry = AgentChatSessionRegistry(
+            agentReportActiveEntryReader: { _, _, _, _ in
+                await gate.read()
+            }
+        )
+        let lookup = Task { @MainActor in
+            await registry.agentReportCopyBinding(
+                captureWorkspaceID: captureWorkspaceID,
+                surfaceID: surfaceID,
+                sessionID: sessionID,
+                turnID: turnID,
+                transcriptBinding: AgentReportTranscriptBinding(
+                    validatedTranscriptPath: firstPath
+                )
+            )
+        }
+        await gate.waitUntilSecondReadStarted()
+        await gate.resumeSecondRead(with: AgentChatHookSessionStore.Entry(
+            sessionID: sessionID,
+            workspaceID: captureWorkspaceID,
+            surfaceID: surfaceID,
+            workingDirectory: nil,
+            transcriptPath: secondPath,
+            pid: nil,
+            updatedAt: Date(timeIntervalSince1970: 2),
+            lastPromptTurnID: turnID
+        ))
+
+        #expect(await lookup.value == nil)
     }
 
     @MainActor
@@ -655,5 +730,39 @@ struct AgentChatSessionRegistryHookStoreTests {
         ]
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
         try data.write(to: directory.appendingPathComponent("codex-hook-sessions.json"))
+    }
+}
+
+private actor AgentReportActiveEntryMutationGate {
+    private let firstEntry: AgentChatHookSessionStore.Entry
+    private var readCount = 0
+    private var secondReadStarted = false
+    private var secondReadStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private var secondReadContinuation: CheckedContinuation<
+        AgentChatHookSessionStore.Entry?, Never
+    >?
+
+    init(firstEntry: AgentChatHookSessionStore.Entry) {
+        self.firstEntry = firstEntry
+    }
+
+    func read() async -> AgentChatHookSessionStore.Entry? {
+        readCount += 1
+        if readCount == 1 { return firstEntry }
+        secondReadStarted = true
+        let waiters = secondReadStartWaiters
+        secondReadStartWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        return await withCheckedContinuation { secondReadContinuation = $0 }
+    }
+
+    func waitUntilSecondReadStarted() async {
+        if secondReadStarted { return }
+        await withCheckedContinuation { secondReadStartWaiters.append($0) }
+    }
+
+    func resumeSecondRead(with entry: AgentChatHookSessionStore.Entry?) {
+        secondReadContinuation?.resume(returning: entry)
+        secondReadContinuation = nil
     }
 }

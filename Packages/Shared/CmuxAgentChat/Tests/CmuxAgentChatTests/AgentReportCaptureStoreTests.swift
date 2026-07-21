@@ -51,6 +51,12 @@ struct AgentReportCaptureStoreTests {
         #expect(report.captureSource == .rawHook)
         #expect(report.capturedAt == capturedAt)
         #expect(report.stableSurfaceID == stableSurfaceID)
+        #expect(
+            report.transcriptBinding
+                == AgentReportTranscriptBinding(
+                    validatedTranscriptPath: "/synthetic/session-1.jsonl"
+                )
+        )
         #expect(!report.description.contains("Synthetic report"))
         #expect(!request(raw: exact).description.contains("Synthetic report"))
         #expect(await recovery.callCount == 0)
@@ -268,6 +274,34 @@ struct AgentReportCaptureStoreTests {
         #expect(await store.latestReport(runtimeSurfaceID: surfaceID) == nil)
     }
 
+    @Test("capture transcript binding is immutable but canonical spelling is accepted")
+    func captureTranscriptBindingIsImmutable() async {
+        let canonicalStore = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
+        )
+        let canonicalTarget = target(transcriptPath: "/synthetic/session-1.jsonl")
+        let alternateSpellingTarget = target(
+            transcriptPath: "/synthetic/nested/../session-1.jsonl"
+        )
+        #expect(await canonicalStore.capture(
+            request(raw: "canonical"),
+            target: canonicalTarget,
+            revalidateTarget: { alternateSpellingTarget }
+        ) == .captured)
+
+        let changedStore = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
+        )
+        #expect(await changedStore.capture(
+            request(raw: "must not commit"),
+            target: canonicalTarget,
+            revalidateTarget: { target(transcriptPath: "/synthetic/session-2.jsonl") }
+        ) == .rejected(.inaccessibleSurface))
+        #expect(await changedStore.latestReport(runtimeSurfaceID: surfaceID) == nil)
+    }
+
     @Test("later receipt wins when an older transcript recovery finishes late")
     func monotonicReceiptOrderingRejectsLateRecovery() async {
         let recovery = SuspendedAgentReportTranscriptRecovery(reply: "older recovered reply")
@@ -364,23 +398,62 @@ struct AgentReportCaptureStoreTests {
         #expect(await store.capture(request(raw: exact), target: target()) == .captured)
         let recoveryCallsBeforeCopy = await recovery.callCount
 
-        let copied = await store.authorizedReportBody(
+        let authorized = try #require(await store.authorizedReport(
             runtimeSurfaceID: surfaceID,
+            capturePolicyRevision: 7,
+            availabilityRevision: AgentReportAvailabilityRevisionAuthority().advance(),
             authorize: { context in
                 #expect(!String(reflecting: context).contains(exact))
                 #expect(!Mirror(reflecting: context).children.contains { $0.label == "finalReply" })
-                return context.workspaceID == self.workspaceID
+                guard context.workspaceID == self.workspaceID
                     && context.runtimeSurfaceID == self.surfaceID
                     && context.agentSessionID == "session-1"
                     && context.turnID == "turn-1"
-                    && context.lifecycleToken == self.lifecycleToken
+                    && context.lifecycleToken == self.lifecycleToken else {
+                    return nil
+                }
+                return context.writeAuthorizationReceipt(
+                    panelInstanceID: ObjectIdentifier(store)
+                )
             }
-        )
+        ))
 
-        #expect(copied == exact)
-        #expect(copied?.hasSuffix("no-extra-newline") == true)
+        #expect(authorized.body == exact)
+        #expect(authorized.body.hasSuffix("no-extra-newline"))
+        #expect(authorized.receipt.capturePolicyRevision == 7)
+        #expect(authorized.receipt.isCurrentReport)
+        #expect(String(describing: authorized.receipt) == "AgentReportWriteAuthorizationReceipt")
+        let receiptReflection = String(reflecting: authorized.receipt)
+        #expect(!receiptReflection.contains("/synthetic/session-1.jsonl"))
         #expect(!exact.contains(workspaceID.uuidString))
         #expect(await recovery.callCount == recoveryCallsBeforeCopy)
+    }
+
+    @Test("a newer report synchronously revokes an already returned write receipt")
+    func newerReportInvalidatesReturnedReceipt() async throws {
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
+        )
+        #expect(await store.capture(request(raw: "old body"), target: target()) == .captured)
+        let authorized = try #require(await store.authorizedReport(
+            runtimeSurfaceID: surfaceID,
+            capturePolicyRevision: 3,
+            availabilityRevision: AgentReportAvailabilityRevisionAuthority().advance(),
+            authorize: { context in
+                context.writeAuthorizationReceipt(panelInstanceID: ObjectIdentifier(store))
+            }
+        ))
+        #expect(authorized.receipt.isCurrentReport)
+
+        #expect(await store.capture(
+            request(raw: "new body", turnID: "turn-2", completionTimestamp: 200),
+            target: target(turnID: "turn-2")
+        ) == .captured)
+
+        #expect(!authorized.receipt.isCurrentReport)
+        #expect(authorized.body == "old body")
+        #expect(await store.latestReport(runtimeSurfaceID: surfaceID)?.finalReply == "new body")
     }
 
     @Test("copy lookup cannot cross surfaces or bypass fresh authority")
@@ -392,10 +465,22 @@ struct AgentReportCaptureStoreTests {
         #expect(await store.capture(request(raw: "private body"), target: target()) == .captured)
 
         #expect(
-            await store.authorizedReportBody(runtimeSurfaceID: UUID(), authorize: { _ in true }) == nil
+            await store.authorizedReport(
+                runtimeSurfaceID: UUID(),
+                capturePolicyRevision: 0,
+                availabilityRevision: AgentReportAvailabilityRevisionAuthority().advance(),
+                authorize: { context in
+                    context.writeAuthorizationReceipt(panelInstanceID: ObjectIdentifier(store))
+                }
+            ) == nil
         )
         #expect(
-            await store.authorizedReportBody(runtimeSurfaceID: surfaceID, authorize: { _ in false }) == nil
+            await store.authorizedReport(
+                runtimeSurfaceID: surfaceID,
+                capturePolicyRevision: 0,
+                availabilityRevision: AgentReportAvailabilityRevisionAuthority().advance(),
+                authorize: { _ in nil }
+            ) == nil
         )
     }
 
@@ -412,7 +497,16 @@ struct AgentReportCaptureStoreTests {
         #expect(await invalidated.capture(request(raw: "old"), target: target()) == .captured)
         await invalidated.invalidatePendingCapture(runtimeSurfaceID: surfaceID)
         #expect(
-            await invalidated.authorizedReportBody(runtimeSurfaceID: surfaceID, authorize: { _ in true }) == nil
+            await invalidated.authorizedReport(
+                runtimeSurfaceID: surfaceID,
+                capturePolicyRevision: 0,
+                availabilityRevision: AgentReportAvailabilityRevisionAuthority().advance(),
+                authorize: { context in
+                    context.writeAuthorizationReceipt(
+                        panelInstanceID: ObjectIdentifier(invalidated)
+                    )
+                }
+            ) == nil
         )
         #expect(await invalidated.latestReport(runtimeSurfaceID: surfaceID)?.finalReply == "old")
 
@@ -420,18 +514,39 @@ struct AgentReportCaptureStoreTests {
         #expect(await purged.capture(request(raw: "old"), target: target()) == .captured)
         await purged.purge(runtimeSurfaceID: surfaceID)
         #expect(
-            await purged.authorizedReportBody(runtimeSurfaceID: surfaceID, authorize: { _ in true }) == nil
+            await purged.authorizedReport(
+                runtimeSurfaceID: surfaceID,
+                capturePolicyRevision: 0,
+                availabilityRevision: AgentReportAvailabilityRevisionAuthority().advance(),
+                authorize: { context in
+                    context.writeAuthorizationReceipt(panelInstanceID: ObjectIdentifier(purged))
+                }
+            ) == nil
         )
 
         let disabled = makeStore()
         #expect(await disabled.capture(request(raw: "old"), target: target()) == .captured)
         await disabled.setPolicy(.disabled)
         #expect(
-            await disabled.authorizedReportBody(runtimeSurfaceID: surfaceID, authorize: { _ in true }) == nil
+            await disabled.authorizedReport(
+                runtimeSurfaceID: surfaceID,
+                capturePolicyRevision: 0,
+                availabilityRevision: AgentReportAvailabilityRevisionAuthority().advance(),
+                authorize: { context in
+                    context.writeAuthorizationReceipt(panelInstanceID: ObjectIdentifier(disabled))
+                }
+            ) == nil
         )
         await disabled.setPolicy(.enabled)
         #expect(
-            await disabled.authorizedReportBody(runtimeSurfaceID: surfaceID, authorize: { _ in true }) == nil
+            await disabled.authorizedReport(
+                runtimeSurfaceID: surfaceID,
+                capturePolicyRevision: 0,
+                availabilityRevision: AgentReportAvailabilityRevisionAuthority().advance(),
+                authorize: { context in
+                    context.writeAuthorizationReceipt(panelInstanceID: ObjectIdentifier(disabled))
+                }
+            ) == nil
         )
     }
 
@@ -450,6 +565,7 @@ struct AgentReportCaptureStoreTests {
         let privateBody = "PRIVATE-AVAILABILITY-SENTINEL"
         #expect(await store.capture(request(raw: privateBody), target: target()) == .captured)
         let captured = try #require(await iterator.next())
+        #expect(captured.revision > initial.revision)
         #expect(captured.hasReport(runtimeSurfaceID: surfaceID))
         #expect(!String(describing: captured).contains(privateBody))
         #expect(!Mirror(reflecting: captured).children.contains { child in
@@ -458,6 +574,7 @@ struct AgentReportCaptureStoreTests {
 
         await store.invalidatePendingCapture(runtimeSurfaceID: surfaceID)
         let invalidated = try #require(await iterator.next())
+        #expect(invalidated.revision > captured.revision)
         #expect(!invalidated.hasReport(runtimeSurfaceID: surfaceID))
         #expect(await store.latestReport(runtimeSurfaceID: surfaceID)?.finalReply == privateBody)
     }
@@ -500,6 +617,8 @@ struct AgentReportCaptureStoreTests {
             shortTarget.description, shortTarget.debugDescription,
             shortIdentity.description, shortIdentity.debugDescription,
             shortReport.description, shortReport.debugDescription,
+            shortReport.transcriptBinding?.description ?? "",
+            longReport.transcriptBinding?.debugDescription ?? "",
         ]
         for description in descriptions {
             #expect(!description.contains("session-1"))
@@ -541,7 +660,8 @@ struct AgentReportCaptureStoreTests {
         workspaceID: UUID? = nil,
         surfaceID: UUID? = nil,
         sessionID: String = "session-1",
-        turnID: String = "turn-1"
+        turnID: String = "turn-1",
+        transcriptPath: String = "/synthetic/session-1.jsonl"
     ) -> AgentReportCaptureTarget {
         AgentReportCaptureTarget(
             workspaceID: workspaceID ?? self.workspaceID,
@@ -550,7 +670,7 @@ struct AgentReportCaptureStoreTests {
             agentSessionID: sessionID,
             turnID: turnID,
             lifecycleToken: lifecycleToken,
-            transcriptPath: "/synthetic/session-1.jsonl"
+            transcriptPath: transcriptPath
         )
     }
 
@@ -560,6 +680,7 @@ struct AgentReportCaptureStoreTests {
         reply: String
     ) -> AgentReport {
         AgentReport(
+            reportIdentity: UUID(),
             provider: request.provider,
             runtimeSurfaceID: request.runtimeSurfaceID,
             stableSurfaceID: target.stableSurfaceID,
@@ -568,6 +689,7 @@ struct AgentReportCaptureStoreTests {
             turnID: request.turnID,
             completionKind: request.completionKind,
             lifecycleToken: target.lifecycleToken,
+            transcriptBinding: target.transcriptBinding,
             finalReply: reply,
             captureSource: .rawHook,
             capturedAt: Date(timeIntervalSince1970: 1),

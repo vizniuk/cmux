@@ -131,8 +131,17 @@ class TerminalController {
 #if DEBUG
     /// Test-only content-free capture-result observation seam.
     @MainActor var agentReportCaptureResultObserverForTesting: ((AgentReportCaptureResult) -> Void)?
-    /// Test-only content-free notification after an actor purge completes.
-    @MainActor var agentReportPurgeObserverForTesting: ((UUID) -> Void)?
+    private var agentReportPurgeTasksForTesting: [
+        ObjectIdentifier: [UUID: Task<Void, Never>]
+    ] = [:]
+    private var agentReportPurgeObserversForTesting: [
+        UUID: (
+            storeID: ObjectIdentifier,
+            runtimeSurfaceID: UUID,
+            eventCount: Int,
+            continuation: AsyncStream<UUID>.Continuation
+        )
+    ] = [:]
 #endif
     // Sendable value type; injected at construction so socket auth never reaches a global.
     nonisolated let passwordStore: SocketControlPasswordStore
@@ -5720,13 +5729,13 @@ class TerminalController {
     ///   - context: Body-free capture-time identity and lifecycle authority.
     ///   - representedWorkspaceID: Exact active or menu/button workspace.
     ///   - representedSurfaceID: Exact active or menu/button runtime surface.
-    /// - Returns: `true` only while the original report tuple remains current.
+    /// - Returns: A body-free receipt only while the original tuple is current.
     @MainActor
     func authorizesAgentReportCopy(
         _ context: AgentReportCopyAuthorizationContext,
         representedWorkspaceID: UUID,
         representedSurfaceID: UUID
-    ) async -> Bool {
+    ) async -> AgentReportWriteAuthorizationReceipt? {
         guard context.provider == .codex,
               context.completionKind == .primaryStop,
               context.runtimeSurfaceID == representedSurfaceID,
@@ -5740,14 +5749,16 @@ class TerminalController {
               terminalPanel.stableSurfaceId == context.stableSurfaceID,
               let service = agentChatTranscriptService,
               service.agentReportLifecycleToken(for: representedSurfaceID) == context.lifecycleToken else {
-            return false
+            return nil
         }
-        guard await service.registry.agentReportCopyBinding(
+        guard let binding = await service.registry.agentReportCopyBinding(
             captureWorkspaceID: context.workspaceID.uuidString,
             surfaceID: context.runtimeSurfaceID.uuidString,
             sessionID: context.agentSessionID,
-            turnID: context.turnID
-        ) != nil,
+            turnID: context.turnID,
+            transcriptBinding: context.transcriptBinding
+        ),
+              binding.transcriptBinding == context.transcriptBinding,
               service.agentReportLifecycleToken(for: representedSurfaceID) == context.lifecycleToken,
               let currentManager = AppDelegate.shared?.tabManagerFor(tabId: representedWorkspaceID)
                 ?? (targetManager.tabs.contains(where: { $0.id == representedWorkspaceID })
@@ -5758,9 +5769,11 @@ class TerminalController {
               currentWorkspace.surfaceIdFromPanelId(representedSurfaceID) != nil,
               currentWorkspace.panels[representedSurfaceID] === terminalPanel,
               terminalPanel.stableSurfaceId == context.stableSurfaceID else {
-            return false
+            return nil
         }
-        return true
+        return context.writeAuthorizationReceipt(
+            panelInstanceID: ObjectIdentifier(terminalPanel)
+        )
     }
 
     /// Purges completed and in-flight report state for a truly closed surface.
@@ -5774,17 +5787,94 @@ class TerminalController {
         agentChatTranscriptService?.rotateAgentReportSurfaceLifecycle(
             runtimeSurfaceID: runtimeSurfaceID
         )
-        AppDelegate.shared?.revokeAgentReportAvailability(runtimeSurfaceID: runtimeSurfaceID)
-        guard let store = agentReportCaptureStore else { return }
-        Task { [weak self] in
-            await store.purge(runtimeSurfaceID: runtimeSurfaceID)
+        let store = agentReportCaptureStore
+        let revisionBarrier = store?.advanceAvailabilityRevisionBarrier()
+        AppDelegate.shared?.revokeAgentReportAvailability(
+            runtimeSurfaceID: runtimeSurfaceID,
+            revisionBarrier: revisionBarrier
+        )
+        guard let store else { return }
 #if DEBUG
-            self?.agentReportPurgeObserverForTesting?(runtimeSurfaceID)
-#endif
+        let storeID = ObjectIdentifier(store)
+        let operationID = UUID()
+        let task = Task { [weak self, store] in
+            await store.purge(runtimeSurfaceID: runtimeSurfaceID)
+            self?.completeAgentReportPurgeForTesting(
+                storeID: storeID,
+                operationID: operationID,
+                runtimeSurfaceID: runtimeSurfaceID
+            )
         }
+        agentReportPurgeTasksForTesting[storeID, default: [:]][operationID] = task
+#else
+        Task {
+            await store.purge(runtimeSurfaceID: runtimeSurfaceID)
+        }
+#endif
     }
 
 #if DEBUG
+    /// Creates a store-and-surface-scoped purge stream for deterministic tests.
+    func observeAgentReportPurgesForTesting(
+        store: AgentReportCaptureStore,
+        runtimeSurfaceID: UUID
+    ) -> (id: UUID, stream: AsyncStream<UUID>) {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream.makeStream(of: UUID.self)
+        agentReportPurgeObserversForTesting[id] = (
+            storeID: ObjectIdentifier(store),
+            runtimeSurfaceID: runtimeSurfaceID,
+            eventCount: 0,
+            continuation: continuation
+        )
+        return (id, stream)
+    }
+
+    /// Removes one exact scoped purge observation.
+    func stopObservingAgentReportPurgesForTesting(id: UUID) {
+        agentReportPurgeObserversForTesting.removeValue(forKey: id)?.continuation.finish()
+    }
+
+    /// Returns the number of exact scoped purge completions observed so far.
+    func agentReportPurgeObservationCountForTesting(id: UUID) -> Int {
+        agentReportPurgeObserversForTesting[id]?.eventCount ?? 0
+    }
+
+    /// Waits until every purge task owned by one injected test store completes.
+    func awaitAgentReportPurgesForTesting(store: AgentReportCaptureStore) async {
+        let storeID = ObjectIdentifier(store)
+        while let tasks = agentReportPurgeTasksForTesting[storeID], !tasks.isEmpty {
+            for task in tasks.values {
+                await task.value
+            }
+        }
+    }
+
+    /// Completes one exact task and yields only to matching scoped observers.
+    private func completeAgentReportPurgeForTesting(
+        storeID: ObjectIdentifier,
+        operationID: UUID,
+        runtimeSurfaceID: UUID
+    ) {
+        agentReportPurgeTasksForTesting[storeID]?.removeValue(forKey: operationID)
+        if agentReportPurgeTasksForTesting[storeID]?.isEmpty == true {
+            agentReportPurgeTasksForTesting.removeValue(forKey: storeID)
+        }
+        let matchingObserverIDs = agentReportPurgeObserversForTesting.compactMap {
+            id,
+            observer in
+            observer.storeID == storeID && observer.runtimeSurfaceID == runtimeSurfaceID
+                ? id
+                : nil
+        }
+        for observerID in matchingObserverIDs {
+            guard var observer = agentReportPurgeObserversForTesting[observerID] else { continue }
+            observer.eventCount += 1
+            agentReportPurgeObserversForTesting[observerID] = observer
+            observer.continuation.yield(runtimeSurfaceID)
+        }
+    }
+
     /// Emits a content-free result to focused socket tests only.
     ///
     /// - Parameter result: Capture status without request or report content.

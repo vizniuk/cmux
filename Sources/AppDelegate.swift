@@ -794,6 +794,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private(set) var agentReportCaptureEnabled = false
     /// Content-free exact runtime surfaces whose report remains copy-eligible.
     private var agentReportAvailableRuntimeSurfaceIDs: Set<UUID> = []
+    /// Shared cross-domain ordering source for actor snapshots and host barriers.
+    private let agentReportAvailabilityRevisionAuthority =
+        AgentReportAvailabilityRevisionAuthority()
+    /// Newest actor snapshot or synchronous revocation barrier accepted by host.
+    private var agentReportAcceptedAvailabilityRevision: AgentReportAvailabilityRevision?
     private var agentReportAvailabilityTask: Task<Void, Never>?
     private var agentReportSettingObservationTask: Task<Void, Never>?
     private var agentReportPolicyUpdateTask: Task<Void, Never>?
@@ -2078,11 +2083,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         )
         let agentReportCaptureStore = AgentReportCaptureStore(
             policy: initialAgentReportCaptureEnabled ? .enabled : .disabled,
+            availabilityRevisionAuthority: agentReportAvailabilityRevisionAuthority,
             transcriptRecovery: AgentChatTranscriptResolver()
         )
         self.agentReportCaptureStore = agentReportCaptureStore
         agentReportCaptureEnabled = initialAgentReportCaptureEnabled
         agentReportAvailableRuntimeSurfaceIDs.removeAll(keepingCapacity: false)
+        agentReportAcceptedAvailabilityRevision = nil
         VMClient.bootstrap(auth: auth.coordinator)
         RemotesClient.bootstrap(auth: auth.coordinator)
         AIAccountsClient.bootstrap(auth: auth.coordinator)
@@ -2100,7 +2107,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         agentChatTranscriptService.setAgentReportSurfaceInvalidator { [weak self, agentReportCaptureStore] surfaceID in
             // Cleanup may queue, but lifecycle authority was already revoked
             // synchronously by AgentChatTranscriptService on the main actor.
-            self?.revokeAgentReportAvailability(runtimeSurfaceID: surfaceID)
+            self?.revokeAgentReportAvailability(
+                runtimeSurfaceID: surfaceID,
+                revisionBarrier: agentReportCaptureStore.advanceAvailabilityRevisionBarrier()
+            )
             Task { await agentReportCaptureStore.invalidatePendingCapture(runtimeSurfaceID: surfaceID) }
         }
         startAgentReportAvailabilityObservation(store: agentReportCaptureStore)
@@ -2149,6 +2159,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func applyAgentReportCapturePolicy(_ enabled: Bool) {
         agentReportCaptureEnabled = enabled
         if !enabled {
+            let revisionBarrier = agentReportCaptureStore?
+                .advanceAvailabilityRevisionBarrier()
+                ?? agentReportAvailabilityRevisionAuthority.advance()
+            if agentReportAcceptedAvailabilityRevision == nil
+                || revisionBarrier > agentReportAcceptedAvailabilityRevision! {
+                agentReportAcceptedAvailabilityRevision = revisionBarrier
+            }
             agentReportAvailableRuntimeSurfaceIDs.removeAll(keepingCapacity: false)
         }
         NotificationCenter.default.post(name: .agentReportCopyAvailabilityDidChange, object: nil)
@@ -2200,6 +2217,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     /// Accepts only content-free topology availability from the report actor.
     func acceptAgentReportAvailability(_ snapshot: AgentReportAvailabilitySnapshot) {
+        if let acceptedRevision = agentReportAcceptedAvailabilityRevision,
+           snapshot.revision <= acceptedRevision {
+            return
+        }
+        agentReportAcceptedAvailabilityRevision = snapshot.revision
         if agentReportCaptureEnabled, snapshot.isCaptureEnabled {
             agentReportAvailableRuntimeSurfaceIDs = snapshot.availableRuntimeSurfaceIDs
         } else {
@@ -2210,7 +2232,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     /// Synchronously removes content-free report availability for one runtime
     /// surface before its lifecycle can be replaced or rebound.
-    func revokeAgentReportAvailability(runtimeSurfaceID: UUID) {
+    func revokeAgentReportAvailability(
+        runtimeSurfaceID: UUID,
+        revisionBarrier: AgentReportAvailabilityRevision? = nil
+    ) {
+        let barrier = revisionBarrier
+            ?? agentReportCaptureStore?.advanceAvailabilityRevisionBarrier()
+            ?? agentReportAvailabilityRevisionAuthority.advance()
+        if agentReportAcceptedAvailabilityRevision == nil
+            || barrier > agentReportAcceptedAvailabilityRevision! {
+            agentReportAcceptedAvailabilityRevision = barrier
+        }
         agentReportAvailableRuntimeSurfaceIDs.remove(runtimeSurfaceID)
         NotificationCenter.default.post(name: .agentReportCopyAvailabilityDidChange, object: nil)
     }
@@ -2255,17 +2287,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func copyLatestAgentReport(
         workspaceID: UUID,
         runtimeSurfaceID: UUID,
-        to pasteboard: NSPasteboard = .general
+        to pasteboard: NSPasteboard = .general,
+        beforeFinalWrite: @escaping @MainActor @Sendable (
+            AgentReportWriteAuthorizationReceipt
+        ) -> Void = { _ in }
     ) async -> Bool {
         let availability = agentReportCopyControlAvailability(
             workspaceID: workspaceID,
             runtimeSurfaceID: runtimeSurfaceID
         )
-        guard availability.hasReport, let store = agentReportCaptureStore else { return false }
+        guard availability.hasReport,
+              let store = agentReportCaptureStore,
+              let availabilityRevision = agentReportAcceptedAvailabilityRevision,
+              let representedPanel = agentReportTerminalPanel(
+                  workspaceID: workspaceID,
+                  runtimeSurfaceID: runtimeSurfaceID
+              ) else {
+            return false
+        }
         let policyRevision = agentReportPolicyUpdateRevision
         return await Self.copyLatestAgentReport(
             store: store,
             runtimeSurfaceID: runtimeSurfaceID,
+            capturePolicyRevision: policyRevision,
+            availabilityRevision: availabilityRevision,
             to: pasteboard,
             authorize: { context in
                 await TerminalController.shared.authorizesAgentReportCopy(
@@ -2274,14 +2319,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                     representedSurfaceID: runtimeSurfaceID
                 )
             },
-            shouldWrite: { [weak self] in
-                self?.agentReportCaptureEnabled == true
-                    && self?.agentReportPolicyUpdateTask == nil
-                    && self?.agentReportPolicyUpdateRevision == policyRevision
-                    && self?.agentReportCopyControlAvailability(
-                        workspaceID: workspaceID,
-                        runtimeSurfaceID: runtimeSurfaceID
-                    ).hasReport == true
+            beforeFinalWrite: beforeFinalWrite,
+            shouldWrite: { [weak self, representedPanel] receipt in
+                self?.authorizesAgentReportFinalWrite(
+                    receipt,
+                    representedWorkspaceID: workspaceID,
+                    representedSurfaceID: runtimeSurfaceID,
+                    representedPanel: representedPanel
+                ) == true
             }
         )
     }
@@ -2289,22 +2334,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// Authoritative report lookup and clipboard write shared by shortcut,
     /// menu, and button entrypoints. It has no transcript or terminal fallback.
     @discardableResult
+    @MainActor
     static func copyLatestAgentReport(
         store: AgentReportCaptureStore,
         runtimeSurfaceID: UUID,
+        capturePolicyRevision: UInt64 = 0,
+        availabilityRevision: AgentReportAvailabilityRevision =
+            AgentReportAvailabilityRevisionAuthority().advance(),
         to pasteboard: NSPasteboard,
-        authorize: @escaping @Sendable (AgentReportCopyAuthorizationContext) async -> Bool,
-        shouldWrite: @escaping @MainActor @Sendable () -> Bool = { true }
+        authorize: @escaping @Sendable (
+            AgentReportCopyAuthorizationContext
+        ) async -> AgentReportWriteAuthorizationReceipt?,
+        beforeFinalWrite: @escaping @MainActor @Sendable (
+            AgentReportWriteAuthorizationReceipt
+        ) -> Void = { _ in },
+        shouldWrite: @escaping @MainActor @Sendable (
+            AgentReportWriteAuthorizationReceipt
+        ) -> Bool = { _ in true }
     ) async -> Bool {
-        guard let body = await store.authorizedReportBody(
+        guard let authorized = await store.authorizedReport(
             runtimeSurfaceID: runtimeSurfaceID,
+            capturePolicyRevision: capturePolicyRevision,
+            availabilityRevision: availabilityRevision,
             authorize: authorize
-        ), shouldWrite() else {
+        ) else {
             return false
         }
-        WorkspaceSurfaceIdentifierClipboardText.copy(body, to: pasteboard)
+        beforeFinalWrite(authorized.receipt)
+        guard shouldWrite(authorized.receipt) else { return false }
+        WorkspaceSurfaceIdentifierClipboardText.copy(authorized.body, to: pasteboard)
         return true
     }
+
+    /// Resolves one exact current terminal panel without focus fallbacks.
+    private func agentReportTerminalPanel(
+        workspaceID: UUID,
+        runtimeSurfaceID: UUID
+    ) -> TerminalPanel? {
+        guard let manager = tabManagerFor(tabId: workspaceID)
+                ?? (tabManager?.tabs.contains(where: { $0.id == workspaceID }) == true
+                    ? tabManager
+                    : nil),
+              let workspace = manager.tabs.first(where: { $0.id == workspaceID }),
+              workspace.surfaceIdFromPanelId(runtimeSurfaceID) != nil else {
+            return nil
+        }
+        return workspace.panels[runtimeSurfaceID] as? TerminalPanel
+    }
+
+    /// Performs the final non-suspending main-actor clipboard authorization.
+    private func authorizesAgentReportFinalWrite(
+        _ receipt: AgentReportWriteAuthorizationReceipt,
+        representedWorkspaceID: UUID,
+        representedSurfaceID: UUID,
+        representedPanel: TerminalPanel
+    ) -> Bool {
+        guard agentReportCaptureEnabled,
+              agentReportPolicyUpdateTask == nil,
+              agentReportPolicyUpdateRevision == receipt.capturePolicyRevision,
+              agentReportAcceptedAvailabilityRevision == receipt.availabilityRevision,
+              agentReportAvailableRuntimeSurfaceIDs.contains(representedSurfaceID),
+              receipt.provider == .codex,
+              receipt.completionKind == .primaryStop,
+              receipt.runtimeSurfaceID == representedSurfaceID,
+              receipt.panelInstanceID == ObjectIdentifier(representedPanel),
+              receipt.stableSurfaceID == representedPanel.stableSurfaceId,
+              receipt.isCurrentReport,
+              agentReportTerminalPanel(
+                  workspaceID: representedWorkspaceID,
+                  runtimeSurfaceID: representedSurfaceID
+              ) === representedPanel,
+              TerminalController.shared.agentChatTranscriptService?
+                .agentReportLifecycleToken(for: representedSurfaceID) == receipt.lifecycleToken else {
+            return false
+        }
+        return true
+    }
+
+#if DEBUG
+    /// Injects a private report store into an isolated app-host test instance.
+    func setAgentReportCaptureStoreForTesting(_ store: AgentReportCaptureStore?) {
+        agentReportCaptureStore = store
+    }
+#endif
 
     private func scheduleGhosttyCrashBreadcrumbIfNeeded(notificationStore: TerminalNotificationStore) {
         guard !didScheduleGhosttyCrashBreadcrumbCheck else { return }

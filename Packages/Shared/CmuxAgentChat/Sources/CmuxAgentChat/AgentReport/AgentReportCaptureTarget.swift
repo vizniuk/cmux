@@ -28,6 +28,9 @@ public struct AgentReportCaptureTarget: Sendable, Equatable, CustomStringConvert
     /// Transcript path validated against that session, when recorded.
     public let transcriptPath: String?
 
+    /// Opaque immutable identity derived from the validated transcript path.
+    public let transcriptBinding: AgentReportTranscriptBinding?
+
     /// A content-free diagnostic description that omits all private metadata.
     public var description: String {
         "AgentReportCaptureTarget"
@@ -62,5 +65,6 @@ public struct AgentReportCaptureTarget: Sendable, Equatable, CustomStringConvert
         self.turnID = turnID
         self.lifecycleToken = lifecycleToken
         self.transcriptPath = transcriptPath
+        transcriptBinding = transcriptPath.map(AgentReportTranscriptBinding.init(validatedTranscriptPath:))
     }
 }

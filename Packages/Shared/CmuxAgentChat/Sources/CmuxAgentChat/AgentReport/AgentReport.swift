@@ -8,6 +8,9 @@ import Foundation
 /// notifications, logs, analytics, crash reporting, filenames, temporary
 /// files, or persistent hook/session stores.
 public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomDebugStringConvertible {
+    /// Opaque process-local identity for this exact retained report.
+    public let reportIdentity: UUID
+
     /// The agent runtime that produced the report.
     public let provider: AgentReportProvider
 
@@ -31,6 +34,9 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
 
     /// Capture-time lifecycle authority, compared again before explicit copy.
     public let lifecycleToken: UUID
+
+    /// Immutable opaque identity of the validated capture transcript.
+    public let transcriptBinding: AgentReportTranscriptBinding?
 
     /// Exact final reply text. This value is never suitable for diagnostics.
     public let finalReply: String
@@ -62,6 +68,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
     /// Creates an exact agent report record after identity and lifecycle validation.
     ///
     /// - Parameters:
+    ///   - reportIdentity: Opaque process-local retained-report identity.
     ///   - provider: Agent runtime that produced the completion.
     ///   - runtimeSurfaceID: Exact live process-local surface used for lookup.
     ///   - stableSurfaceID: Authoritative restart-stable surface identity, when available.
@@ -70,6 +77,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
     ///   - turnID: Provider-owned completed turn identity.
     ///   - completionKind: Accepted provider lifecycle boundary.
     ///   - lifecycleToken: Capture-time live lifecycle authority.
+    ///   - transcriptBinding: Opaque validated transcript identity.
     ///   - finalReply: Unmodified private final reply text.
     ///   - captureSource: Authoritative source of `finalReply`.
     ///   - capturedAt: Time the actor committed the record.
@@ -77,6 +85,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
     ///   - completionTimestamp: Time the accepted completion reached cmux.
     ///   - duplicateIdentity: Content-free idempotency identity.
     public init(
+        reportIdentity: UUID,
         provider: AgentReportProvider,
         runtimeSurfaceID: UUID,
         stableSurfaceID: UUID?,
@@ -85,6 +94,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
         turnID: String,
         completionKind: AgentReportCompletionKind,
         lifecycleToken: UUID,
+        transcriptBinding: AgentReportTranscriptBinding?,
         finalReply: String,
         captureSource: AgentReportCaptureSource,
         capturedAt: Date,
@@ -92,6 +102,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
         completionTimestamp: Date,
         duplicateIdentity: AgentReportDuplicateIdentity
     ) {
+        self.reportIdentity = reportIdentity
         self.provider = provider
         self.runtimeSurfaceID = runtimeSurfaceID
         self.stableSurfaceID = stableSurfaceID
@@ -100,6 +111,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
         self.turnID = turnID
         self.completionKind = completionKind
         self.lifecycleToken = lifecycleToken
+        self.transcriptBinding = transcriptBinding
         self.finalReply = finalReply
         self.captureSource = captureSource
         self.capturedAt = capturedAt

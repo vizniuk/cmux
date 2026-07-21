@@ -8,6 +8,9 @@ import Foundation
 public struct AgentReportCopyAuthorizationContext: Sendable, Equatable,
     CustomStringConvertible, CustomDebugStringConvertible
 {
+    /// Opaque identity of the exact actor-owned retained report.
+    public let reportIdentity: UUID
+
     /// Agent runtime whose live primary-session binding must still match.
     public let provider: AgentReportProvider
 
@@ -33,13 +36,34 @@ public struct AgentReportCopyAuthorizationContext: Sendable, Equatable,
     /// Capture-time process-local lifecycle token that must remain current.
     public let lifecycleToken: UUID
 
+    /// Immutable opaque capture-time transcript identity.
+    public let transcriptBinding: AgentReportTranscriptBinding?
+
+    /// Report-actor policy generation observed before authorization suspended.
+    public let captureStorePolicyGeneration: UInt64
+
+    /// Main-actor capture-policy revision observed before authorization.
+    public let capturePolicyRevision: UInt64
+
+    /// Host-accepted availability revision observed before authorization.
+    public let availabilityRevision: AgentReportAvailabilityRevision
+
+    let finalWriteCapability: AgentReportFinalWriteCapability
+
     /// A diagnostic description containing no private identities or body text.
     public var description: String { "AgentReportCopyAuthorizationContext" }
 
     /// A diagnostic description containing no private identities or body text.
     public var debugDescription: String { description }
 
-    init(report: AgentReport) {
+    init(
+        report: AgentReport,
+        captureStorePolicyGeneration: UInt64,
+        capturePolicyRevision: UInt64,
+        availabilityRevision: AgentReportAvailabilityRevision,
+        finalWriteCapability: AgentReportFinalWriteCapability
+    ) {
+        reportIdentity = report.reportIdentity
         provider = report.provider
         workspaceID = report.workspaceID
         runtimeSurfaceID = report.runtimeSurfaceID
@@ -48,5 +72,44 @@ public struct AgentReportCopyAuthorizationContext: Sendable, Equatable,
         turnID = report.turnID
         completionKind = report.completionKind
         lifecycleToken = report.lifecycleToken
+        transcriptBinding = report.transcriptBinding
+        self.captureStorePolicyGeneration = captureStorePolicyGeneration
+        self.capturePolicyRevision = capturePolicyRevision
+        self.availabilityRevision = availabilityRevision
+        self.finalWriteCapability = finalWriteCapability
+    }
+
+    /// Creates a body-free final-write receipt after app authority succeeds.
+    ///
+    /// - Parameter panelInstanceID: Exact live panel object identity revalidated
+    ///   after the asynchronous registry lookup.
+    /// - Returns: A receipt bound to this exact report authorization context.
+    public func writeAuthorizationReceipt(
+        panelInstanceID: ObjectIdentifier
+    ) -> AgentReportWriteAuthorizationReceipt {
+        AgentReportWriteAuthorizationReceipt(
+            context: self,
+            panelInstanceID: panelInstanceID
+        )
+    }
+
+    public static func == (
+        lhs: AgentReportCopyAuthorizationContext,
+        rhs: AgentReportCopyAuthorizationContext
+    ) -> Bool {
+        lhs.reportIdentity == rhs.reportIdentity
+            && lhs.provider == rhs.provider
+            && lhs.workspaceID == rhs.workspaceID
+            && lhs.runtimeSurfaceID == rhs.runtimeSurfaceID
+            && lhs.stableSurfaceID == rhs.stableSurfaceID
+            && lhs.agentSessionID == rhs.agentSessionID
+            && lhs.turnID == rhs.turnID
+            && lhs.completionKind == rhs.completionKind
+            && lhs.lifecycleToken == rhs.lifecycleToken
+            && lhs.transcriptBinding == rhs.transcriptBinding
+            && lhs.captureStorePolicyGeneration == rhs.captureStorePolicyGeneration
+            && lhs.capturePolicyRevision == rhs.capturePolicyRevision
+            && lhs.availabilityRevision == rhs.availabilityRevision
+            && lhs.finalWriteCapability === rhs.finalWriteCapability
     }
 }

@@ -12,12 +12,21 @@ final class AgentChatSessionRegistry {
         /// authorize a read; the off-main resolver independently enforces the
         /// app-authoritative Codex root and regular-file policy.
         let transcriptPath: String?
+
+        /// Opaque canonical identity of ``transcriptPath`` when present.
+        let transcriptBinding: AgentReportTranscriptBinding?
     }
 
     private var records: [String: AgentChatSessionRecord] = [:]
     private var liveSessionIDBySurfaceID: [String: String] = [:]
     private var liveClaudeSessionIDsBySurfaceID: [String: Set<String>] = [:]
     private let hookStore: AgentChatHookSessionStore
+    private let agentReportActiveEntryReader: @Sendable (
+        _ agentSource: String,
+        _ sessionID: String,
+        _ surfaceID: String,
+        _ turnID: String
+    ) async -> AgentChatHookSessionStore.Entry?
 
     /// Called after a record mutation with the previous value (nil for a
     /// brand-new record), so the owner derives state/descriptor deltas in
@@ -55,8 +64,30 @@ final class AgentChatSessionRegistry {
     /// Creates a registry.
     ///
     /// - Parameter hookStore: Reader for the per-agent hook session stores.
-    init(hookStore: AgentChatHookSessionStore = AgentChatHookSessionStore()) {
+    init(
+        hookStore: AgentChatHookSessionStore = AgentChatHookSessionStore(),
+        agentReportActiveEntryReader: (@Sendable (
+            _ agentSource: String,
+            _ sessionID: String,
+            _ surfaceID: String,
+            _ turnID: String
+        ) async -> AgentChatHookSessionStore.Entry?)? = nil
+    ) {
         self.hookStore = hookStore
+        self.agentReportActiveEntryReader = agentReportActiveEntryReader ?? {
+            agentSource,
+            sessionID,
+            surfaceID,
+            turnID in
+            await Task.detached(priority: .utility) {
+                hookStore.activeCaptureEntry(
+                    agentSource: agentSource,
+                    sessionID: sessionID,
+                    surfaceID: surfaceID,
+                    turnID: turnID
+                )
+            }.value
+        }
     }
 
     /// All known sessions, optionally restricted to one workspace, most
@@ -287,7 +318,9 @@ final class AgentChatSessionRegistry {
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: requestedTranscriptPath
+            requestedTranscriptPath: requestedTranscriptPath,
+            requiredTranscriptBinding: nil,
+            requiresExactTranscriptBinding: false
         )
     }
 
@@ -304,12 +337,14 @@ final class AgentChatSessionRegistry {
     ///   - surfaceID: Exact live runtime surface recorded at capture.
     ///   - sessionID: Exact provider session recorded at capture.
     ///   - turnID: Exact provider turn recorded at capture.
+    ///   - transcriptBinding: Immutable capture-time transcript identity.
     /// - Returns: A content-free validated binding, or `nil` on any mismatch.
     func agentReportCopyBinding(
         captureWorkspaceID: String,
         surfaceID: String,
         sessionID: String,
-        turnID: String
+        turnID: String,
+        transcriptBinding: AgentReportTranscriptBinding?
     ) async -> AgentReportCaptureBinding? {
         await agentReportBinding(
             captureWorkspaceID: captureWorkspaceID,
@@ -317,7 +352,9 @@ final class AgentChatSessionRegistry {
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: nil
+            requestedTranscriptPath: nil,
+            requiredTranscriptBinding: transcriptBinding,
+            requiresExactTranscriptBinding: true
         )
     }
 
@@ -329,7 +366,9 @@ final class AgentChatSessionRegistry {
         surfaceID: String,
         sessionID: String,
         turnID: String,
-        requestedTranscriptPath: String?
+        requestedTranscriptPath: String?,
+        requiredTranscriptBinding: AgentReportTranscriptBinding?,
+        requiresExactTranscriptBinding: Bool
     ) async -> AgentReportCaptureBinding? {
         guard Self.sessionRecordAllowsAgentReportCapture(
             record(sessionID: sessionID),
@@ -340,21 +379,20 @@ final class AgentChatSessionRegistry {
             return nil
         }
 
-        let hookStore = self.hookStore
-        let entry = await Task.detached(priority: .utility) {
-            hookStore.activeCaptureEntry(
-                agentSource: "codex",
-                sessionID: sessionID,
-                surfaceID: surfaceID,
-                turnID: turnID
-            )
-        }.value
-
-        guard let entry,
-              entry.sessionID == sessionID,
-              Self.sameUUID(entry.workspaceID, captureWorkspaceID),
-              Self.sameUUID(entry.surfaceID, surfaceID),
-              entry.lastPromptTurnID == turnID,
+        let firstEntry = await agentReportActiveEntryReader(
+            "codex",
+            sessionID,
+            surfaceID,
+            turnID
+        )
+        guard let firstEntry,
+              Self.agentReportEntryAllowsCapture(
+                  firstEntry,
+                  captureWorkspaceID: captureWorkspaceID,
+                  surfaceID: surfaceID,
+                  sessionID: sessionID,
+                  turnID: turnID
+              ),
               Self.sessionRecordAllowsAgentReportCapture(
                   record(sessionID: sessionID),
                   requiredWorkspaceID: requiredRegistryWorkspaceID,
@@ -364,17 +402,83 @@ final class AgentChatSessionRegistry {
             return nil
         }
 
-        let recordedTranscriptPath = entry.transcriptPath
+        let firstRecordedTranscriptPath = firstEntry.transcriptPath
             ?? record(sessionID: sessionID)?.transcriptPath
+        let firstTranscriptBinding = firstRecordedTranscriptPath.map(
+            AgentReportTranscriptBinding.init(validatedTranscriptPath:)
+        )
         if let requestedTranscriptPath {
-            guard let recordedTranscriptPath,
-                  Self.normalizedPath(requestedTranscriptPath) == Self.normalizedPath(recordedTranscriptPath) else {
+            guard let firstRecordedTranscriptPath,
+                  Self.normalizedPath(requestedTranscriptPath)
+                    == Self.normalizedPath(firstRecordedTranscriptPath) else {
                 return nil
             }
         }
-        return AgentReportCaptureBinding(
-            transcriptPath: recordedTranscriptPath
+        if requiresExactTranscriptBinding,
+           firstTranscriptBinding != requiredTranscriptBinding {
+            return nil
+        }
+
+        // Read the atomic hook-store snapshot again and recheck registry state.
+        // A transcript or lifecycle rewrite during either suspension must not
+        // authorize the retained capture-time binding.
+        let secondEntry = await agentReportActiveEntryReader(
+            "codex",
+            sessionID,
+            surfaceID,
+            turnID
         )
+        guard let secondEntry,
+              Self.agentReportEntryAllowsCapture(
+                  secondEntry,
+                  captureWorkspaceID: captureWorkspaceID,
+                  surfaceID: surfaceID,
+                  sessionID: sessionID,
+                  turnID: turnID
+              ),
+              Self.sessionRecordAllowsAgentReportCapture(
+                  record(sessionID: sessionID),
+                  requiredWorkspaceID: requiredRegistryWorkspaceID,
+                  surfaceID: surfaceID,
+                  sessionID: sessionID
+              ) else {
+            return nil
+        }
+        let recordedTranscriptPath = secondEntry.transcriptPath
+            ?? record(sessionID: sessionID)?.transcriptPath
+        let transcriptBinding = recordedTranscriptPath.map(
+            AgentReportTranscriptBinding.init(validatedTranscriptPath:)
+        )
+        guard transcriptBinding == firstTranscriptBinding else { return nil }
+        if let requestedTranscriptPath {
+            guard let recordedTranscriptPath,
+                  Self.normalizedPath(requestedTranscriptPath)
+                    == Self.normalizedPath(recordedTranscriptPath) else {
+                return nil
+            }
+        }
+        if requiresExactTranscriptBinding,
+           transcriptBinding != requiredTranscriptBinding {
+            return nil
+        }
+        return AgentReportCaptureBinding(
+            transcriptPath: recordedTranscriptPath,
+            transcriptBinding: transcriptBinding
+        )
+    }
+
+    /// Applies immutable active hook-entry checks around transcript lookup.
+    private static func agentReportEntryAllowsCapture(
+        _ entry: AgentChatHookSessionStore.Entry,
+        captureWorkspaceID: String,
+        surfaceID: String,
+        sessionID: String,
+        turnID: String
+    ) -> Bool {
+        entry.sessionID == sessionID
+            && sameUUID(entry.workspaceID, captureWorkspaceID)
+            && sameUUID(entry.surfaceID, surfaceID)
+            && entry.lastPromptTurnID == turnID
     }
 
     /// Applies registry-side session checks without borrowing another

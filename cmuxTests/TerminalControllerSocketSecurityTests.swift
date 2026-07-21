@@ -789,7 +789,13 @@ final class TerminalControllerSocketSecurityTests {
             runtimeSurfaceID: surfaceID,
             to: pasteboard,
             authorize: { report in
-                report.workspaceID == workspaceID && report.runtimeSurfaceID == surfaceID
+                guard report.workspaceID == workspaceID,
+                      report.runtimeSurfaceID == surfaceID else {
+                    return nil
+                }
+                return report.writeAuthorizationReceipt(
+                    panelInstanceID: ObjectIdentifier(store)
+                )
             }
         )
 
@@ -806,7 +812,11 @@ final class TerminalControllerSocketSecurityTests {
                 store: store,
                 runtimeSurfaceID: UUID(),
                 to: pasteboard,
-                authorize: { _ in true }
+                authorize: { context in
+                    context.writeAuthorizationReceipt(
+                        panelInstanceID: ObjectIdentifier(store)
+                    )
+                }
             ) == false
         )
         #expect(pasteboard.changeCount == unavailableChangeCount)
@@ -817,8 +827,12 @@ final class TerminalControllerSocketSecurityTests {
                 store: store,
                 runtimeSurfaceID: surfaceID,
                 to: pasteboard,
-                authorize: { _ in true },
-                shouldWrite: { false }
+                authorize: { context in
+                    context.writeAuthorizationReceipt(
+                        panelInstanceID: ObjectIdentifier(store)
+                    )
+                },
+                shouldWrite: { _ in false }
             ) == false
         )
         #expect(pasteboard.changeCount == unavailableChangeCount)
@@ -828,11 +842,126 @@ final class TerminalControllerSocketSecurityTests {
                 store: store,
                 runtimeSurfaceID: surfaceID,
                 to: pasteboard,
-                authorize: { _ in false }
+                authorize: { _ in nil }
             ) == false
         )
         #expect(pasteboard.changeCount == unavailableChangeCount)
         workspace.teardownAllPanels()
+    }
+
+    @Test func staleAgentReportAvailabilityCannotCrossSynchronousRevocation() throws {
+        let previousAppDelegate = AppDelegate.shared
+        let app = AppDelegate()
+        let manager = TabManager()
+        let workspace = try #require(manager.selectedWorkspace)
+        let panel = try #require(workspace.focusedTerminalPanel)
+        let surfaceID = panel.id
+        let authority = AgentReportAvailabilityRevisionAuthority()
+        app.tabManager = manager
+        app.applyAgentReportCapturePolicy(true)
+        AppDelegate.shared = app
+        defer {
+            AppDelegate.shared = previousAppDelegate
+            workspace.teardownAllPanels()
+        }
+
+        let olderRevision = authority.advance()
+        let availableRevision = authority.advance()
+        let available = AgentReportAvailabilitySnapshot(
+            revision: availableRevision,
+            isCaptureEnabled: true,
+            availableRuntimeSurfaceIDs: [surfaceID]
+        )
+        app.acceptAgentReportAvailability(available)
+        #expect(app.agentReportCopyControlAvailability(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: surfaceID,
+            representedSurface: panel.surface
+        ).hasReport)
+
+        let revocationBarrier = authority.advance()
+        app.revokeAgentReportAvailability(
+            runtimeSurfaceID: surfaceID,
+            revisionBarrier: revocationBarrier
+        )
+        app.acceptAgentReportAvailability(available)
+        app.acceptAgentReportAvailability(AgentReportAvailabilitySnapshot(
+            revision: olderRevision,
+            isCaptureEnabled: true,
+            availableRuntimeSurfaceIDs: [surfaceID]
+        ))
+        #expect(!app.agentReportCopyControlAvailability(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: surfaceID,
+            representedSurface: panel.surface
+        ).hasReport)
+
+        let freshRevision = authority.advance()
+        let fresh = AgentReportAvailabilitySnapshot(
+            revision: freshRevision,
+            isCaptureEnabled: true,
+            availableRuntimeSurfaceIDs: [surfaceID]
+        )
+        app.acceptAgentReportAvailability(fresh)
+        #expect(app.agentReportCopyControlAvailability(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: surfaceID,
+            representedSurface: panel.surface
+        ).hasReport)
+
+        let rapidPurgeBarrier = authority.advance()
+        app.revokeAgentReportAvailability(
+            runtimeSurfaceID: surfaceID,
+            revisionBarrier: rapidPurgeBarrier
+        )
+        app.acceptAgentReportAvailability(fresh)
+        #expect(!app.agentReportCopyControlAvailability(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: surfaceID,
+            representedSurface: panel.surface
+        ).hasReport)
+
+        let newestRevision = authority.advance()
+        let newest = AgentReportAvailabilitySnapshot(
+            revision: newestRevision,
+            isCaptureEnabled: true,
+            availableRuntimeSurfaceIDs: [surfaceID]
+        )
+        app.acceptAgentReportAvailability(newest)
+        #expect(app.agentReportCopyControlAvailability(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: surfaceID,
+            representedSurface: panel.surface
+        ).hasReport)
+
+        app.applyAgentReportCapturePolicy(false)
+        app.acceptAgentReportAvailability(newest)
+        app.applyAgentReportCapturePolicy(true)
+        app.acceptAgentReportAvailability(newest)
+        #expect(!app.agentReportCopyControlAvailability(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: surfaceID,
+            representedSurface: panel.surface
+        ).hasReport)
+        let postEnableFresh = AgentReportAvailabilitySnapshot(
+            revision: authority.advance(),
+            isCaptureEnabled: true,
+            availableRuntimeSurfaceIDs: [surfaceID]
+        )
+        app.acceptAgentReportAvailability(postEnableFresh)
+        #expect(app.agentReportCopyControlAvailability(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: surfaceID,
+            representedSurface: panel.surface
+        ).hasReport)
+        #expect(!String(describing: newest.revision).contains("6"))
+        let snapshotLabels = Mirror(reflecting: newest).children.compactMap(\.label)
+        #expect(!snapshotLabels.contains(where: {
+            $0.localizedCaseInsensitiveContains("session")
+                || $0.localizedCaseInsensitiveContains("turn")
+                || $0.localizedCaseInsensitiveContains("transcript")
+                || $0.localizedCaseInsensitiveContains("body")
+        }))
     }
 
     @Test func shiftCommandCUsesCentralRequestWhileCommandCAndTextInputRemainUntouched() throws {
@@ -1023,16 +1152,13 @@ final class TerminalControllerSocketSecurityTests {
             transcriptRecovery: SuspendedEndpointAgentReportRecovery(reply: "unused")
         )
         controller.agentReportCaptureStore = store
-        var purgeCount = 0
-        let purges = AsyncStream<UUID> { continuation in
-            controller.agentReportPurgeObserverForTesting = { surfaceID in
-                if surfaceID == panel.id { purgeCount += 1 }
-                continuation.yield(surfaceID)
-            }
-        }
-        var purgeIterator = purges.makeAsyncIterator()
+        let purgeObservation = controller.observeAgentReportPurgesForTesting(
+            store: store,
+            runtimeSurfaceID: panel.id
+        )
+        var purgeIterator = purgeObservation.stream.makeAsyncIterator()
         defer {
-            controller.agentReportPurgeObserverForTesting = nil
+            controller.stopObservingAgentReportPurgesForTesting(id: purgeObservation.id)
             controller.agentReportCaptureStore = nil
             for remainingWorkspace in manager.tabs {
                 remainingWorkspace.teardownAllPanels()
@@ -1053,8 +1179,15 @@ final class TerminalControllerSocketSecurityTests {
             panel: panel
         )
         #expect(await purgeIterator.next() == panel.id)
+        await controller.awaitAgentReportPurgesForTesting(store: store)
         #expect(await store.latestReport(runtimeSurfaceID: panel.id) == nil)
-        #expect(purgeCount == 1)
+        #expect(
+            controller.agentReportPurgeObservationCountForTesting(id: purgeObservation.id) == 1
+        )
+        for remainingWorkspace in manager.tabs {
+            remainingWorkspace.teardownAllPanels()
+        }
+        await controller.awaitAgentReportPurgesForTesting(store: store)
     }
 
     @Test(arguments: ["tab", "pane", "workspace"])
@@ -1066,12 +1199,13 @@ final class TerminalControllerSocketSecurityTests {
         let recovery = SuspendedEndpointAgentReportRecovery(reply: "late report")
         let store = AgentReportCaptureStore(policy: .enabled, transcriptRecovery: recovery)
         controller.agentReportCaptureStore = store
-        let purges = AsyncStream<UUID> { continuation in
-            controller.agentReportPurgeObserverForTesting = { continuation.yield($0) }
-        }
-        var purgeIterator = purges.makeAsyncIterator()
+        let purgeObservation = controller.observeAgentReportPurgesForTesting(
+            store: store,
+            runtimeSurfaceID: panel.id
+        )
+        var purgeIterator = purgeObservation.stream.makeAsyncIterator()
         defer {
-            controller.agentReportPurgeObserverForTesting = nil
+            controller.stopObservingAgentReportPurgesForTesting(id: purgeObservation.id)
             controller.agentReportCaptureStore = nil
             for remainingWorkspace in manager.tabs {
                 remainingWorkspace.teardownAllPanels()
@@ -1092,10 +1226,15 @@ final class TerminalControllerSocketSecurityTests {
             panel: panel
         )
         #expect(await purgeIterator.next() == panel.id)
+        await controller.awaitAgentReportPurgesForTesting(store: store)
         await recovery.resumeRecovery()
 
         #expect(await capture.value == .rejected(.inaccessibleSurface))
         #expect(await store.latestReport(runtimeSurfaceID: panel.id) == nil)
+        for remainingWorkspace in manager.tabs {
+            remainingWorkspace.teardownAllPanels()
+        }
+        await controller.awaitAgentReportPurgesForTesting(store: store)
     }
 
     @Test func liveWorkspaceTransferMovesAvailabilityAndCentralCopyAuthority() async throws {
@@ -1159,10 +1298,7 @@ final class TerminalControllerSocketSecurityTests {
         controller.tabManager = manager
         controller.agentChatTranscriptService = service
         controller.agentReportCaptureStore = store
-        var purgeCount = 0
-        controller.agentReportPurgeObserverForTesting = { _ in purgeCount += 1 }
         defer {
-            controller.agentReportPurgeObserverForTesting = nil
             controller.tabManager = previousTabManager
             controller.agentChatTranscriptService = previousService
             controller.agentReportCaptureStore = previousStore
@@ -1216,7 +1352,6 @@ final class TerminalControllerSocketSecurityTests {
         #expect(service.agentReportLifecycleToken(for: panel.id) == lifecycleTokenBeforeDisplayRestamp)
 
         #expect(await store.latestReport(runtimeSurfaceID: panel.id) == capturedReport)
-        #expect(purgeCount == 0)
         #expect(!app.agentReportCopyControlAvailability(
             workspaceID: source.id,
             runtimeSurfaceID: panel.id,
@@ -1278,7 +1413,11 @@ final class TerminalControllerSocketSecurityTests {
                 store: store,
                 runtimeSurfaceID: differentPanel.id,
                 to: differentPasteboard,
-                authorize: { _ in true }
+                authorize: { context in
+                    context.writeAuthorizationReceipt(
+                        panelInstanceID: ObjectIdentifier(store)
+                    )
+                }
             ) == false
         )
         #expect(differentPasteboard.changeCount == differentChangeCount)
@@ -1440,10 +1579,18 @@ final class TerminalControllerSocketSecurityTests {
                 store: store,
                 runtimeSurfaceID: panel.id,
                 to: purgedPasteboard,
-                authorize: { _ in true }
+                authorize: { context in
+                    context.writeAuthorizationReceipt(
+                        panelInstanceID: ObjectIdentifier(store)
+                    )
+                }
             ) == false
         )
         #expect(purgedPasteboard.changeCount == purgedChangeCount)
+        for remainingWorkspace in manager.tabs {
+            remainingWorkspace.teardownAllPanels()
+        }
+        await controller.awaitAgentReportPurgesForTesting(store: store)
     }
 
     @Test(arguments: [
@@ -1451,6 +1598,8 @@ final class TerminalControllerSocketSecurityTests {
         "resume",
         "new-turn",
         "lifecycle-token",
+        "transcript-binding",
+        "transcript-binding-restored-after-lifecycle",
         "inactive-hook",
         "disable",
         "purge",
@@ -1606,6 +1755,33 @@ final class TerminalControllerSocketSecurityTests {
             ))
         case "lifecycle-token":
             service.invalidateAgentReportSurfaceLifecycle(runtimeSurfaceID: panel.id)
+        case "transcript-binding":
+            let changedTranscriptPayload: [String: Any] = [
+                "sessions": [
+                    request.agentSessionID: [
+                        "workspaceId": source.id.uuidString,
+                        "surfaceId": panel.id.uuidString,
+                        "transcriptPath": "/synthetic/changed-lifecycle.jsonl",
+                        "lastPromptTurnId": request.turnID,
+                        "updatedAt": 101.0,
+                    ],
+                ],
+                "activeSessionsBySurface": [
+                    panel.id.uuidString: [
+                        "sessionId": request.agentSessionID,
+                        "turnId": request.turnID,
+                        "updatedAt": 101.0,
+                    ],
+                ],
+            ]
+            try JSONSerialization.data(
+                withJSONObject: changedTranscriptPayload,
+                options: [.sortedKeys]
+            ).write(to: storeDirectory.appendingPathComponent("codex-hook-sessions.json"))
+        case "transcript-binding-restored-after-lifecycle":
+            service.invalidateAgentReportSurfaceLifecycle(runtimeSurfaceID: panel.id)
+            try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+                .write(to: storeDirectory.appendingPathComponent("codex-hook-sessions.json"))
         case "inactive-hook":
             let inactivePayload: [String: Any] = [
                 "sessions": [
@@ -1630,7 +1806,7 @@ final class TerminalControllerSocketSecurityTests {
             Issue.record("Unknown transfer revocation")
         }
 
-        if revocation != "inactive-hook" {
+        if revocation != "inactive-hook" && revocation != "transcript-binding" {
             let revokedSnapshot = try #require(await snapshotIterator.next())
             app.acceptAgentReportAvailability(revokedSnapshot)
             #expect(!app.agentReportCopyControlAvailability(
@@ -1661,6 +1837,10 @@ final class TerminalControllerSocketSecurityTests {
         )
         #expect(revokedPasteboard.changeCount == revokedChangeCount)
         #expect(revokedPasteboard.string(forType: .string) == "preserve revoked")
+        for remainingWorkspace in manager.tabs {
+            remainingWorkspace.teardownAllPanels()
+        }
+        await controller.awaitAgentReportPurgesForTesting(store: store)
     }
 
     @Test func terminalRespawnRevokesReusedReportLifecycleBeforeReplacementExposure() async throws {
@@ -1672,8 +1852,10 @@ final class TerminalControllerSocketSecurityTests {
         let manager = TabManager()
         let workspace = try #require(manager.selectedWorkspace)
         let originalPanel = try #require(workspace.focusedTerminalPanel)
+        let workspaceID = workspace.id
         let runtimeSurfaceID = originalPanel.id
         let stableSurfaceID = originalPanel.stableSurfaceId
+        let originalPanelInstanceID = ObjectIdentifier(originalPanel)
         let exactOldBody = "  old lifecycle report\nno-extra-newline"
         let exactFreshBody = "  replacement lifecycle report ✅\nexact-end"
         let home = FileManager.default.temporaryDirectory
@@ -1683,7 +1865,7 @@ final class TerminalControllerSocketSecurityTests {
         let payload: [String: Any] = [
             "sessions": [
                 "lifecycle-session": [
-                    "workspaceId": workspace.id.uuidString,
+                    "workspaceId": workspaceID.uuidString,
                     "surfaceId": runtimeSurfaceID.uuidString,
                     "transcriptPath": "/synthetic/lifecycle.jsonl",
                     "lastPromptTurnId": "lifecycle-turn",
@@ -1707,7 +1889,7 @@ final class TerminalControllerSocketSecurityTests {
             sessionID: "lifecycle-session",
             source: "codex",
             surfaceID: runtimeSurfaceID.uuidString,
-            workspaceID: workspace.id.uuidString,
+            workspaceID: workspaceID.uuidString,
             workingDirectory: nil
         )
         let service = AgentChatTranscriptService(
@@ -1719,16 +1901,19 @@ final class TerminalControllerSocketSecurityTests {
         let app = AppDelegate()
         app.tabManager = manager
         app.applyAgentReportCapturePolicy(true)
+        app.setAgentReportCaptureStoreForTesting(store)
         AppDelegate.shared = app
         controller.tabManager = manager
         controller.agentChatTranscriptService = service
         controller.agentReportCaptureStore = store
-        let purges = AsyncStream<UUID> { continuation in
-            controller.agentReportPurgeObserverForTesting = { continuation.yield($0) }
-        }
-        var purgeIterator = purges.makeAsyncIterator()
+        let purgeObservation = controller.observeAgentReportPurgesForTesting(
+            store: store,
+            runtimeSurfaceID: runtimeSurfaceID
+        )
+        var purgeIterator = purgeObservation.stream.makeAsyncIterator()
         defer {
-            controller.agentReportPurgeObserverForTesting = nil
+            controller.stopObservingAgentReportPurgesForTesting(id: purgeObservation.id)
+            app.setAgentReportCaptureStoreForTesting(nil)
             controller.tabManager = previousTabManager
             controller.agentChatTranscriptService = previousService
             controller.agentReportCaptureStore = previousStore
@@ -1745,7 +1930,7 @@ final class TerminalControllerSocketSecurityTests {
         let oldRequest = agentReportRequest(workspace: workspace, panel: originalPanel, raw: exactOldBody)
         let oldLifecycleToken = service.agentReportLifecycleToken(for: runtimeSurfaceID)
         let oldTarget = AgentReportCaptureTarget(
-            workspaceID: workspace.id,
+            workspaceID: workspaceID,
             runtimeSurfaceID: runtimeSurfaceID,
             stableSurfaceID: stableSurfaceID,
             agentSessionID: oldRequest.agentSessionID,
@@ -1758,9 +1943,10 @@ final class TerminalControllerSocketSecurityTests {
             target: oldTarget,
             revalidateTarget: { oldTarget }
         ) == .captured)
-        app.acceptAgentReportAvailability(try #require(await snapshotIterator.next()))
+        let oldAvailabilitySnapshot = try #require(await snapshotIterator.next())
+        app.acceptAgentReportAvailability(oldAvailabilitySnapshot)
         #expect(app.agentReportCopyControlAvailability(
-            workspaceID: workspace.id,
+            workspaceID: workspaceID,
             runtimeSurfaceID: runtimeSurfaceID,
             representedSurface: originalPanel.surface
         ).hasReport)
@@ -1774,7 +1960,7 @@ final class TerminalControllerSocketSecurityTests {
             authorize: { context in
                 await controller.authorizesAgentReportCopy(
                     context,
-                    representedWorkspaceID: workspace.id,
+                    representedWorkspaceID: workspaceID,
                     representedSurfaceID: runtimeSurfaceID
                 )
             }
@@ -1783,7 +1969,7 @@ final class TerminalControllerSocketSecurityTests {
 
         let pendingRequest = AgentReportCaptureRequest(
             provider: .codex,
-            workspaceID: workspace.id,
+            workspaceID: workspaceID,
             runtimeSurfaceID: runtimeSurfaceID,
             agentSessionID: "pending-old-session",
             turnID: "pending-old-turn",
@@ -1793,7 +1979,7 @@ final class TerminalControllerSocketSecurityTests {
             completionTimestamp: Date(timeIntervalSince1970: 101)
         )
         let pendingTarget = AgentReportCaptureTarget(
-            workspaceID: workspace.id,
+            workspaceID: workspaceID,
             runtimeSurfaceID: runtimeSurfaceID,
             stableSurfaceID: stableSurfaceID,
             agentSessionID: pendingRequest.agentSessionID,
@@ -1810,19 +1996,44 @@ final class TerminalControllerSocketSecurityTests {
         }
         await recovery.waitUntilRecoveryStarted()
 
-        let replacementPanel = try #require(workspace.respawnTerminalSurface(
-            panelId: runtimeSurfaceID,
-            command: "true",
-            focus: false
-        ))
+        let finalGatePasteboard = NSPasteboard(
+            name: .init("cmux-respawn-final-gate-\(UUID().uuidString)")
+        )
+        finalGatePasteboard.clearContents()
+        finalGatePasteboard.setString("preserve during final gate", forType: .string)
+        let finalGateChangeCount = finalGatePasteboard.changeCount
+        let copiedDuringFinalGate = await app.copyLatestAgentReport(
+            workspaceID: workspaceID,
+            runtimeSurfaceID: runtimeSurfaceID,
+            to: finalGatePasteboard,
+            beforeFinalWrite: { receipt in
+                #expect(receipt.runtimeSurfaceID == runtimeSurfaceID)
+                #expect(receipt.stableSurfaceID == stableSurfaceID)
+                #expect(receipt.lifecycleToken == oldLifecycleToken)
+                #expect(receipt.panelInstanceID == originalPanelInstanceID)
+                let finalGateWorkspace = AppDelegate.shared?.tabManager?.tabs.first(where: {
+                    $0.id == workspaceID
+                })
+                _ = finalGateWorkspace?.respawnTerminalSurface(
+                    panelId: runtimeSurfaceID,
+                    command: "true",
+                    focus: false
+                )
+            }
+        )
+        #expect(copiedDuringFinalGate == false)
+        #expect(finalGatePasteboard.changeCount == finalGateChangeCount)
+        #expect(finalGatePasteboard.string(forType: .string) == "preserve during final gate")
+        let replacementPanel = try #require(workspace.panels[runtimeSurfaceID] as? TerminalPanel)
         #expect(replacementPanel !== originalPanel)
         #expect(replacementPanel.surface !== originalPanel.surface)
         #expect(replacementPanel.id == runtimeSurfaceID)
         #expect(replacementPanel.stableSurfaceId == stableSurfaceID)
         #expect(service.agentReportLifecycleToken(for: runtimeSurfaceID) != oldLifecycleToken)
+        app.acceptAgentReportAvailability(oldAvailabilitySnapshot)
 
         let immediateAvailability = app.agentReportCopyControlAvailability(
-            workspaceID: workspace.id,
+            workspaceID: workspaceID,
             runtimeSurfaceID: runtimeSurfaceID,
             representedSurface: replacementPanel.surface
         )
@@ -1831,7 +2042,7 @@ final class TerminalControllerSocketSecurityTests {
         replacementPanel.hostedView.synchronizeAgentReportCopyControl()
         #expect(!replacementPanel.hostedView.agentReportCopyButtonForTesting.isEnabled)
         let unavailableMenuItem = replacementPanel.hostedView.surfaceView.makeAgentReportCopyMenuItem(
-            workspaceID: workspace.id,
+            workspaceID: workspaceID,
             runtimeSurfaceID: runtimeSurfaceID,
             isCaptureEnabled: immediateAvailability.isCaptureEnabled,
             hasReport: immediateAvailability.hasReport
@@ -1849,7 +2060,7 @@ final class TerminalControllerSocketSecurityTests {
             authorize: { context in
                 await controller.authorizesAgentReportCopy(
                     context,
-                    representedWorkspaceID: workspace.id,
+                    representedWorkspaceID: workspaceID,
                     representedSurfaceID: runtimeSurfaceID
                 )
             }
@@ -1873,7 +2084,7 @@ final class TerminalControllerSocketSecurityTests {
         #expect(app.handleAgentReportCopyShortcut(
             event: shiftCommandC,
             captureEnabled: true,
-            targetResolver: { _ in (workspace.id, runtimeSurfaceID) },
+            targetResolver: { _ in (workspaceID, runtimeSurfaceID) },
             performCopy: { shortcutTargets.append(($0, $1)) }
         ))
         #expect(shortcutTargets.count == 1)
@@ -1899,13 +2110,14 @@ final class TerminalControllerSocketSecurityTests {
 
         #expect(await purgeIterator.next() == runtimeSurfaceID)
         #expect(await store.latestReport(runtimeSurfaceID: runtimeSurfaceID) == nil)
+        await controller.awaitAgentReportPurgesForTesting(store: store)
         await recovery.resumeRecovery()
         #expect(await pendingCapture.value == .rejected(.inaccessibleSurface))
         #expect(await store.latestReport(runtimeSurfaceID: runtimeSurfaceID) == nil)
 
         let freshRequest = agentReportRequest(workspace: workspace, panel: replacementPanel, raw: exactFreshBody)
         let freshTarget = AgentReportCaptureTarget(
-            workspaceID: workspace.id,
+            workspaceID: workspaceID,
             runtimeSurfaceID: runtimeSurfaceID,
             stableSurfaceID: replacementPanel.stableSurfaceId,
             agentSessionID: freshRequest.agentSessionID,
@@ -1922,7 +2134,7 @@ final class TerminalControllerSocketSecurityTests {
         var freshSnapshotIterator = freshSnapshots.makeAsyncIterator()
         app.acceptAgentReportAvailability(try #require(await freshSnapshotIterator.next()))
         #expect(app.agentReportCopyControlAvailability(
-            workspaceID: workspace.id,
+            workspaceID: workspaceID,
             runtimeSurfaceID: runtimeSurfaceID,
             representedSurface: replacementPanel.surface
         ).hasReport)
@@ -1934,7 +2146,7 @@ final class TerminalControllerSocketSecurityTests {
             authorize: { context in
                 await controller.authorizesAgentReportCopy(
                     context,
-                    representedWorkspaceID: workspace.id,
+                    representedWorkspaceID: workspaceID,
                     representedSurfaceID: runtimeSurfaceID
                 )
             }
@@ -1952,12 +2164,16 @@ final class TerminalControllerSocketSecurityTests {
         #expect(secondReplacement.stableSurfaceId == stableSurfaceID)
         #expect(service.agentReportLifecycleToken(for: runtimeSurfaceID) != secondLifecycleToken)
         #expect(!app.agentReportCopyControlAvailability(
-            workspaceID: workspace.id,
+            workspaceID: workspaceID,
             runtimeSurfaceID: runtimeSurfaceID,
             representedSurface: secondReplacement.surface
         ).hasReport)
         #expect(await purgeIterator.next() == runtimeSurfaceID)
         #expect(await store.latestReport(runtimeSurfaceID: runtimeSurfaceID) == nil)
+        for remainingWorkspace in manager.tabs {
+            remainingWorkspace.teardownAllPanels()
+        }
+        await controller.awaitAgentReportPurgesForTesting(store: store)
     }
 
     @Test func repeatedWorkspaceTeardownPurgesEachSurfaceExactlyOnce() async throws {
@@ -1969,16 +2185,13 @@ final class TerminalControllerSocketSecurityTests {
             transcriptRecovery: SuspendedEndpointAgentReportRecovery(reply: "unused")
         )
         controller.agentReportCaptureStore = store
-        var purgeCount = 0
-        let purges = AsyncStream<UUID> { continuation in
-            controller.agentReportPurgeObserverForTesting = { surfaceID in
-                if surfaceID == panel.id { purgeCount += 1 }
-                continuation.yield(surfaceID)
-            }
-        }
-        var purgeIterator = purges.makeAsyncIterator()
+        let purgeObservation = controller.observeAgentReportPurgesForTesting(
+            store: store,
+            runtimeSurfaceID: panel.id
+        )
+        var purgeIterator = purgeObservation.stream.makeAsyncIterator()
         defer {
-            controller.agentReportPurgeObserverForTesting = nil
+            controller.stopObservingAgentReportPurgesForTesting(id: purgeObservation.id)
             controller.agentReportCaptureStore = nil
             workspace.teardownAllPanels()
         }
@@ -1992,8 +2205,11 @@ final class TerminalControllerSocketSecurityTests {
         workspace.teardownAllPanels()
         #expect(await purgeIterator.next() == panel.id)
         workspace.teardownAllPanels()
+        await controller.awaitAgentReportPurgesForTesting(store: store)
 
-        #expect(purgeCount == 1)
+        #expect(
+            controller.agentReportPurgeObservationCountForTesting(id: purgeObservation.id) == 1
+        )
         #expect(await store.latestReport(runtimeSurfaceID: panel.id) == nil)
     }
 

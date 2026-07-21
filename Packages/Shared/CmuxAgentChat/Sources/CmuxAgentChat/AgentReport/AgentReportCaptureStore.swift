@@ -17,6 +17,9 @@ import Foundation
 public actor AgentReportCaptureStore {
     private var policy: AgentReportCapturePolicy
     private var latestByRuntimeSurfaceID: [UUID: AgentReport] = [:]
+    private var latestFinalWriteCapabilityByRuntimeSurfaceID: [
+        UUID: AgentReportFinalWriteCapability
+    ] = [:]
     private var latestReceiptOrdinalByRuntimeSurfaceID: [UUID: UInt64] = [:]
     private var lifecycleGenerationByRuntimeSurfaceID: [UUID: UInt64] = [:]
     private var capturedLifecycleGenerationByRuntimeSurfaceID: [UUID: UInt64] = [:]
@@ -25,6 +28,7 @@ public actor AgentReportCaptureStore {
     ] = [:]
     private var policyGeneration: UInt64 = 0
     private var nextReceiptOrdinal: UInt64 = 0
+    private nonisolated let availabilityRevisionAuthority: AgentReportAvailabilityRevisionAuthority
     private let transcriptRecovery: any AgentReportTranscriptRecovering
     private let now: @Sendable () -> Date
 
@@ -32,14 +36,17 @@ public actor AgentReportCaptureStore {
     ///
     /// - Parameters:
     ///   - policy: Initial policy. Defaults to disabled.
+    ///   - availabilityRevisionAuthority: Shared synchronous revision source.
     ///   - transcriptRecovery: Exact structured-transcript recovery service.
     ///   - now: Injectable capture clock.
     public init(
         policy: AgentReportCapturePolicy = .disabled,
+        availabilityRevisionAuthority: AgentReportAvailabilityRevisionAuthority = .init(),
         transcriptRecovery: any AgentReportTranscriptRecovering,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.policy = policy
+        self.availabilityRevisionAuthority = availabilityRevisionAuthority
         self.transcriptRecovery = transcriptRecovery
         self.now = now
     }
@@ -57,7 +64,9 @@ public actor AgentReportCaptureStore {
     public func setPolicy(_ newPolicy: AgentReportCapturePolicy) {
         guard policy != newPolicy else {
             if !newPolicy.isEnabled {
+                invalidateAllFinalWriteCapabilities()
                 latestByRuntimeSurfaceID.removeAll(keepingCapacity: false)
+                latestFinalWriteCapabilityByRuntimeSurfaceID.removeAll(keepingCapacity: false)
                 latestReceiptOrdinalByRuntimeSurfaceID.removeAll(keepingCapacity: false)
                 lifecycleGenerationByRuntimeSurfaceID.removeAll(keepingCapacity: false)
                 capturedLifecycleGenerationByRuntimeSurfaceID.removeAll(keepingCapacity: false)
@@ -68,7 +77,9 @@ public actor AgentReportCaptureStore {
         policy = newPolicy
         policyGeneration &+= 1
         if !newPolicy.isEnabled {
+            invalidateAllFinalWriteCapabilities()
             latestByRuntimeSurfaceID.removeAll(keepingCapacity: false)
+            latestFinalWriteCapabilityByRuntimeSurfaceID.removeAll(keepingCapacity: false)
             latestReceiptOrdinalByRuntimeSurfaceID.removeAll(keepingCapacity: false)
             lifecycleGenerationByRuntimeSurfaceID.removeAll(keepingCapacity: false)
             capturedLifecycleGenerationByRuntimeSurfaceID.removeAll(keepingCapacity: false)
@@ -84,7 +95,8 @@ public actor AgentReportCaptureStore {
         latestByRuntimeSurfaceID[runtimeSurfaceID]
     }
 
-    /// Returns an exact report body only after fresh caller-supplied authority.
+    /// Returns an exact report body and body-free final-write receipt only after
+    /// fresh caller-supplied authority.
     ///
     /// This is the sole report-body reveal seam. It never performs transcript
     /// recovery or terminal/scrollback reads. Policy, lifecycle generation, and
@@ -93,24 +105,59 @@ public actor AgentReportCaptureStore {
     ///
     /// - Parameters:
     ///   - runtimeSurfaceID: Exact process-local surface requested by the user.
-    ///   - authorize: Fresh app authority check using body-free metadata.
-    /// - Returns: The unmodified body, or `nil` when unavailable or unauthorized.
-    public func authorizedReportBody(
+    ///   - capturePolicyRevision: Main-actor policy revision observed by the caller.
+    ///   - availabilityRevision: Exact host-accepted availability revision.
+    ///   - authorize: Fresh app authority check returning a body-free receipt.
+    /// - Returns: The unmodified body and receipt, or `nil` when unauthorized.
+    public func authorizedReport(
         runtimeSurfaceID: UUID,
-        authorize: @escaping @Sendable (AgentReportCopyAuthorizationContext) async -> Bool
-    ) async -> String? {
+        capturePolicyRevision: UInt64,
+        availabilityRevision: AgentReportAvailabilityRevision,
+        authorize: @escaping @Sendable (
+            AgentReportCopyAuthorizationContext
+        ) async -> AgentReportWriteAuthorizationReceipt?
+    ) async -> (body: String, receipt: AgentReportWriteAuthorizationReceipt)? {
         guard policy.isEnabled,
               let report = latestByRuntimeSurfaceID[runtimeSurfaceID],
+              let finalWriteCapability = latestFinalWriteCapabilityByRuntimeSurfaceID[
+                  runtimeSurfaceID
+              ],
+              finalWriteCapability.isValid,
               capturedLifecycleGenerationByRuntimeSurfaceID[runtimeSurfaceID]
                 == lifecycleGenerationByRuntimeSurfaceID[runtimeSurfaceID, default: 0],
-              await authorize(AgentReportCopyAuthorizationContext(report: report)),
+              let receipt = await authorize(AgentReportCopyAuthorizationContext(
+                  report: report,
+                  captureStorePolicyGeneration: policyGeneration,
+                  capturePolicyRevision: capturePolicyRevision,
+                  availabilityRevision: availabilityRevision,
+                  finalWriteCapability: finalWriteCapability
+              )),
               policy.isEnabled,
               latestByRuntimeSurfaceID[runtimeSurfaceID] == report,
+              latestFinalWriteCapabilityByRuntimeSurfaceID[runtimeSurfaceID]
+                === finalWriteCapability,
+              finalWriteCapability.isValid,
+              receipt.matches(AgentReportCopyAuthorizationContext(
+                  report: report,
+                  captureStorePolicyGeneration: policyGeneration,
+                  capturePolicyRevision: capturePolicyRevision,
+                  availabilityRevision: availabilityRevision,
+                  finalWriteCapability: finalWriteCapability
+              )),
               capturedLifecycleGenerationByRuntimeSurfaceID[runtimeSurfaceID]
                 == lifecycleGenerationByRuntimeSurfaceID[runtimeSurfaceID, default: 0] else {
             return nil
         }
-        return report.finalReply
+        return (report.finalReply, receipt)
+    }
+
+    /// Advances a synchronous host revocation barrier in the store's ordering domain.
+    ///
+    /// - Returns: A revision newer than every snapshot already produced.
+    public nonisolated func advanceAvailabilityRevisionBarrier()
+        -> AgentReportAvailabilityRevision
+    {
+        availabilityRevisionAuthority.advance()
     }
 
     /// Observes content-free report availability without polling.
@@ -128,7 +175,9 @@ public actor AgentReportCaptureStore {
             bufferingPolicy: .bufferingNewest(1)
         )
         availabilityContinuations[id] = continuation
-        continuation.yield(availabilitySnapshot())
+        continuation.yield(availabilitySnapshot(
+            revision: availabilityRevisionAuthority.advance()
+        ))
         continuation.onTermination = { [weak self] _ in
             Task { await self?.removeAvailabilityContinuation(id: id) }
         }
@@ -141,6 +190,8 @@ public actor AgentReportCaptureStore {
     public func purge(runtimeSurfaceID: UUID) {
         invalidatePendingCapture(runtimeSurfaceID: runtimeSurfaceID)
         latestByRuntimeSurfaceID.removeValue(forKey: runtimeSurfaceID)
+        latestFinalWriteCapabilityByRuntimeSurfaceID.removeValue(forKey: runtimeSurfaceID)?
+            .invalidate()
         latestReceiptOrdinalByRuntimeSurfaceID.removeValue(forKey: runtimeSurfaceID)
         capturedLifecycleGenerationByRuntimeSurfaceID.removeValue(forKey: runtimeSurfaceID)
         publishAvailability()
@@ -153,6 +204,7 @@ public actor AgentReportCaptureStore {
     /// - Parameter runtimeSurfaceID: Surface whose in-flight generation changes.
     public func invalidatePendingCapture(runtimeSurfaceID: UUID) {
         lifecycleGenerationByRuntimeSurfaceID[runtimeSurfaceID, default: 0] &+= 1
+        latestFinalWriteCapabilityByRuntimeSurfaceID[runtimeSurfaceID]?.invalidate()
         publishAvailability()
     }
 
@@ -256,6 +308,9 @@ public actor AgentReportCaptureStore {
         guard currentTarget.lifecycleToken == target.lifecycleToken else {
             return .rejected(.inaccessibleSurface)
         }
+        guard currentTarget.transcriptBinding == target.transcriptBinding else {
+            return .rejected(.inaccessibleSurface)
+        }
         if let existing = latestByRuntimeSurfaceID[request.runtimeSurfaceID] {
             if existing.duplicateIdentity == identity {
                 return .duplicate
@@ -269,7 +324,10 @@ public actor AgentReportCaptureStore {
             return .rejected(.exactReplyUnavailable)
         }
 
+        latestFinalWriteCapabilityByRuntimeSurfaceID[request.runtimeSurfaceID]?.invalidate()
+        let finalWriteCapability = AgentReportFinalWriteCapability()
         latestByRuntimeSurfaceID[request.runtimeSurfaceID] = AgentReport(
+            reportIdentity: UUID(),
             provider: request.provider,
             runtimeSurfaceID: request.runtimeSurfaceID,
             stableSurfaceID: currentTarget.stableSurfaceID,
@@ -278,6 +336,7 @@ public actor AgentReportCaptureStore {
             turnID: request.turnID,
             completionKind: request.completionKind,
             lifecycleToken: currentTarget.lifecycleToken,
+            transcriptBinding: currentTarget.transcriptBinding,
             finalReply: exactReply,
             captureSource: source,
             capturedAt: now(),
@@ -285,6 +344,7 @@ public actor AgentReportCaptureStore {
             completionTimestamp: request.completionTimestamp,
             duplicateIdentity: identity
         )
+        latestFinalWriteCapabilityByRuntimeSurfaceID[request.runtimeSurfaceID] = finalWriteCapability
         latestReceiptOrdinalByRuntimeSurfaceID[request.runtimeSurfaceID] = receiptOrdinal
         capturedLifecycleGenerationByRuntimeSurfaceID[request.runtimeSurfaceID] = lifecycleGeneration
         publishAvailability()
@@ -338,9 +398,12 @@ public actor AgentReportCaptureStore {
     }
 
     /// Builds the narrow content-free projection used by visible controls.
-    private func availabilitySnapshot() -> AgentReportAvailabilitySnapshot {
+    private func availabilitySnapshot(
+        revision: AgentReportAvailabilityRevision
+    ) -> AgentReportAvailabilitySnapshot {
         guard policy.isEnabled else {
             return AgentReportAvailabilitySnapshot(
+                revision: revision,
                 isCaptureEnabled: false,
                 availableRuntimeSurfaceIDs: []
             )
@@ -354,6 +417,7 @@ public actor AgentReportCaptureStore {
             result.insert(surfaceID)
         }
         return AgentReportAvailabilitySnapshot(
+            revision: revision,
             isCaptureEnabled: true,
             availableRuntimeSurfaceIDs: available
         )
@@ -361,7 +425,9 @@ public actor AgentReportCaptureStore {
 
     /// Publishes a content-free newest-value snapshot to every subscriber.
     private func publishAvailability() {
-        let snapshot = availabilitySnapshot()
+        let snapshot = availabilitySnapshot(
+            revision: availabilityRevisionAuthority.advance()
+        )
         for continuation in availabilityContinuations.values {
             continuation.yield(snapshot)
         }
@@ -370,5 +436,12 @@ public actor AgentReportCaptureStore {
     /// Removes a terminated availability subscriber.
     private func removeAvailabilityContinuation(id: UUID) {
         availabilityContinuations.removeValue(forKey: id)
+    }
+
+    /// Permanently revokes every retained report's synchronous final-write bit.
+    private func invalidateAllFinalWriteCapabilities() {
+        for capability in latestFinalWriteCapabilityByRuntimeSurfaceID.values {
+            capability.invalidate()
+        }
     }
 }
