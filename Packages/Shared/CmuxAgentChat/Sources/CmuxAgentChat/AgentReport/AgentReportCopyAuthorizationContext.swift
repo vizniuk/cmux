@@ -8,6 +8,9 @@ import Foundation
 public struct AgentReportCopyAuthorizationContext: Sendable, Equatable,
     CustomStringConvertible, CustomDebugStringConvertible
 {
+    /// Actor-issued monotonic ordering identity for the retained report.
+    public let captureAttemptToken: AgentReportCaptureAttemptToken
+
     /// Opaque identity of the exact actor-owned retained report.
     public let reportIdentity: UUID
 
@@ -66,6 +69,7 @@ public struct AgentReportCopyAuthorizationContext: Sendable, Equatable,
         availabilityRevision: AgentReportAvailabilityRevision,
         finalWriteCapability: AgentReportFinalWriteCapability
     ) {
+        captureAttemptToken = report.captureAttemptToken
         reportIdentity = report.reportIdentity
         provider = report.provider
         workspaceID = report.workspaceID
@@ -97,11 +101,30 @@ public struct AgentReportCopyAuthorizationContext: Sendable, Equatable,
         )
     }
 
+    /// The exact body-free commit identity required from current registry authority.
+    public var resolvedAuthorityCommit: AgentReportResolvedAuthorityCommit {
+        AgentReportResolvedAuthorityCommit(
+            captureAttemptToken: captureAttemptToken,
+            reportIdentity: reportIdentity,
+            provider: provider,
+            captureWorkspaceID: workspaceID,
+            runtimeSurfaceID: runtimeSurfaceID,
+            stableSurfaceID: stableSurfaceID,
+            agentSessionID: agentSessionID,
+            turnID: turnID,
+            completionKind: completionKind,
+            lifecycleToken: lifecycleToken,
+            transcriptBinding: transcriptBinding,
+            authorityRevision: authorityRevision
+        )
+    }
+
     public static func == (
         lhs: AgentReportCopyAuthorizationContext,
         rhs: AgentReportCopyAuthorizationContext
     ) -> Bool {
-        lhs.reportIdentity == rhs.reportIdentity
+        lhs.captureAttemptToken == rhs.captureAttemptToken
+            && lhs.reportIdentity == rhs.reportIdentity
             && lhs.provider == rhs.provider
             && lhs.workspaceID == rhs.workspaceID
             && lhs.runtimeSurfaceID == rhs.runtimeSurfaceID
@@ -116,5 +139,24 @@ public struct AgentReportCopyAuthorizationContext: Sendable, Equatable,
             && lhs.capturePolicyRevision == rhs.capturePolicyRevision
             && lhs.availabilityRevision == rhs.availabilityRevision
             && lhs.finalWriteCapability === rhs.finalWriteCapability
+    }
+
+    /// Whether current registry authority is the exact retained report commit.
+    ///
+    /// - Parameter authority: Body-free authority returned by the registry.
+    /// - Returns: `true` only when every committed identity component matches.
+    public func matches(_ authority: AgentReportResolvedAuthorityCommit) -> Bool {
+        captureAttemptToken == authority.captureAttemptToken
+            && reportIdentity == authority.reportIdentity
+            && provider == authority.provider
+            && workspaceID == authority.captureWorkspaceID
+            && runtimeSurfaceID == authority.runtimeSurfaceID
+            && stableSurfaceID == authority.stableSurfaceID
+            && agentSessionID == authority.agentSessionID
+            && turnID == authority.turnID
+            && completionKind == authority.completionKind
+            && lifecycleToken == authority.lifecycleToken
+            && transcriptBinding == authority.transcriptBinding
+            && authorityRevision == authority.authorityRevision
     }
 }

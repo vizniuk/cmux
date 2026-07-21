@@ -251,8 +251,7 @@ struct AgentChatSessionRegistryHookStoreTests {
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: transcriptPath,
-            lifecycleToken: lifecycleToken
+            requestedTranscriptPath: transcriptPath
         )
 
         #expect(accepted?.recordedTranscriptPathHint == transcriptPath)
@@ -261,40 +260,35 @@ struct AgentChatSessionRegistryHookStoreTests {
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: transcriptPath,
-            lifecycleToken: lifecycleToken
+            requestedTranscriptPath: transcriptPath
         ) == nil)
         #expect(await registry.agentReportCaptureRoute(
             workspaceID: workspaceID,
             surfaceID: UUID().uuidString,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: transcriptPath,
-            lifecycleToken: lifecycleToken
+            requestedTranscriptPath: transcriptPath
         ) == nil)
         #expect(await registry.agentReportCaptureRoute(
             workspaceID: workspaceID,
             surfaceID: surfaceID,
             sessionID: "other-session",
             turnID: turnID,
-            requestedTranscriptPath: transcriptPath,
-            lifecycleToken: lifecycleToken
+            requestedTranscriptPath: transcriptPath
         ) == nil)
         #expect(await registry.agentReportCaptureRoute(
             workspaceID: workspaceID,
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: "stale-turn",
-            requestedTranscriptPath: transcriptPath,
-            lifecycleToken: lifecycleToken
+            requestedTranscriptPath: transcriptPath
         ) == nil)
         #expect(await registry.agentReportCaptureRoute(
             workspaceID: workspaceID,
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: home.appendingPathComponent("other-session.jsonl").path,
-            lifecycleToken: lifecycleToken
+            requestedTranscriptPath: home.appendingPathComponent("other-session.jsonl").path
         ) == nil)
     }
 
@@ -340,19 +334,19 @@ struct AgentChatSessionRegistryHookStoreTests {
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: transcriptPath,
-            lifecycleToken: lifecycleToken
+            requestedTranscriptPath: transcriptPath
         ))
-        let establishedRoute = try #require(await registry.agentReportCaptureRoute(
+        let authority = agentReportAuthority(
             workspaceID: captureWorkspaceID,
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: transcriptPath,
             lifecycleToken: lifecycleToken,
-            resolvedTranscriptBinding: transcriptBinding
-        ))
-        #expect(establishedRoute == initialRoute)
+            route: initialRoute,
+            transcriptBinding: transcriptBinding,
+            orderingValue: 1
+        )
+        #expect(await registry.publishAgentReportResolvedAuthority(authority))
         let alternateSpelling = home
             .appendingPathComponent("spelling", isDirectory: true)
             .appendingPathComponent("..", isDirectory: true)
@@ -363,8 +357,7 @@ struct AgentChatSessionRegistryHookStoreTests {
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: alternateSpelling,
-            lifecycleToken: lifecycleToken
+            requestedTranscriptPath: alternateSpelling
         )?.authorityRevision == initialRoute.authorityRevision)
 
         service.updateSessionWorkspace(sessionID: sessionID, workspaceID: displayWorkspaceID)
@@ -375,55 +368,50 @@ struct AgentChatSessionRegistryHookStoreTests {
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: transcriptPath,
-            lifecycleToken: lifecycleToken
+            requestedTranscriptPath: transcriptPath
         ) == nil)
-        #expect(await registry.agentReportCopyAuthority(
-            captureWorkspaceID: captureWorkspaceID,
-            surfaceID: surfaceID,
-            sessionID: sessionID,
-            turnID: turnID,
-            lifecycleToken: lifecycleToken,
-            authorityRevision: initialRoute.authorityRevision,
-            transcriptBinding: transcriptBinding
-        )?.transcriptBinding == transcriptBinding)
+        #expect(await registry.agentReportCopyAuthority(authority) == authority)
 
-        #expect(await registry.agentReportCopyAuthority(
-            captureWorkspaceID: displayWorkspaceID,
+        #expect(await registry.agentReportCopyAuthority(agentReportAuthority(
+            workspaceID: displayWorkspaceID,
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: turnID,
             lifecycleToken: lifecycleToken,
-            authorityRevision: initialRoute.authorityRevision,
-            transcriptBinding: transcriptBinding
-        ) == nil)
-        #expect(await registry.agentReportCopyAuthority(
-            captureWorkspaceID: captureWorkspaceID,
+            route: initialRoute,
+            transcriptBinding: transcriptBinding,
+            orderingValue: 1
+        )) == nil)
+        #expect(await registry.agentReportCopyAuthority(agentReportAuthority(
+            workspaceID: captureWorkspaceID,
             surfaceID: UUID().uuidString,
             sessionID: sessionID,
             turnID: turnID,
             lifecycleToken: lifecycleToken,
-            authorityRevision: initialRoute.authorityRevision,
-            transcriptBinding: transcriptBinding
-        ) == nil)
-        #expect(await registry.agentReportCopyAuthority(
-            captureWorkspaceID: captureWorkspaceID,
+            route: initialRoute,
+            transcriptBinding: transcriptBinding,
+            orderingValue: 1
+        )) == nil)
+        #expect(await registry.agentReportCopyAuthority(agentReportAuthority(
+            workspaceID: captureWorkspaceID,
             surfaceID: surfaceID,
             sessionID: "different-session",
             turnID: turnID,
             lifecycleToken: lifecycleToken,
-            authorityRevision: initialRoute.authorityRevision,
-            transcriptBinding: transcriptBinding
-        ) == nil)
-        #expect(await registry.agentReportCopyAuthority(
-            captureWorkspaceID: captureWorkspaceID,
+            route: initialRoute,
+            transcriptBinding: transcriptBinding,
+            orderingValue: 1
+        )) == nil)
+        #expect(await registry.agentReportCopyAuthority(agentReportAuthority(
+            workspaceID: captureWorkspaceID,
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: "different-turn",
             lifecycleToken: lifecycleToken,
-            authorityRevision: initialRoute.authorityRevision,
-            transcriptBinding: transcriptBinding
-        ) == nil)
+            route: initialRoute,
+            transcriptBinding: transcriptBinding,
+            orderingValue: 1
+        )) == nil)
 
         service.noteHookEvent(WorkstreamEvent(
             sessionId: sessionID,
@@ -433,15 +421,7 @@ struct AgentChatSessionRegistryHookStoreTests {
             surfaceId: surfaceID,
             transcriptPath: transcriptPath
         ))
-        #expect(await registry.agentReportCopyAuthority(
-            captureWorkspaceID: captureWorkspaceID,
-            surfaceID: surfaceID,
-            sessionID: sessionID,
-            turnID: turnID,
-            lifecycleToken: lifecycleToken,
-            authorityRevision: initialRoute.authorityRevision,
-            transcriptBinding: transcriptBinding
-        ) == nil)
+        #expect(await registry.agentReportCopyAuthority(authority) == nil)
 
         let wrongProviderRegistry = AgentChatSessionRegistry(
             hookStore: AgentChatHookSessionStore(homeDirectory: home)
@@ -454,15 +434,7 @@ struct AgentChatSessionRegistryHookStoreTests {
             surfaceId: surfaceID,
             transcriptPath: transcriptPath
         ))
-        #expect(await wrongProviderRegistry.agentReportCopyAuthority(
-            captureWorkspaceID: captureWorkspaceID,
-            surfaceID: surfaceID,
-            sessionID: sessionID,
-            turnID: turnID,
-            lifecycleToken: lifecycleToken,
-            authorityRevision: initialRoute.authorityRevision,
-            transcriptBinding: transcriptBinding
-        ) == nil)
+        #expect(await wrongProviderRegistry.agentReportCopyAuthority(authority) == nil)
     }
 
     @MainActor
@@ -483,7 +455,10 @@ struct AgentChatSessionRegistryHookStoreTests {
             updatedAt: Date(timeIntervalSince1970: 1),
             lastPromptTurnID: turnID
         )
-        let gate = AgentReportActiveEntryMutationGate(firstEntry: firstEntry)
+        let gate = AgentReportActiveEntryMutationGate(
+            firstEntry: firstEntry,
+            suspendReadNumber: 8
+        )
         let registry = AgentChatSessionRegistry(
             agentReportActiveEntryReader: { _, _, _, _ in
                 await gate.read()
@@ -500,20 +475,21 @@ struct AgentChatSessionRegistryHookStoreTests {
             surfaceID: surfaceID,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: firstPath,
-            lifecycleToken: lifecycleToken,
-            resolvedTranscriptBinding: transcriptBinding
+            requestedTranscriptPath: firstPath
         ))
+        let authority = agentReportAuthority(
+            workspaceID: captureWorkspaceID,
+            surfaceID: surfaceID,
+            sessionID: sessionID,
+            turnID: turnID,
+            lifecycleToken: lifecycleToken,
+            route: route,
+            transcriptBinding: transcriptBinding,
+            orderingValue: 1
+        )
+        #expect(await registry.publishAgentReportResolvedAuthority(authority))
         let lookup = Task { @MainActor in
-            await registry.agentReportCopyAuthority(
-                captureWorkspaceID: captureWorkspaceID,
-                surfaceID: surfaceID,
-                sessionID: sessionID,
-                turnID: turnID,
-                lifecycleToken: lifecycleToken,
-                authorityRevision: route.authorityRevision,
-                transcriptBinding: transcriptBinding
-            )
+            await registry.agentReportCopyAuthority(authority)
         }
         await gate.waitUntilSecondReadStarted()
         await gate.resumeSecondRead(with: AgentChatHookSessionStore.Entry(
@@ -565,81 +541,73 @@ struct AgentChatSessionRegistryHookStoreTests {
             surfaceID: surfaceID.uuidString,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: nil,
-            lifecycleToken: lifecycleToken,
-            resolvedTranscriptBinding: fallbackF1
+            requestedTranscriptPath: nil
         ))
         #expect(routeF1.recordedTranscriptPathHint == nil)
-        #expect(await registry.agentReportCopyAuthority(
-            captureWorkspaceID: captureWorkspaceID.uuidString,
-            surfaceID: surfaceID.uuidString,
-            sessionID: sessionID,
-            turnID: turnID,
-            lifecycleToken: lifecycleToken,
-            authorityRevision: routeF1.authorityRevision,
-            transcriptBinding: fallbackF1
-        )?.transcriptBinding == fallbackF1)
-
-        let routeF2 = try #require(await registry.agentReportCaptureRoute(
+        let authorityF1 = agentReportAuthority(
             workspaceID: captureWorkspaceID.uuidString,
             surfaceID: surfaceID.uuidString,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: nil,
             lifecycleToken: lifecycleToken,
-            resolvedTranscriptBinding: fallbackF2
-        ))
-        #expect(routeF2.authorityRevision == routeF1.authorityRevision)
-        #expect(await registry.agentReportCopyAuthority(
-            captureWorkspaceID: captureWorkspaceID.uuidString,
+            route: routeF1,
+            transcriptBinding: fallbackF1,
+            orderingValue: 1
+        )
+        let authorityF2 = agentReportAuthority(
+            workspaceID: captureWorkspaceID.uuidString,
             surfaceID: surfaceID.uuidString,
             sessionID: sessionID,
             turnID: turnID,
             lifecycleToken: lifecycleToken,
-            authorityRevision: routeF1.authorityRevision,
-            transcriptBinding: fallbackF1
-        ) == nil)
-        #expect(await registry.agentReportCopyAuthority(
-            captureWorkspaceID: captureWorkspaceID.uuidString,
-            surfaceID: surfaceID.uuidString,
-            sessionID: sessionID,
-            turnID: turnID,
-            lifecycleToken: lifecycleToken,
-            authorityRevision: routeF2.authorityRevision,
-            transcriptBinding: fallbackF2
-        )?.transcriptBinding == fallbackF2)
+            route: routeF1,
+            transcriptBinding: fallbackF2,
+            orderingValue: 2
+        )
+
+        #expect(await registry.publishAgentReportResolvedAuthority(authorityF2))
+        #expect(await registry.publishAgentReportResolvedAuthority(authorityF2))
+        #expect(await registry.publishAgentReportResolvedAuthority(authorityF1) == false)
+        #expect(registry.currentAgentReportResolvedAuthority(runtimeSurfaceID: surfaceID) == authorityF2)
+        #expect(await registry.agentReportCopyAuthority(authorityF2) == authorityF2)
+        #expect(await registry.agentReportCopyAuthority(authorityF1) == nil)
+
+        let equalConflict = AgentReportResolvedAuthorityCommit(
+            captureAttemptToken: authorityF2.captureAttemptToken,
+            reportIdentity: UUID(),
+            provider: authorityF2.provider,
+            captureWorkspaceID: authorityF2.captureWorkspaceID,
+            runtimeSurfaceID: authorityF2.runtimeSurfaceID,
+            stableSurfaceID: authorityF2.stableSurfaceID,
+            agentSessionID: authorityF2.agentSessionID,
+            turnID: authorityF2.turnID,
+            completionKind: authorityF2.completionKind,
+            lifecycleToken: authorityF2.lifecycleToken,
+            transcriptBinding: fallbackF1,
+            authorityRevision: authorityF2.authorityRevision
+        )
+        #expect(await registry.publishAgentReportResolvedAuthority(equalConflict) == false)
+        registry.discardAgentReportResolvedAuthority(authorityF1)
+        #expect(registry.currentAgentReportResolvedAuthority(runtimeSurfaceID: surfaceID) == authorityF2)
 
         registry.invalidateAgentReportResolvedAuthority(runtimeSurfaceID: surfaceID)
-        #expect(await registry.agentReportCopyAuthority(
-            captureWorkspaceID: captureWorkspaceID.uuidString,
-            surfaceID: surfaceID.uuidString,
-            sessionID: sessionID,
-            turnID: turnID,
-            lifecycleToken: lifecycleToken,
-            authorityRevision: routeF2.authorityRevision,
-            transcriptBinding: fallbackF2
-        ) == nil)
+        #expect(registry.currentAgentReportResolvedAuthority(runtimeSurfaceID: surfaceID) == nil)
+        #expect(await registry.publishAgentReportResolvedAuthority(authorityF2) == false)
+        #expect(await registry.agentReportCopyAuthority(authorityF2) == nil)
 
         let restored = try #require(await registry.agentReportCaptureRoute(
             workspaceID: captureWorkspaceID.uuidString,
             surfaceID: surfaceID.uuidString,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: nil,
-            lifecycleToken: lifecycleToken,
-            resolvedTranscriptBinding: fallbackF1
+            requestedTranscriptPath: nil
         ))
         #expect(restored.authorityRevision != routeF1.authorityRevision)
-        #expect(await registry.agentReportCopyAuthority(
-            captureWorkspaceID: captureWorkspaceID.uuidString,
-            surfaceID: surfaceID.uuidString,
-            sessionID: sessionID,
-            turnID: turnID,
-            lifecycleToken: lifecycleToken,
-            authorityRevision: routeF1.authorityRevision,
-            transcriptBinding: fallbackF1
-        ) == nil)
-        #expect(!String(describing: restored).contains("fallback"))
+        #expect(!String(describing: authorityF2).contains("fallback"))
+        #expect(!String(describing: authorityF2).contains(sessionID))
+        #expect(!String(describing: authorityF2).contains(turnID))
+        #expect(!String(describing: authorityF2).contains(surfaceID.uuidString))
+        #expect(!String(describing: authorityF2.captureAttemptToken).contains("2"))
     }
 
     @MainActor
@@ -683,8 +651,7 @@ struct AgentChatSessionRegistryHookStoreTests {
             surfaceID: oldSurfaceID,
             sessionID: sessionID,
             turnID: turnID,
-            requestedTranscriptPath: transcriptPath,
-            lifecycleToken: UUID()
+            requestedTranscriptPath: transcriptPath
         ) == nil)
     }
 
@@ -734,16 +701,14 @@ struct AgentChatSessionRegistryHookStoreTests {
             surfaceID: surfaceID,
             sessionID: oldSessionID,
             turnID: oldTurnID,
-            requestedTranscriptPath: nil,
-            lifecycleToken: UUID()
+            requestedTranscriptPath: nil
         ) == nil)
         #expect(await registry.agentReportCaptureRoute(
             workspaceID: workspaceID,
             surfaceID: surfaceID,
             sessionID: currentSessionID,
             turnID: currentTurnID,
-            requestedTranscriptPath: nil,
-            lifecycleToken: UUID()
+            requestedTranscriptPath: nil
         ) != nil)
     }
 
@@ -788,11 +753,38 @@ struct AgentChatSessionRegistryHookStoreTests {
             surfaceID: surfaceID,
             sessionID: parentSessionID,
             turnID: parentTurnID,
-            requestedTranscriptPath: nil,
-            lifecycleToken: UUID()
+            requestedTranscriptPath: nil
         )
         #expect(binding != nil)
         #expect(binding?.recordedTranscriptPathHint == nil)
+    }
+
+    private func agentReportAuthority(
+        workspaceID: String,
+        surfaceID: String,
+        sessionID: String,
+        turnID: String,
+        lifecycleToken: UUID,
+        route: AgentChatSessionRegistry.AgentReportCaptureRoute,
+        transcriptBinding: AgentReportTranscriptBinding,
+        orderingValue: UInt64
+    ) -> AgentReportResolvedAuthorityCommit {
+        AgentReportResolvedAuthorityCommit(
+            captureAttemptToken: AgentReportCaptureAttemptToken(
+                orderingValue: orderingValue
+            ),
+            reportIdentity: UUID(),
+            provider: .codex,
+            captureWorkspaceID: UUID(uuidString: workspaceID)!,
+            runtimeSurfaceID: UUID(uuidString: surfaceID)!,
+            stableSurfaceID: nil,
+            agentSessionID: sessionID,
+            turnID: turnID,
+            completionKind: .primaryStop,
+            lifecycleToken: lifecycleToken,
+            transcriptBinding: transcriptBinding,
+            authorityRevision: route.authorityRevision
+        )
     }
 
     private func guaranteedDeadPID() -> Int? {
@@ -901,6 +893,7 @@ struct AgentChatSessionRegistryHookStoreTests {
 
 private actor AgentReportActiveEntryMutationGate {
     private let firstEntry: AgentChatHookSessionStore.Entry
+    private let suspendReadNumber: Int
     private var readCount = 0
     private var secondReadStarted = false
     private var secondReadStartWaiters: [CheckedContinuation<Void, Never>] = []
@@ -908,13 +901,14 @@ private actor AgentReportActiveEntryMutationGate {
         AgentChatHookSessionStore.Entry?, Never
     >?
 
-    init(firstEntry: AgentChatHookSessionStore.Entry) {
+    init(firstEntry: AgentChatHookSessionStore.Entry, suspendReadNumber: Int) {
         self.firstEntry = firstEntry
+        self.suspendReadNumber = suspendReadNumber
     }
 
     func read() async -> AgentChatHookSessionStore.Entry? {
         readCount += 1
-        if readCount <= 3 { return firstEntry }
+        if readCount < suspendReadNumber { return firstEntry }
         secondReadStarted = true
         let waiters = secondReadStartWaiters
         secondReadStartWaiters.removeAll()

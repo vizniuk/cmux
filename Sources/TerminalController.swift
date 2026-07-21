@@ -5639,7 +5639,9 @@ class TerminalController {
                 let result = await store.capture(
                     request,
                     target: nil,
-                    revalidateTarget: { _ in nil }
+                    revalidateTarget: { _ in nil },
+                    publishResolvedAuthority: { _ in false },
+                    discardResolvedAuthority: { _ in }
                 )
 #if DEBUG
                 await self?.observeAgentReportCaptureResultForTesting(result)
@@ -5649,12 +5651,16 @@ class TerminalController {
             let result = await store.capture(
                 request,
                 target: target,
-                revalidateTarget: { [weak self] transcriptBinding in
+                revalidateTarget: { [weak self] _ in
                     guard let self else { return nil }
-                    return await self.agentReportCaptureTarget(
-                        for: request,
-                        resolvedTranscriptBinding: transcriptBinding
-                    )
+                    return await self.agentReportCaptureTarget(for: request)
+                },
+                publishResolvedAuthority: { [weak self] authority in
+                    guard let self else { return false }
+                    return await self.publishAgentReportResolvedAuthority(authority)
+                },
+                discardResolvedAuthority: { [weak self] authority in
+                    await self?.discardAgentReportResolvedAuthority(authority)
                 }
             )
 #if DEBUG
@@ -5677,8 +5683,7 @@ class TerminalController {
     /// - Returns: Fresh authoritative target, or `nil` on any mismatch.
     @MainActor
     private func agentReportCaptureTarget(
-        for request: AgentReportCaptureRequest,
-        resolvedTranscriptBinding: AgentReportTranscriptBinding? = nil
+        for request: AgentReportCaptureRequest
     ) async -> AgentReportCaptureTarget? {
         guard request.provider == .codex,
               let targetManager = AppDelegate.shared?.tabManagerFor(tabId: request.workspaceID)
@@ -5697,9 +5702,7 @@ class TerminalController {
                   surfaceID: request.runtimeSurfaceID.uuidString,
                   sessionID: request.agentSessionID,
                   turnID: request.turnID,
-                  requestedTranscriptPath: request.transcriptPath,
-                  lifecycleToken: lifecycleToken,
-                  resolvedTranscriptBinding: resolvedTranscriptBinding
+                  requestedTranscriptPath: request.transcriptPath
               ),
               service.agentReportLifecycleToken(for: request.runtimeSurfaceID) == lifecycleToken,
               let currentManager = AppDelegate.shared?.tabManagerFor(tabId: request.workspaceID)
@@ -5721,6 +5724,65 @@ class TerminalController {
             lifecycleToken: lifecycleToken,
             recordedTranscriptPathHint: route.recordedTranscriptPathHint,
             authorityRevision: route.authorityRevision
+        )
+    }
+
+    /// Publishes one actor-selected report authority through the live app tuple.
+    @MainActor
+    private func publishAgentReportResolvedAuthority(
+        _ authority: AgentReportResolvedAuthorityCommit
+    ) async -> Bool {
+        guard authority.provider == .codex,
+              authority.completionKind == .primaryStop,
+              let targetManager = AppDelegate.shared?.tabManagerFor(
+                  tabId: authority.captureWorkspaceID
+              ) ?? (tabManager?.tabs.contains(where: {
+                  $0.id == authority.captureWorkspaceID
+              }) == true ? tabManager : nil),
+              let workspace = targetManager.tabs.first(where: {
+                  $0.id == authority.captureWorkspaceID
+              }),
+              workspace.surfaceIdFromPanelId(authority.runtimeSurfaceID) != nil,
+              let terminalPanel = workspace.panels[
+                  authority.runtimeSurfaceID
+              ] as? TerminalPanel,
+              terminalPanel.stableSurfaceId == authority.stableSurfaceID,
+              let service = agentChatTranscriptService,
+              service.agentReportLifecycleToken(for: authority.runtimeSurfaceID)
+                == authority.lifecycleToken,
+              await service.registry.publishAgentReportResolvedAuthority(authority),
+              service.agentReportLifecycleToken(for: authority.runtimeSurfaceID)
+                == authority.lifecycleToken,
+              let currentManager = AppDelegate.shared?.tabManagerFor(
+                  tabId: authority.captureWorkspaceID
+              ) ?? (targetManager.tabs.contains(where: {
+                  $0.id == authority.captureWorkspaceID
+              }) ? targetManager : nil),
+              currentManager === targetManager,
+              let currentWorkspace = currentManager.tabs.first(where: {
+                  $0.id == authority.captureWorkspaceID
+              }),
+              currentWorkspace.surfaceIdFromPanelId(authority.runtimeSurfaceID) != nil,
+              currentWorkspace.panels[authority.runtimeSurfaceID] === terminalPanel,
+              terminalPanel.stableSurfaceId == authority.stableSurfaceID,
+              service.registry.currentAgentReportResolvedAuthority(
+                  runtimeSurfaceID: authority.runtimeSurfaceID
+              ) == authority else {
+            agentChatTranscriptService?.registry.discardAgentReportResolvedAuthority(
+                authority
+            )
+            return false
+        }
+        return true
+    }
+
+    /// Removes one exact provisional authority without affecting a newer winner.
+    @MainActor
+    private func discardAgentReportResolvedAuthority(
+        _ authority: AgentReportResolvedAuthorityCommit
+    ) {
+        agentChatTranscriptService?.registry.discardAgentReportResolvedAuthority(
+            authority
         )
     }
 
@@ -5759,16 +5821,9 @@ class TerminalController {
             return nil
         }
         guard let authority = await service.registry.agentReportCopyAuthority(
-            captureWorkspaceID: context.workspaceID.uuidString,
-            surfaceID: context.runtimeSurfaceID.uuidString,
-            sessionID: context.agentSessionID,
-            turnID: context.turnID,
-            lifecycleToken: context.lifecycleToken,
-            authorityRevision: context.authorityRevision,
-            transcriptBinding: context.transcriptBinding
+            context.resolvedAuthorityCommit
         ),
-              authority.transcriptBinding == context.transcriptBinding,
-              authority.authorityRevision == context.authorityRevision,
+              context.matches(authority),
               service.agentReportLifecycleToken(for: representedSurfaceID) == context.lifecycleToken,
               let currentManager = AppDelegate.shared?.tabManagerFor(tabId: representedWorkspaceID)
                 ?? (targetManager.tabs.contains(where: { $0.id == representedWorkspaceID })

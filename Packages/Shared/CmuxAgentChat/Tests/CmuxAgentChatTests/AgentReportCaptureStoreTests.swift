@@ -310,7 +310,9 @@ struct AgentReportCaptureStoreTests {
             await store.capture(
                 older,
                 target: target(turnID: "turn-1"),
-                revalidateTarget: { _ in target(turnID: "turn-2") }
+                revalidateTarget: { _ in target(turnID: "turn-2") },
+                publishResolvedAuthority: { _ in true },
+                discardResolvedAuthority: { _ in }
             ) == .rejected(.identityMismatch)
         )
         #expect(await store.latestReport(runtimeSurfaceID: surfaceID)?.finalReply == "newest")
@@ -324,7 +326,9 @@ struct AgentReportCaptureStoreTests {
             await store.capture(
                 request(raw: nil),
                 target: target(),
-                revalidateTarget: { _ in target() }
+                revalidateTarget: { _ in target() },
+                publishResolvedAuthority: { _ in true },
+                discardResolvedAuthority: { _ in }
             )
         }
         await recovery.waitUntilRecoveryStarted()
@@ -344,7 +348,9 @@ struct AgentReportCaptureStoreTests {
             await store.capture(
                 request(raw: nil),
                 target: target(),
-                revalidateTarget: { _ in target() }
+                revalidateTarget: { _ in target() },
+                publishResolvedAuthority: { _ in true },
+                discardResolvedAuthority: { _ in }
             )
         }
         await recovery.waitUntilRecoveryStarted()
@@ -366,7 +372,9 @@ struct AgentReportCaptureStoreTests {
             await store.capture(
                 request(raw: nil),
                 target: target(),
-                revalidateTarget: { _ in await targetBox.value }
+                revalidateTarget: { _ in await targetBox.value },
+                publishResolvedAuthority: { _ in true },
+                discardResolvedAuthority: { _ in }
             )
         }
         await recovery.waitUntilRecoveryStarted()
@@ -389,7 +397,9 @@ struct AgentReportCaptureStoreTests {
             target: originalTarget,
             revalidateTarget: { _ in
                 target(recordedTranscriptPathHint: "/synthetic/session-2.jsonl")
-            }
+            },
+            publishResolvedAuthority: { _ in true },
+            discardResolvedAuthority: { _ in }
         ) == .rejected(.inaccessibleSurface))
 
         let revisionMutationStore = AgentReportCaptureStore(
@@ -401,7 +411,9 @@ struct AgentReportCaptureStoreTests {
             target: originalTarget,
             revalidateTarget: { _ in
                 target(authorityRevision: UUID())
-            }
+            },
+            publishResolvedAuthority: { _ in true },
+            discardResolvedAuthority: { _ in }
         ) == .rejected(.inaccessibleSurface))
         #expect(await revisionMutationStore.latestReport(runtimeSurfaceID: surfaceID) == nil)
     }
@@ -414,7 +426,9 @@ struct AgentReportCaptureStoreTests {
             await store.capture(
                 request(raw: nil, turnID: "turn-1", completionTimestamp: 9_999),
                 target: target(turnID: "turn-1"),
-                revalidateTarget: { _ in target(turnID: "turn-1") }
+                revalidateTarget: { _ in target(turnID: "turn-1") },
+                publishResolvedAuthority: { _ in true },
+                discardResolvedAuthority: { _ in }
             )
         }
         await recovery.waitUntilRecoveryStarted()
@@ -423,13 +437,179 @@ struct AgentReportCaptureStoreTests {
             await store.capture(
                 request(raw: "newer exact reply", turnID: "turn-2", completionTimestamp: 1),
                 target: target(turnID: "turn-2"),
-                revalidateTarget: { _ in target(turnID: "turn-2") }
+                revalidateTarget: { _ in target(turnID: "turn-2") },
+                publishResolvedAuthority: { _ in true },
+                discardResolvedAuthority: { _ in }
             ) == .captured
         )
         await recovery.resumeRecovery()
 
         #expect(await olderCapture.value == .rejected(.staleCompletion))
         #expect(await store.latestReport(runtimeSurfaceID: surfaceID)?.finalReply == "newer exact reply")
+    }
+
+    @Test("slow F1 cannot publish after fast F2 becomes the committed winner")
+    func slowResolvedF1CannotOverwriteFastF2Authority() async throws {
+        let bindingF1 = AgentReportTranscriptBinding(testIdentity: "overlap-f1")
+        let bindingF2 = AgentReportTranscriptBinding(testIdentity: "overlap-f2")
+        let recovery = TurnBoundAgentReportRecovery(results: [
+            "turn-1": AgentReportRecoveryResult(body: "body F1", transcriptBinding: bindingF1),
+            "turn-2": AgentReportRecoveryResult(body: "body F2", transcriptBinding: bindingF2),
+        ])
+        let targetF1 = target(turnID: "turn-1")
+        let targetF2 = target(turnID: "turn-2")
+        let revalidation = SuspendedBindingTargetRevalidation(
+            suspendedBinding: bindingF1,
+            targets: [bindingF1: targetF1, bindingF2: targetF2]
+        )
+        let authority = AgentReportAuthorityPublicationRecorder()
+        let store = AgentReportCaptureStore(policy: .enabled, transcriptRecovery: recovery)
+
+        let captureF1 = Task {
+            await store.capture(
+                request(raw: nil, turnID: "turn-1"),
+                target: targetF1,
+                revalidateTarget: { await revalidation.target(for: $0) },
+                publishResolvedAuthority: { await authority.publish($0) },
+                discardResolvedAuthority: { await authority.discard($0) }
+            )
+        }
+        await revalidation.waitUntilSuspended()
+
+        #expect(await store.capture(
+            request(raw: nil, turnID: "turn-2"),
+            target: targetF2,
+            revalidateTarget: { await revalidation.target(for: $0) },
+            publishResolvedAuthority: { await authority.publish($0) },
+            discardResolvedAuthority: { await authority.discard($0) }
+        ) == .captured)
+        await revalidation.resume()
+
+        #expect(await captureF1.value == .rejected(.staleCompletion))
+        let report = try #require(await store.latestReport(runtimeSurfaceID: surfaceID))
+        let committed = try #require(await store.committedAuthority(runtimeSurfaceID: surfaceID))
+        #expect(report.finalReply == "body F2")
+        #expect(report.transcriptBinding == bindingF2)
+        let currentAuthority = await authority.current
+        #expect(committed == currentAuthority)
+        #expect(committed.reportIdentity == report.reportIdentity)
+        #expect(committed.captureAttemptToken == report.captureAttemptToken)
+        #expect(await authority.acceptedPublicationCount == 1)
+
+        let authorized = try #require(await store.authorizedReport(
+            runtimeSurfaceID: surfaceID,
+            capturePolicyRevision: 1,
+            availabilityRevision: AgentReportAvailabilityRevisionAuthority().advance(),
+            authorize: { context in
+                guard context.matches(committed) else { return nil }
+                return context.writeAuthorizationReceipt(
+                    panelInstanceID: ObjectIdentifier(store)
+                )
+            }
+        ))
+        #expect(authorized.body == "body F2")
+    }
+
+    @Test("out-of-order authority publication keeps the newer finalized report")
+    func outOfOrderAuthorityPublicationKeepsNewerWinner() async throws {
+        let bindingF1 = AgentReportTranscriptBinding(testIdentity: "publish-f1")
+        let bindingF2 = AgentReportTranscriptBinding(testIdentity: "publish-f2")
+        let recovery = TurnBoundAgentReportRecovery(results: [
+            "turn-1": AgentReportRecoveryResult(body: "body F1", transcriptBinding: bindingF1),
+            "turn-2": AgentReportRecoveryResult(body: "body F2", transcriptBinding: bindingF2),
+        ])
+        let authority = AgentReportAuthorityPublicationRecorder(suspendFirstPublication: true)
+        let store = AgentReportCaptureStore(policy: .enabled, transcriptRecovery: recovery)
+
+        let captureF1 = Task {
+            await store.capture(
+                request(raw: nil, turnID: "turn-1"),
+                target: target(turnID: "turn-1"),
+                revalidateTarget: { _ in target(turnID: "turn-1") },
+                publishResolvedAuthority: { await authority.publish($0) },
+                discardResolvedAuthority: { await authority.discard($0) }
+            )
+        }
+        await authority.waitUntilFirstPublicationSuspends()
+
+        #expect(await store.capture(
+            request(raw: nil, turnID: "turn-2"),
+            target: target(turnID: "turn-2"),
+            revalidateTarget: { _ in target(turnID: "turn-2") },
+            publishResolvedAuthority: { await authority.publish($0) },
+            discardResolvedAuthority: { await authority.discard($0) }
+        ) == .captured)
+        await authority.resumeFirstPublication()
+
+        #expect(await captureF1.value != .captured)
+        let report = try #require(await store.latestReport(runtimeSurfaceID: surfaceID))
+        let committed = try #require(await store.committedAuthority(runtimeSurfaceID: surfaceID))
+        let attemptedAuthorities = await authority.attemptedAuthorities
+        let currentAuthority = await authority.current
+        #expect(report.finalReply == "body F2")
+        #expect(committed == currentAuthority)
+        #expect(attemptedAuthorities.count == 2)
+        #expect(
+            attemptedAuthorities[0].captureAttemptToken
+                < attemptedAuthorities[1].captureAttemptToken
+        )
+        #expect(await authority.acceptedPublicationCount == 1)
+    }
+
+    @Test("newer duplicate attempt performs no authority publication")
+    func newerDuplicateDoesNotReplaceCommittedAuthority() async throws {
+        let authority = AgentReportAuthorityPublicationRecorder()
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
+        )
+        let first = request(raw: "committed body")
+        #expect(await store.capture(
+            first,
+            target: target(),
+            revalidateTarget: { _ in target() },
+            publishResolvedAuthority: { await authority.publish($0) },
+            discardResolvedAuthority: { await authority.discard($0) }
+        ) == .captured)
+        let committed = try #require(await store.committedAuthority(runtimeSurfaceID: surfaceID))
+
+        #expect(await store.capture(
+            first,
+            target: target(),
+            revalidateTarget: { _ in target() },
+            publishResolvedAuthority: { await authority.publish($0) },
+            discardResolvedAuthority: { await authority.discard($0) }
+        ) == .duplicate)
+        #expect(await authority.publicationAttemptCount == 1)
+        #expect(await authority.current == committed)
+        #expect(await store.committedAuthority(runtimeSurfaceID: surfaceID) == committed)
+    }
+
+    @Test("purge during suspended publication cannot restore authority or availability")
+    func purgeDuringAuthorityPublicationFailsClosed() async {
+        let authority = AgentReportAuthorityPublicationRecorder(suspendFirstPublication: true)
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
+        )
+        let capture = Task {
+            await store.capture(
+                request(raw: "must not commit"),
+                target: target(),
+                revalidateTarget: { _ in target() },
+                publishResolvedAuthority: { await authority.publish($0) },
+                discardResolvedAuthority: { await authority.discard($0) }
+            )
+        }
+        await authority.waitUntilFirstPublicationSuspends()
+        await authority.invalidate()
+        await store.purge(runtimeSurfaceID: surfaceID)
+        await authority.resumeFirstPublication()
+
+        #expect(await capture.value != .captured)
+        #expect(await store.latestReport(runtimeSurfaceID: surfaceID) == nil)
+        #expect(await store.committedAuthority(runtimeSurfaceID: surfaceID) == nil)
+        #expect(await authority.current == nil)
     }
 
     @Test("raw text from a structured subagent session is rejected")
@@ -482,7 +662,9 @@ struct AgentReportCaptureStoreTests {
             await store.capture(
                 request(raw: nil, turnID: "turn-2"),
                 target: target(turnID: "turn-2"),
-                revalidateTarget: { _ in target(turnID: "turn-2") }
+                revalidateTarget: { _ in target(turnID: "turn-2") },
+                publishResolvedAuthority: { _ in true },
+                discardResolvedAuthority: { _ in }
             )
         }
         await recovery.waitUntilRecoveryStarted()
@@ -723,6 +905,20 @@ struct AgentReportCaptureStoreTests {
             body: "private recovery body",
             transcriptBinding: transcriptBinding
         )
+        let authorityCommit = AgentReportResolvedAuthorityCommit(
+            captureAttemptToken: longReport.captureAttemptToken,
+            reportIdentity: longReport.reportIdentity,
+            provider: longReport.provider,
+            captureWorkspaceID: longReport.workspaceID,
+            runtimeSurfaceID: longReport.runtimeSurfaceID,
+            stableSurfaceID: longReport.stableSurfaceID,
+            agentSessionID: longReport.agentSessionID,
+            turnID: longReport.turnID,
+            completionKind: longReport.completionKind,
+            lifecycleToken: longReport.lifecycleToken,
+            transcriptBinding: longReport.transcriptBinding,
+            authorityRevision: longReport.authorityRevision
+        )
 
         let descriptions = [
             shortRequest.description, shortRequest.debugDescription,
@@ -733,6 +929,9 @@ struct AgentReportCaptureStoreTests {
             longReport.transcriptBinding.debugDescription,
             validatedAuthority.description, validatedAuthority.debugDescription,
             recoveryResult.description, recoveryResult.debugDescription,
+            authorityCommit.captureAttemptToken.description,
+            authorityCommit.captureAttemptToken.debugDescription,
+            authorityCommit.description, authorityCommit.debugDescription,
         ]
         for description in descriptions {
             #expect(!description.contains("session-1"))
@@ -797,6 +996,7 @@ struct AgentReportCaptureStoreTests {
         reply: String
     ) -> AgentReport {
         AgentReport(
+            captureAttemptToken: AgentReportCaptureAttemptToken(ordinal: 1),
             reportIdentity: UUID(),
             provider: request.provider,
             runtimeSurfaceID: request.runtimeSurfaceID,
@@ -1113,6 +1313,137 @@ private actor StubAgentReportTranscriptRecovery: AgentReportTranscriptRecovering
         return reply.map {
             AgentReportRecoveryResult(body: $0, transcriptBinding: transcriptBinding)
         }
+    }
+}
+
+private actor TurnBoundAgentReportRecovery: AgentReportTranscriptRecovering {
+    private let results: [String: AgentReportRecoveryResult]
+
+    init(results: [String: AgentReportRecoveryResult]) {
+        self.results = results
+    }
+
+    func validatePrimaryCodexSession(
+        recordedPath: String?,
+        sessionID: String
+    ) async -> ValidatedCodexTranscriptAuthority? {
+        guard let result = results.values.first else { return nil }
+        return ValidatedCodexTranscriptAuthority(
+            transcriptBinding: result.transcriptBinding
+        )
+    }
+
+    func recoverCodexFinalReply(
+        recordedPath: String?,
+        sessionID: String,
+        turnID: String
+    ) async -> AgentReportRecoveryResult? {
+        results[turnID]
+    }
+}
+
+private actor SuspendedBindingTargetRevalidation {
+    private let suspendedBinding: AgentReportTranscriptBinding
+    private let targets: [AgentReportTranscriptBinding: AgentReportCaptureTarget]
+    private var didSuspend = false
+    private var suspensionStarted = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var resumeWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(
+        suspendedBinding: AgentReportTranscriptBinding,
+        targets: [AgentReportTranscriptBinding: AgentReportCaptureTarget]
+    ) {
+        self.suspendedBinding = suspendedBinding
+        self.targets = targets
+    }
+
+    func target(
+        for binding: AgentReportTranscriptBinding
+    ) async -> AgentReportCaptureTarget? {
+        if binding == suspendedBinding, !didSuspend {
+            didSuspend = true
+            suspensionStarted = true
+            let waiters = startWaiters
+            startWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            await withCheckedContinuation { resumeWaiters.append($0) }
+        }
+        return targets[binding]
+    }
+
+    func waitUntilSuspended() async {
+        if suspensionStarted { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func resume() {
+        let waiters = resumeWaiters
+        resumeWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+}
+
+private actor AgentReportAuthorityPublicationRecorder {
+    private let suspendFirstPublication: Bool
+    private var publicationGeneration: UInt64 = 0
+    private var firstPublicationSuspended = false
+    private var firstStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private var firstResumeWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var current: AgentReportResolvedAuthorityCommit?
+    private(set) var publicationAttemptCount = 0
+    private(set) var acceptedPublicationCount = 0
+    private(set) var attemptedAuthorities: [AgentReportResolvedAuthorityCommit] = []
+
+    init(suspendFirstPublication: Bool = false) {
+        self.suspendFirstPublication = suspendFirstPublication
+    }
+
+    func publish(_ authority: AgentReportResolvedAuthorityCommit) async -> Bool {
+        publicationAttemptCount += 1
+        attemptedAuthorities.append(authority)
+        let generation = publicationGeneration
+        if suspendFirstPublication, publicationAttemptCount == 1 {
+            firstPublicationSuspended = true
+            let waiters = firstStartWaiters
+            firstStartWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            await withCheckedContinuation { firstResumeWaiters.append($0) }
+        }
+        guard generation == publicationGeneration else { return false }
+        if let current {
+            if authority.captureAttemptToken < current.captureAttemptToken {
+                return false
+            }
+            if authority.captureAttemptToken == current.captureAttemptToken {
+                return authority == current
+            }
+        }
+        current = authority
+        acceptedPublicationCount += 1
+        return true
+    }
+
+    func discard(_ authority: AgentReportResolvedAuthorityCommit) {
+        if current == authority {
+            current = nil
+        }
+    }
+
+    func waitUntilFirstPublicationSuspends() async {
+        if firstPublicationSuspended { return }
+        await withCheckedContinuation { firstStartWaiters.append($0) }
+    }
+
+    func resumeFirstPublication() {
+        let waiters = firstResumeWaiters
+        firstResumeWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func invalidate() {
+        publicationGeneration += 1
+        current = nil
     }
 }
 

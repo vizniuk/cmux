@@ -20,20 +20,6 @@ final class AgentChatSessionRegistry {
         var debugDescription: String { description }
     }
 
-    /// Current resolver-proven transcript authority for one exact tuple.
-    struct AgentReportResolvedAuthority: Sendable, Equatable,
-        CustomStringConvertible, CustomDebugStringConvertible
-    {
-        /// Opaque binding returned by the descriptor-pinned resolver.
-        let transcriptBinding: AgentReportTranscriptBinding
-
-        /// Exact active hook-entry revision associated with the binding.
-        let authorityRevision: UUID
-
-        var description: String { "AgentReportResolvedAuthority" }
-        var debugDescription: String { description }
-    }
-
     /// Content-free snapshot used to detect active-entry mutation.
     private struct AgentReportActiveEntrySnapshot: Equatable {
         let workspaceID: UUID
@@ -43,17 +29,6 @@ final class AgentChatSessionRegistry {
         let recordedTranscriptPathHint: String?
         let updatedAt: Date?
         let pid: Int?
-    }
-
-    /// Process-local resolved authority keyed by the exact capture tuple.
-    private struct AgentReportResolvedAuthorityState {
-        let captureWorkspaceID: UUID
-        let surfaceID: UUID
-        let sessionID: String
-        let turnID: String
-        let lifecycleToken: UUID
-        let authorityRevision: UUID
-        let transcriptBinding: AgentReportTranscriptBinding
     }
 
     private var records: [String: AgentChatSessionRecord] = [:]
@@ -66,12 +41,15 @@ final class AgentChatSessionRegistry {
         _ surfaceID: String,
         _ turnID: String
     ) async -> AgentChatHookSessionStore.Entry?
+    private let agentReportAuthorityPublicationGate: @Sendable (
+        AgentReportResolvedAuthorityCommit
+    ) async -> Void
     private var agentReportActiveEntrySnapshotBySurfaceID: [
         UUID: AgentReportActiveEntrySnapshot
     ] = [:]
     private var agentReportAuthorityRevisionBySurfaceID: [UUID: UUID] = [:]
     private var agentReportResolvedAuthorityBySurfaceID: [
-        UUID: AgentReportResolvedAuthorityState
+        UUID: AgentReportResolvedAuthorityCommit
     ] = [:]
 
     /// Called after a record mutation with the previous value (nil for a
@@ -117,9 +95,14 @@ final class AgentChatSessionRegistry {
             _ sessionID: String,
             _ surfaceID: String,
             _ turnID: String
-        ) async -> AgentChatHookSessionStore.Entry?)? = nil
+        ) async -> AgentChatHookSessionStore.Entry?)? = nil,
+        agentReportAuthorityPublicationGate: (@Sendable (
+            AgentReportResolvedAuthorityCommit
+        ) async -> Void)? = nil
     ) {
         self.hookStore = hookStore
+        self.agentReportAuthorityPublicationGate = agentReportAuthorityPublicationGate
+            ?? { _ in }
         self.agentReportActiveEntryReader = agentReportActiveEntryReader ?? {
             agentSource,
             sessionID,
@@ -350,20 +333,15 @@ final class AgentChatSessionRegistry {
     ///   - turnID: Exact provider turn claimed by the request.
     ///   - requestedTranscriptPath: Hook-supplied path to compare syntactically
     ///     with the lifecycle record, when present. Equality cannot authorize I/O.
-    ///   - lifecycleToken: Exact process-local surface lifecycle authority.
-    ///   - resolvedTranscriptBinding: Binding returned by the resolver during
-    ///     post-I/O revalidation, or `nil` during initial route lookup.
     /// - Returns: A content-free validated route, or `nil` on any mismatch.
     func agentReportCaptureRoute(
         workspaceID: String,
         surfaceID: String,
         sessionID: String,
         turnID: String,
-        requestedTranscriptPath: String?,
-        lifecycleToken: UUID,
-        resolvedTranscriptBinding: AgentReportTranscriptBinding? = nil
+        requestedTranscriptPath: String?
     ) async -> AgentReportCaptureRoute? {
-        guard let route = await validatedAgentReportRoute(
+        await validatedAgentReportRoute(
             captureWorkspaceID: workspaceID,
             requiredRegistryWorkspaceID: workspaceID,
             surfaceID: surfaceID,
@@ -371,24 +349,88 @@ final class AgentChatSessionRegistry {
             turnID: turnID,
             requestedTranscriptPath: requestedTranscriptPath,
             invalidateAuthorityOnFailure: false
-        ) else {
-            return nil
+        )
+    }
+
+    /// Publishes resolver authority only for an actor-selected report commit.
+    ///
+    /// Route validation is repeated around the injected suspension seam. Older
+    /// tokens cannot replace newer authority; equal tokens are idempotent only
+    /// when the complete commit tuple is identical.
+    ///
+    /// - Parameter authority: Exact body-free winning capture candidate.
+    /// - Returns: `true` only when this exact authority is current.
+    func publishAgentReportResolvedAuthority(
+        _ authority: AgentReportResolvedAuthorityCommit
+    ) async -> Bool {
+        guard authority.provider == .codex,
+              authority.completionKind == .primaryStop,
+              let firstRoute = await validatedAgentReportRoute(
+                  captureWorkspaceID: authority.captureWorkspaceID.uuidString,
+                  requiredRegistryWorkspaceID: authority.captureWorkspaceID.uuidString,
+                  surfaceID: authority.runtimeSurfaceID.uuidString,
+                  sessionID: authority.agentSessionID,
+                  turnID: authority.turnID,
+                  requestedTranscriptPath: nil,
+                  invalidateAuthorityOnFailure: false
+              ),
+              firstRoute.authorityRevision == authority.authorityRevision else {
+            return false
         }
-        if let resolvedTranscriptBinding,
-           let captureWorkspaceID = UUID(uuidString: workspaceID),
-           let runtimeSurfaceID = UUID(uuidString: surfaceID) {
-            agentReportResolvedAuthorityBySurfaceID[runtimeSurfaceID] =
-                AgentReportResolvedAuthorityState(
-                    captureWorkspaceID: captureWorkspaceID,
-                    surfaceID: runtimeSurfaceID,
-                    sessionID: sessionID,
-                    turnID: turnID,
-                    lifecycleToken: lifecycleToken,
-                    authorityRevision: route.authorityRevision,
-                    transcriptBinding: resolvedTranscriptBinding
-                )
+
+        await agentReportAuthorityPublicationGate(authority)
+
+        guard let secondRoute = await validatedAgentReportRoute(
+            captureWorkspaceID: authority.captureWorkspaceID.uuidString,
+            requiredRegistryWorkspaceID: authority.captureWorkspaceID.uuidString,
+            surfaceID: authority.runtimeSurfaceID.uuidString,
+            sessionID: authority.agentSessionID,
+            turnID: authority.turnID,
+            requestedTranscriptPath: nil,
+            invalidateAuthorityOnFailure: false
+        ),
+            secondRoute == firstRoute,
+            secondRoute.authorityRevision == authority.authorityRevision else {
+            return false
         }
-        return route
+
+        if let current = agentReportResolvedAuthorityBySurfaceID[
+            authority.runtimeSurfaceID
+        ] {
+            if authority.captureAttemptToken < current.captureAttemptToken {
+                return false
+            }
+            if authority.captureAttemptToken == current.captureAttemptToken {
+                return authority == current
+            }
+        }
+        agentReportResolvedAuthorityBySurfaceID[authority.runtimeSurfaceID] = authority
+        return true
+    }
+
+    /// Discards one exact provisional publication without affecting a newer winner.
+    ///
+    /// - Parameter authority: Exact body-free publication to remove.
+    func discardAgentReportResolvedAuthority(
+        _ authority: AgentReportResolvedAuthorityCommit
+    ) {
+        guard agentReportResolvedAuthorityBySurfaceID[authority.runtimeSurfaceID]
+                == authority else {
+            return
+        }
+        agentReportResolvedAuthorityBySurfaceID.removeValue(
+            forKey: authority.runtimeSurfaceID
+        )
+    }
+
+    /// Returns current content-free resolved authority for invariant checks.
+    ///
+    /// - Parameter runtimeSurfaceID: Exact process-local runtime surface.
+    /// - Returns: Current winner identity, or `nil` after invalidation.
+    func currentAgentReportResolvedAuthority(
+        runtimeSurfaceID: UUID
+    ) -> AgentReportResolvedAuthorityCommit? {
+        agentReportResolvedAuthorityBySurfaceID[runtimeSurfaceID]
     }
 
     /// Validates a retained report against its immutable hook-store capture
@@ -400,49 +442,30 @@ final class AgentChatSessionRegistry {
     /// off-main hook-store read.
     ///
     /// - Parameters:
-    ///   - captureWorkspaceID: Immutable workspace recorded at capture.
-    ///   - surfaceID: Exact live runtime surface recorded at capture.
-    ///   - sessionID: Exact provider session recorded at capture.
-    ///   - turnID: Exact provider turn recorded at capture.
-    ///   - lifecycleToken: Immutable capture-time surface lifecycle authority.
-    ///   - authorityRevision: Immutable capture-time active-entry revision.
-    ///   - transcriptBinding: Resolver-proven capture-time transcript identity.
+    /// - Parameter expectedAuthority: Exact retained-report identity to prove.
     /// - Returns: Current content-free authority, or `nil` on any mismatch.
     func agentReportCopyAuthority(
-        captureWorkspaceID: String,
-        surfaceID: String,
-        sessionID: String,
-        turnID: String,
-        lifecycleToken: UUID,
-        authorityRevision: UUID,
-        transcriptBinding: AgentReportTranscriptBinding
-    ) async -> AgentReportResolvedAuthority? {
+        _ expectedAuthority: AgentReportResolvedAuthorityCommit
+    ) async -> AgentReportResolvedAuthorityCommit? {
         guard let route = await validatedAgentReportRoute(
-            captureWorkspaceID: captureWorkspaceID,
+            captureWorkspaceID: expectedAuthority.captureWorkspaceID.uuidString,
             requiredRegistryWorkspaceID: nil,
-            surfaceID: surfaceID,
-            sessionID: sessionID,
-            turnID: turnID,
+            surfaceID: expectedAuthority.runtimeSurfaceID.uuidString,
+            sessionID: expectedAuthority.agentSessionID,
+            turnID: expectedAuthority.turnID,
             requestedTranscriptPath: nil,
             invalidateAuthorityOnFailure: true
-        ),
-            let captureWorkspaceUUID = UUID(uuidString: captureWorkspaceID),
-            let runtimeSurfaceID = UUID(uuidString: surfaceID),
-            route.authorityRevision == authorityRevision,
-            let current = agentReportResolvedAuthorityBySurfaceID[runtimeSurfaceID],
-            current.captureWorkspaceID == captureWorkspaceUUID,
-            current.surfaceID == runtimeSurfaceID,
-            current.sessionID == sessionID,
-            current.turnID == turnID,
-            current.lifecycleToken == lifecycleToken,
-            current.authorityRevision == authorityRevision,
-            current.transcriptBinding == transcriptBinding else {
+        ) else {
             return nil
         }
-        return AgentReportResolvedAuthority(
-            transcriptBinding: current.transcriptBinding,
-            authorityRevision: current.authorityRevision
-        )
+        guard route.authorityRevision == expectedAuthority.authorityRevision else {
+            discardAgentReportResolvedAuthority(expectedAuthority)
+            return nil
+        }
+        guard let current = agentReportResolvedAuthorityBySurfaceID[
+            expectedAuthority.runtimeSurfaceID
+        ], current == expectedAuthority else { return nil }
+        return current
     }
 
     /// Clears current resolved authority and revision history for one surface.
@@ -595,7 +618,7 @@ final class AgentChatSessionRegistry {
     }
 
     /// Returns a stable revision for unchanged active state and replaces it on
-    /// any mutation, clearing prior resolver authority synchronously.
+    /// mutation without publishing or replacing resolved report authority.
     private func agentReportAuthorityRevision(
         for snapshot: AgentReportActiveEntrySnapshot,
         runtimeSurfaceID: UUID
@@ -604,7 +627,6 @@ final class AgentChatSessionRegistry {
            let revision = agentReportAuthorityRevisionBySurfaceID[runtimeSurfaceID] {
             return revision
         }
-        agentReportResolvedAuthorityBySurfaceID.removeValue(forKey: runtimeSurfaceID)
         agentReportActiveEntrySnapshotBySurfaceID[runtimeSurfaceID] = snapshot
         let revision = UUID()
         agentReportAuthorityRevisionBySurfaceID[runtimeSurfaceID] = revision

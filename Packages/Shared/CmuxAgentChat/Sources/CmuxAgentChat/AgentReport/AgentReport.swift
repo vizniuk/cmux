@@ -8,6 +8,9 @@ import Foundation
 /// notifications, logs, analytics, crash reporting, filenames, temporary
 /// files, or persistent hook/session stores.
 public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomDebugStringConvertible {
+    /// Actor-issued monotonic ordering identity for this capture attempt.
+    public let captureAttemptToken: AgentReportCaptureAttemptToken
+
     /// Opaque process-local identity for this exact retained report.
     public let reportIdentity: UUID
 
@@ -71,6 +74,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
     /// Creates an exact agent report record after identity and lifecycle validation.
     ///
     /// - Parameters:
+    ///   - captureAttemptToken: Actor-issued monotonic capture ordering token.
     ///   - reportIdentity: Opaque process-local retained-report identity.
     ///   - provider: Agent runtime that produced the completion.
     ///   - runtimeSurfaceID: Exact live process-local surface used for lookup.
@@ -89,6 +93,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
     ///   - completionTimestamp: Time the accepted completion reached cmux.
     ///   - duplicateIdentity: Content-free idempotency identity.
     public init(
+        captureAttemptToken: AgentReportCaptureAttemptToken,
         reportIdentity: UUID,
         provider: AgentReportProvider,
         runtimeSurfaceID: UUID,
@@ -107,6 +112,7 @@ public struct AgentReport: Sendable, Equatable, CustomStringConvertible, CustomD
         completionTimestamp: Date,
         duplicateIdentity: AgentReportDuplicateIdentity
     ) {
+        self.captureAttemptToken = captureAttemptToken
         self.reportIdentity = reportIdentity
         self.provider = provider
         self.runtimeSurfaceID = runtimeSurfaceID

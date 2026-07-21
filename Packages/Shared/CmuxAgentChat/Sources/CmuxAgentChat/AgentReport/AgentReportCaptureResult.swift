@@ -29,6 +29,9 @@ public enum AgentReportCaptureResult: Sendable, Equatable {
         /// The completion is older than the report already accepted.
         case staleCompletion
 
+        /// Monotonic capture ordering can no longer issue a unique token.
+        case captureOrderingUnavailable
+
         /// No exact final response could be proven.
         case exactReplyUnavailable
     }

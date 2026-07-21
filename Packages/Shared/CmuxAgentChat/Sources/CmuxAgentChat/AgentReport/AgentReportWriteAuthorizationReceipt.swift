@@ -7,6 +7,9 @@ import Foundation
 public struct AgentReportWriteAuthorizationReceipt: Sendable,
     CustomStringConvertible, CustomDebugStringConvertible
 {
+    /// Actor-issued monotonic ordering identity of the retained report.
+    public let captureAttemptToken: AgentReportCaptureAttemptToken
+
     /// Opaque identity of the exact retained report.
     public let reportIdentity: UUID
 
@@ -64,6 +67,7 @@ public struct AgentReportWriteAuthorizationReceipt: Sendable,
         context: AgentReportCopyAuthorizationContext,
         panelInstanceID: ObjectIdentifier
     ) {
+        captureAttemptToken = context.captureAttemptToken
         reportIdentity = context.reportIdentity
         provider = context.provider
         runtimeSurfaceID = context.runtimeSurfaceID
@@ -82,7 +86,8 @@ public struct AgentReportWriteAuthorizationReceipt: Sendable,
     }
 
     func matches(_ context: AgentReportCopyAuthorizationContext) -> Bool {
-        reportIdentity == context.reportIdentity
+        captureAttemptToken == context.captureAttemptToken
+            && reportIdentity == context.reportIdentity
             && provider == context.provider
             && runtimeSurfaceID == context.runtimeSurfaceID
             && stableSurfaceID == context.stableSurfaceID
