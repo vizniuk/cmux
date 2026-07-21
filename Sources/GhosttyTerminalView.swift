@@ -2,6 +2,7 @@ import Foundation
 import CmuxAppKitSupportUI
 import CmuxTerminal
 import CmuxFoundation
+import CmuxGit
 import CmuxPanes
 import CmuxTerminalCore
 import CmuxSettings
@@ -3539,6 +3540,8 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
     var onTriggerFlash: (() -> Void)?
     /// Test seam and single dispatch point for represented-surface copy UI.
     var agentReportCopyRequestHandler: ((UUID, UUID) -> Void)?
+    /// Test seam and single dispatch point for represented-surface Full Run UI.
+    var agentReportFullRunCopyRequestHandler: ((UUID, UUID) -> Void)?
     var backgroundColor: NSColor?
     private var appliedColorScheme: ghostty_color_scheme_e?
     private var lastLoggedSurfaceBackgroundSignature: String?
@@ -5190,7 +5193,7 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
             return canSplitCurrentSurface()
         case #selector(copyWorkspaceAndSurfaceIdentifiers(_:)):
             return terminalSurface != nil
-        case #selector(copyAgentReport(_:)):
+        case #selector(copyAgentReport(_:)), #selector(copyFullAgentRun(_:)):
             guard let menuItem = item as? NSMenuItem,
                   let represented = menuItem.representedObject as? [String: String],
                   let workspaceValue = represented["workspaceID"],
@@ -7272,6 +7275,12 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
                 isCaptureEnabled: availability.isCaptureEnabled,
                 hasReport: availability.hasReport
             ))
+            menu.addItem(makeAgentReportFullRunCopyMenuItem(
+                workspaceID: terminalSurface.tabId,
+                runtimeSurfaceID: terminalSurface.id,
+                isCaptureEnabled: availability.isCaptureEnabled,
+                hasReport: availability.hasReport
+            ))
         }
         let pasteItem = menu.addItem(
             withTitle: String(localized: "terminalContextMenu.paste", defaultValue: "Paste"),
@@ -7348,6 +7357,33 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         )
         item.target = self
         item.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: title)
+        applyConfiguredMenuShortcut(
+            KeyboardShortcutSettings.menuShortcut(for: .copyAgentReport),
+            to: item
+        )
+        item.representedObject = [
+            "workspaceID": workspaceID.uuidString,
+            "runtimeSurfaceID": runtimeSurfaceID.uuidString,
+        ]
+        item.isEnabled = isCaptureEnabled && hasReport
+        return item
+    }
+
+    /// Builds a body-free represented-surface Full Run menu item.
+    func makeAgentReportFullRunCopyMenuItem(
+        workspaceID: UUID,
+        runtimeSurfaceID: UUID,
+        isCaptureEnabled: Bool,
+        hasReport: Bool
+    ) -> NSMenuItem {
+        let title = String(localized: "agentReport.copyFullRun", defaultValue: "Copy Full Run")
+        let item = NSMenuItem(
+            title: title,
+            action: #selector(copyFullAgentRun(_:)),
+            keyEquivalent: ""
+        )
+        item.target = self
+        item.image = NSImage(systemSymbolName: "doc.on.doc.fill", accessibilityDescription: title)
         item.representedObject = [
             "workspaceID": workspaceID.uuidString,
             "runtimeSurfaceID": runtimeSurfaceID.uuidString,
@@ -7366,6 +7402,35 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
             return
         }
         requestAgentReportCopy(workspaceID: workspaceID, runtimeSurfaceID: runtimeSurfaceID)
+    }
+
+    /// Copies the Full Run for the IDs captured when the context menu was built.
+    @objc func copyFullAgentRun(_ sender: NSMenuItem) {
+        guard let represented = sender.representedObject as? [String: String],
+              let workspaceValue = represented["workspaceID"],
+              let surfaceValue = represented["runtimeSurfaceID"],
+              let workspaceID = UUID(uuidString: workspaceValue),
+              let runtimeSurfaceID = UUID(uuidString: surfaceValue) else {
+            return
+        }
+        requestAgentReportFullRunCopy(
+            workspaceID: workspaceID,
+            runtimeSurfaceID: runtimeSurfaceID
+        )
+    }
+
+    /// Routes every represented Full Run menu item to the central app action.
+    func requestAgentReportFullRunCopy(workspaceID: UUID, runtimeSurfaceID: UUID) {
+        if let agentReportFullRunCopyRequestHandler {
+            agentReportFullRunCopyRequestHandler(workspaceID, runtimeSurfaceID)
+            return
+        }
+        Task { @MainActor in
+            await AppDelegate.shared?.copyFullAgentRun(
+                workspaceID: workspaceID,
+                runtimeSurfaceID: runtimeSurfaceID
+            )
+        }
     }
 
     /// Routes every represented UI control to the central app copy action.
@@ -7986,6 +8051,10 @@ extension Notification.Name {
     static let workspaceRemoteConnectionPresentationDidChange = Notification.Name(
         "cmux.workspaceRemoteConnectionPresentationDidChange"
     )
+    /// Content-free request to refresh branch UI for one represented surface.
+    static let terminalGitBranchRefreshRequested = Notification.Name(
+        "cmux.terminalGitBranchRefreshRequested"
+    )
 }
 
 private final class GhosttyFlashOverlayView: NSView {
@@ -7994,6 +8063,12 @@ private final class GhosttyFlashOverlayView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? {
         nil
     }
+}
+
+private final class AgentReportCopyButton: NSButton {
+    // Borderless image buttons add vertical alignment insets, so an Auto Layout
+    // height constrains their alignment rect instead of their physical frame.
+    override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsetsZero }
 }
 
 private final class TerminalViewportBorderOverlayView: NSView {
@@ -8187,6 +8262,14 @@ private final class CloudTerminalReconnectOverlayView: NSView {
     }
 }
 
+struct TerminalGitBranchResolutionIdentity: Equatable {
+    let workspaceID: UUID
+    let surfaceID: UUID
+    let surfaceInstanceID: ObjectIdentifier
+    let panelInstanceID: ObjectIdentifier
+    let directory: String
+}
+
 final class GhosttySurfaceScrollView: NSView {
     enum FlashStyle {
         case navigation
@@ -8227,6 +8310,12 @@ final class GhosttySurfaceScrollView: NSView {
     private let dropZoneOverlayView: GhosttyFlashOverlayView
     private let paneDropTargetView = TerminalPaneDropTargetView(frame: .zero)
     private let agentReportCopyButton: NSButton
+    private let terminalTopRightControls = NSStackView()
+    private let gitBranchLabel = NSTextField(labelWithString: "")
+    private let gitMetadataService = GitMetadataService()
+    private var gitBranchResolutionTask: Task<Void, Never>?
+    private var gitBranchResolutionRequestID: UUID?
+    private var gitBranchResolvedDirectory: String?
     private let notificationRingOverlayView: GhosttyFlashOverlayView
     private let notificationRingLayer: CAShapeLayer
     private let flashOverlayView: GhosttyFlashOverlayView
@@ -8495,7 +8584,7 @@ final class GhosttySurfaceScrollView: NSView {
         imageTransferIndicatorView = NSVisualEffectView(frame: .zero)
         imageTransferIndicatorSpinner = NSProgressIndicator(frame: .zero)
         imageTransferCancelButton = NSButton(frame: .zero)
-        agentReportCopyButton = NSButton(frame: .zero)
+        agentReportCopyButton = AgentReportCopyButton(frame: .zero)
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = false
@@ -8547,8 +8636,32 @@ final class GhosttySurfaceScrollView: NSView {
         agentReportCopyButton.target = self
         agentReportCopyButton.action = #selector(handleAgentReportCopyButton)
         agentReportCopyButton.isHidden = true
+        gitBranchLabel.translatesAutoresizingMaskIntoConstraints = false
+        gitBranchLabel.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
+        gitBranchLabel.textColor = .secondaryLabelColor
+        gitBranchLabel.lineBreakMode = .byTruncatingTail
+        gitBranchLabel.maximumNumberOfLines = 1
+        gitBranchLabel.isSelectable = false
+        gitBranchLabel.isHidden = true
+        gitBranchLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        gitBranchLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        gitBranchLabel.setAccessibilityElement(true)
+        gitBranchLabel.identifier = NSUserInterfaceItemIdentifier("TerminalGitBranchIndicator")
+        terminalTopRightControls.translatesAutoresizingMaskIntoConstraints = false
+        terminalTopRightControls.orientation = .horizontal
+        terminalTopRightControls.alignment = .centerY
+        terminalTopRightControls.spacing = 5
+        terminalTopRightControls.addArrangedSubview(gitBranchLabel)
+        addSubview(terminalTopRightControls, positioned: .above, relativeTo: nil)
         addSubview(agentReportCopyButton, positioned: .above, relativeTo: nil)
         NSLayoutConstraint.activate([
+            terminalTopRightControls.trailingAnchor.constraint(
+                equalTo: agentReportCopyButton.leadingAnchor,
+                constant: -5
+            ),
+            terminalTopRightControls.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 8),
+            terminalTopRightControls.centerYAnchor.constraint(equalTo: agentReportCopyButton.centerYAnchor),
+            gitBranchLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 180),
             agentReportCopyButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             agentReportCopyButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
             agentReportCopyButton.widthAnchor.constraint(equalToConstant: 22),
@@ -8795,6 +8908,7 @@ final class GhosttySurfaceScrollView: NSView {
                   readySurfaceId == self.surfaceView.terminalSurface?.id else {
                 return
             }
+            self.scheduleGitBranchRefresh(clearStaleValue: true)
             // Session restore can request focus before the runtime surface exists.
             // Re-run the normal first-responder/focus path once the surface is live.
             guard self.isActive || self.surfaceView.desiredFocus || self.isSurfaceViewFirstResponder() else {
@@ -8808,6 +8922,20 @@ final class GhosttySurfaceScrollView: NSView {
             queue: .main
         ) { [weak self] notification in
             self?.handleWorkspaceRemoteConnectionPresentationDidChange(notification)
+        })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .terminalGitBranchRefreshRequested,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleGitBranchRefreshRequest(notification)
+        })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.scheduleGitBranchRefresh(clearStaleValue: false)
         })
         observers.append(NotificationCenter.default.addObserver(
             forName: .ghosttyDidReceiveWheelScroll,
@@ -8890,6 +9018,7 @@ final class GhosttySurfaceScrollView: NSView {
         windowObservers.forEach { NotificationCenter.default.removeObserver($0) }
         deferredSearchOverlayMutationWorkItem?.cancel()
         imageTransferIndicatorShowWorkItem?.cancel()
+        gitBranchResolutionTask?.cancel()
         dropZoneOverlayView.removeFromSuperview()
         cancelFocusRequest()
     }
@@ -9157,6 +9286,9 @@ final class GhosttySurfaceScrollView: NSView {
     }
 
     private func bringPaneDropTargetToFrontIfNeeded() {
+        if terminalTopRightControls.superview !== self {
+            addSubview(terminalTopRightControls, positioned: .above, relativeTo: nil)
+        }
         if agentReportCopyButton.superview !== self {
             addSubview(agentReportCopyButton, positioned: .above, relativeTo: nil)
         }
@@ -9315,12 +9447,14 @@ final class GhosttySurfaceScrollView: NSView {
         if window.isKeyWindow {
             scheduleAutomaticFirstResponderApply(reason: "viewDidMoveToWindow")
         }
+        scheduleGitBranchRefresh(clearStaleValue: false)
     }
 
     func attachSurface(_ terminalSurface: TerminalSurface) {
         if surfaceView.terminalSurface !== terminalSurface { setLinkHoverURL(nil) }
         surfaceView.attachSurface(terminalSurface)
         synchronizeAgentReportCopyControl()
+        scheduleGitBranchRefresh(clearStaleValue: true)
         // Preserve the bootstrap 800x600 surface until portal reattach churn
         // has produced a real host size instead of a transient 1x1 placeholder.
         guard bounds.width > 1, bounds.height > 1 else { return }
@@ -9351,8 +9485,119 @@ final class GhosttySurfaceScrollView: NSView {
         )
     }
 
+    /// Debounces a represented-surface branch resolution and cancels stale work.
+    func scheduleGitBranchRefresh(clearStaleValue: Bool) {
+        let requestID = UUID()
+        gitBranchResolutionRequestID = requestID
+        gitBranchResolutionTask?.cancel()
+
+        guard let input = currentGitBranchResolutionInput() else {
+            gitBranchResolvedDirectory = nil
+            applyGitBranchDisplay(nil)
+            return
+        }
+        if clearStaleValue || gitBranchResolvedDirectory != input.directory {
+            gitBranchResolvedDirectory = nil
+            applyGitBranchDisplay(nil)
+        }
+
+        let service = gitMetadataService
+        gitBranchResolutionTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(120))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            let snapshot = await service.branchDisplaySnapshot(forDirectory: input.directory)
+            guard !Task.isCancelled,
+                  let self,
+                  Self.gitBranchResolutionIsCurrent(
+                      requestID: requestID,
+                      latestRequestID: self.gitBranchResolutionRequestID,
+                      expected: input,
+                      current: self.currentGitBranchResolutionInput()
+                  ) else {
+                return
+            }
+            self.gitBranchResolvedDirectory = input.directory
+            self.applyGitBranchDisplay(snapshot?.displayName)
+        }
+    }
+
+    private func currentGitBranchResolutionInput() -> TerminalGitBranchResolutionIdentity? {
+        guard let surface = surfaceView.terminalSurface,
+              let app = AppDelegate.shared,
+              let manager = app.tabManagerFor(tabId: surface.tabId),
+              let workspace = manager.tabs.first(where: { $0.id == surface.tabId }),
+              workspace.allowsLocalDirectoryFallback(panelId: surface.id),
+              let panel = workspace.panels[surface.id] as? TerminalPanel,
+              panel.surface === surface,
+              let directory = manager.gitProbeDirectory(for: workspace, panelId: surface.id) else {
+            return nil
+        }
+        return TerminalGitBranchResolutionIdentity(
+            workspaceID: surface.tabId,
+            surfaceID: surface.id,
+            surfaceInstanceID: ObjectIdentifier(surface),
+            panelInstanceID: ObjectIdentifier(panel),
+            directory: directory
+        )
+    }
+
+    /// Accepts only the newest result for the exact cwd and represented panel lifecycle.
+    static func gitBranchResolutionIsCurrent(
+        requestID: UUID,
+        latestRequestID: UUID?,
+        expected: TerminalGitBranchResolutionIdentity,
+        current: TerminalGitBranchResolutionIdentity?
+    ) -> Bool {
+        requestID == latestRequestID && expected == current
+    }
+
+    private func handleGitBranchRefreshRequest(_ notification: Notification) {
+        guard let surface = surfaceView.terminalSurface,
+              notification.userInfo?["workspaceID"] as? UUID == surface.tabId,
+              notification.userInfo?["surfaceID"] as? UUID == surface.id else {
+            return
+        }
+        let currentDirectory = currentGitBranchResolutionInput()?.directory
+        scheduleGitBranchRefresh(
+            clearStaleValue: currentDirectory == nil || currentDirectory != gitBranchResolvedDirectory
+        )
+    }
+
+    private func applyGitBranchDisplay(_ displayName: String?) {
+        guard let displayName, !displayName.isEmpty else {
+            gitBranchLabel.stringValue = ""
+            gitBranchLabel.toolTip = nil
+            gitBranchLabel.setAccessibilityLabel(nil)
+            gitBranchLabel.isHidden = true
+            return
+        }
+        let tooltipFormat = String(
+            localized: "terminal.gitBranch",
+            defaultValue: "Git branch: %@"
+        )
+        let tooltip = String.localizedStringWithFormat(tooltipFormat, displayName)
+        gitBranchLabel.stringValue = displayName
+        gitBranchLabel.toolTip = tooltip
+        gitBranchLabel.setAccessibilityLabel(tooltip)
+        gitBranchLabel.isHidden = false
+    }
+
+    /// Internal test seam for localized truncating branch presentation.
+    func applyGitBranchDisplayForTesting(_ displayName: String?) {
+        applyGitBranchDisplay(displayName)
+    }
+
     /// Internal test inspection of content-free button state and geometry.
     var agentReportCopyButtonForTesting: NSButton { agentReportCopyButton }
+
+    /// Internal test inspection of the compact branch indicator and shared overlay.
+    var gitBranchIndicatorForTesting: (label: NSTextField, controls: NSStackView) {
+        (gitBranchLabel, terminalTopRightControls)
+    }
 
     @objc private func handleAgentReportCopyButton() {
         surfaceView.requestAgentReportCopyForRepresentedSurface()

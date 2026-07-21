@@ -5841,6 +5841,39 @@ class TerminalController {
         )
     }
 
+    /// Generates a Full Run only from the exact represented report authority.
+    ///
+    /// Live topology is authorized before descriptor-backed parsing. The report
+    /// actor performs the required second authorization and winner/lifecycle
+    /// checks after this suspension before revealing the body to the clipboard path.
+    @MainActor
+    func generateAgentReportFullRun(
+        _ context: AgentReportCopyAuthorizationContext,
+        representedWorkspaceID: UUID,
+        representedSurfaceID: UUID
+    ) async -> AgentReportFullRunExport? {
+        guard await authorizesAgentReportCopy(
+            context,
+            representedWorkspaceID: representedWorkspaceID,
+            representedSurfaceID: representedSurfaceID
+        ) != nil,
+              let service = agentChatTranscriptService,
+              service.agentReportLifecycleToken(for: representedSurfaceID) == context.lifecycleToken,
+              let route = await service.registry.agentReportFullRunRoute(
+                  context.resolvedAuthorityCommit
+              ),
+              route.authorityRevision == context.authorityRevision,
+              service.agentReportLifecycleToken(for: representedSurfaceID) == context.lifecycleToken else {
+            return nil
+        }
+        return await service.resolver.exportCodexFullRun(
+            recordedPath: route.recordedTranscriptPathHint,
+            sessionID: context.agentSessionID,
+            turnID: context.turnID,
+            expectedBinding: context.transcriptBinding
+        )
+    }
+
     /// Purges completed and in-flight report state for a truly closed surface.
     ///
     /// - Parameter runtimeSurfaceID: Exact process-local closed surface.

@@ -447,6 +447,20 @@ final class AgentChatSessionRegistry {
     func agentReportCopyAuthority(
         _ expectedAuthority: AgentReportResolvedAuthorityCommit
     ) async -> AgentReportResolvedAuthorityCommit? {
+        guard await agentReportFullRunRoute(expectedAuthority) != nil else { return nil }
+        guard let current = agentReportResolvedAuthorityBySurfaceID[
+            expectedAuthority.runtimeSurfaceID
+        ], current == expectedAuthority else { return nil }
+        return current
+    }
+
+    /// Returns the current content-free route for one exact retained report.
+    ///
+    /// The optional path is only a resolver lookup hint. The resolver must prove
+    /// descriptor containment and equality with the committed transcript binding.
+    func agentReportFullRunRoute(
+        _ expectedAuthority: AgentReportResolvedAuthorityCommit
+    ) async -> AgentReportCaptureRoute? {
         guard let route = await validatedAgentReportRoute(
             captureWorkspaceID: expectedAuthority.captureWorkspaceID.uuidString,
             requiredRegistryWorkspaceID: nil,
@@ -465,7 +479,7 @@ final class AgentChatSessionRegistry {
         guard let current = agentReportResolvedAuthorityBySurfaceID[
             expectedAuthority.runtimeSurfaceID
         ], current == expectedAuthority else { return nil }
-        return current
+        return route
     }
 
     /// Clears current resolved authority and revision history for one surface.

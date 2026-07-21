@@ -2367,6 +2367,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return true
     }
 
+    /// Copies the exact completed Codex turn associated with the represented report.
+    ///
+    /// Generation is explicit, descriptor-pinned, and transient. Every authority
+    /// component is checked again after parsing and by the final non-suspending
+    /// main-actor gate immediately before the single pasteboard write.
+    @discardableResult
+    func copyFullAgentRun(
+        workspaceID: UUID,
+        runtimeSurfaceID: UUID,
+        to pasteboard: NSPasteboard = .general,
+        beforeFinalWrite: @escaping @MainActor @Sendable (
+            AgentReportWriteAuthorizationReceipt
+        ) -> Void = { _ in }
+    ) async -> Bool {
+        let availability = agentReportCopyControlAvailability(
+            workspaceID: workspaceID,
+            runtimeSurfaceID: runtimeSurfaceID
+        )
+        guard availability.hasReport,
+              let store = agentReportCaptureStore,
+              let availabilityRevision = agentReportAcceptedAvailabilityRevision,
+              let representedPanel = agentReportTerminalPanel(
+                  workspaceID: workspaceID,
+                  runtimeSurfaceID: runtimeSurfaceID
+              ) else {
+            return false
+        }
+        let policyRevision = agentReportPolicyUpdateRevision
+        return await Self.copyFullAgentRun(
+            store: store,
+            runtimeSurfaceID: runtimeSurfaceID,
+            capturePolicyRevision: policyRevision,
+            availabilityRevision: availabilityRevision,
+            to: pasteboard,
+            generate: { context in
+                await TerminalController.shared.generateAgentReportFullRun(
+                    context,
+                    representedWorkspaceID: workspaceID,
+                    representedSurfaceID: runtimeSurfaceID
+                )
+            },
+            authorize: { context in
+                await TerminalController.shared.authorizesAgentReportCopy(
+                    context,
+                    representedWorkspaceID: workspaceID,
+                    representedSurfaceID: runtimeSurfaceID
+                )
+            },
+            beforeFinalWrite: beforeFinalWrite,
+            shouldWrite: { [weak self, representedPanel] receipt in
+                self?.authorizesAgentReportFinalWrite(
+                    receipt,
+                    representedWorkspaceID: workspaceID,
+                    representedSurfaceID: runtimeSurfaceID,
+                    representedPanel: representedPanel
+                ) == true
+            }
+        )
+    }
+
+    /// Central Full Run generation and exact-once clipboard implementation.
+    @discardableResult
+    @MainActor
+    static func copyFullAgentRun(
+        store: AgentReportCaptureStore,
+        runtimeSurfaceID: UUID,
+        capturePolicyRevision: UInt64 = 0,
+        availabilityRevision: AgentReportAvailabilityRevision =
+            AgentReportAvailabilityRevisionAuthority().advance(),
+        to pasteboard: NSPasteboard,
+        generate: @escaping @Sendable (
+            AgentReportCopyAuthorizationContext
+        ) async -> AgentReportFullRunExport?,
+        authorize: @escaping @Sendable (
+            AgentReportCopyAuthorizationContext
+        ) async -> AgentReportWriteAuthorizationReceipt?,
+        beforeFinalWrite: @escaping @MainActor @Sendable (
+            AgentReportWriteAuthorizationReceipt
+        ) -> Void = { _ in },
+        shouldWrite: @escaping @MainActor @Sendable (
+            AgentReportWriteAuthorizationReceipt
+        ) -> Bool = { _ in true }
+    ) async -> Bool {
+        guard let authorized = await store.authorizedFullRun(
+            runtimeSurfaceID: runtimeSurfaceID,
+            capturePolicyRevision: capturePolicyRevision,
+            availabilityRevision: availabilityRevision,
+            generate: generate,
+            authorize: authorize
+        ) else {
+            return false
+        }
+        beforeFinalWrite(authorized.receipt)
+        guard shouldWrite(authorized.receipt) else { return false }
+        WorkspaceSurfaceIdentifierClipboardText.copy(authorized.body, to: pasteboard)
+        return true
+    }
+
     /// Resolves one exact current terminal panel without focus fallbacks.
     private func agentReportTerminalPanel(
         workspaceID: UUID,
@@ -13106,17 +13204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return true
     }
 
-    /// Fixed B1 default routed through the existing shortcut matcher. It is not
-    /// user-configurable until Slice B2.
-    private static let agentReportCopyShortcut = StoredShortcut(
-        key: "c",
-        command: true,
-        shift: true,
-        option: false,
-        control: false
-    )
-
-    /// Handles the fixed Slice B1 Agent Report shortcut while leaving ordinary
+    /// Handles the configured Agent Report shortcut while leaving ordinary
     /// Command-C and text-input/recorder ownership untouched.
     ///
     /// Test-only injection parameters keep shortcut routing verifiable without
@@ -13129,13 +13217,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         targetResolver: ((NSEvent) -> (workspaceID: UUID, runtimeSurfaceID: UUID)?)? = nil,
         hasActiveConfiguredChord: Bool? = nil,
         configuredShortcutOwnsEvent: ((NSEvent) -> Bool)? = nil,
+        configuredShortcutMatchesEvent: ((NSEvent) -> Bool)? = nil,
         performCopy: ((UUID, UUID) -> Void)? = nil
     ) -> Bool {
-        guard event.type == .keyDown else { return false }
-        let configuredChordIsActive = hasActiveConfiguredChord
-            ?? (activeConfiguredShortcutChordPrefixForCurrentEvent != nil)
-        guard !configuredChordIsActive else { return false }
-        guard matchShortcut(event: event, shortcut: Self.agentReportCopyShortcut),
+        guard event.type == .keyDown, !event.isARepeat else { return false }
+        if hasActiveConfiguredChord == true { return false }
+        if hasActiveConfiguredChord == nil,
+           let activePrefix = activeConfiguredShortcutChordPrefixForCurrentEvent {
+            let reportShortcut = KeyboardShortcutSettings.shortcut(for: .copyAgentReport)
+            guard reportShortcut.hasChord,
+                  reportShortcut.firstStroke == activePrefix else {
+                return false
+            }
+        }
+        let matchesConfiguredShortcut = configuredShortcutMatchesEvent?(event)
+            ?? matchConfiguredShortcut(event: event, action: .copyAgentReport)
+        guard matchesConfiguredShortcut,
               (captureEnabled ?? agentReportCaptureEnabled) else {
             return false
         }
@@ -15465,12 +15562,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return matchConfiguredShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: action))
     }
 
-    /// Returns whether an existing configurable shortcut owns the fixed Agent
-    /// Report stroke. Single-stroke bindings and eligible chord prefixes both
-    /// win, including custom-command shortcuts from cmux.json.
+    /// Returns whether another effective binding owns the Agent Report event.
+    /// Single-stroke bindings and eligible chord prefixes both win, including
+    /// custom-command shortcuts from cmux.json.
     private func configuredShortcutOwnsAgentReportCopyEvent(_ event: NSEvent) -> Bool {
         let chordActions = Set(currentConfiguredShortcutChordActions())
-        for action in KeyboardShortcutSettings.Action.allCases {
+        for action in KeyboardShortcutSettings.Action.allCases where action != .copyAgentReport {
             guard shortcutWhenClauseAllows(action: action, event: event) else { continue }
             let shortcut = KeyboardShortcutSettings.shortcut(for: action)
             if configuredShortcutClaimsEvent(

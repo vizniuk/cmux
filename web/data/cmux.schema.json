@@ -1593,6 +1593,7 @@
               "switchRightSidebarToFeed",
               "switchRightSidebarToDock",
               "triggerFlash",
+              "copyAgentReport",
               "nextSurface",
               "prevSurface",
               "moveSurfaceLeft",

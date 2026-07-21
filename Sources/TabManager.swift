@@ -1975,6 +1975,11 @@ class TabManager: ObservableObject {
         guard let tab = tabs.first(where: { $0.id == tabId }) else { return }
         tab.updatePanelShellActivityState(panelId: surfaceId, state: state)
         if state == .promptIdle {
+            NotificationCenter.default.post(
+                name: .terminalGitBranchRefreshRequested,
+                object: nil,
+                userInfo: ["workspaceID": tabId, "surfaceID": surfaceId]
+            )
             pullRequestProbing.scheduleWorkspacePullRequestRefresh(
                 workspaceId: tabId,
                 panelId: surfaceId,

@@ -757,6 +757,7 @@ final class TerminalControllerSocketSecurityTests {
         #expect(limits.maximumJSONLRecordBytes == 8 * 1024 * 1024)
         #expect(limits.maximumTranscriptBytes == 128 * 1024 * 1024)
         #expect(limits.maximumAuthorizedSocketFrameBytes == 16 * 1024 * 1024)
+        #expect(AgentReportResourceLimits.maximumFullRunExportBytes == 8 * 1024 * 1024)
     }
 
     @Test func socketFrameCeilingMatchesSharedSliceAPolicy() {
@@ -853,6 +854,91 @@ final class TerminalControllerSocketSecurityTests {
         )
         #expect(pasteboard.changeCount == unavailableChangeCount)
         workspace.teardownAllPanels()
+    }
+
+    @Test func centralFullRunCopyWritesOnlyAuthorizedBodyAndFailurePreservesClipboard() async throws {
+        let manager = TabManager()
+        let workspace = try #require(manager.selectedWorkspace)
+        let panel = try #require(workspace.focusedTerminalPanel)
+        defer { workspace.teardownAllPanels() }
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: SuspendedEndpointAgentReportRecovery(reply: "unused")
+        )
+        let request = agentReportRequest(workspace: workspace, panel: panel, raw: "report body")
+        let target = agentReportTarget(workspace: workspace, panel: panel)
+        #expect(await store.capture(
+            request,
+            target: target,
+            revalidateTarget: { _ in target },
+            publishResolvedAuthority: { _ in true },
+            discardResolvedAuthority: { _ in }
+        ) == .captured)
+
+        let exact = "USER\n\nUnicode prompt 🌍\n\nASSISTANT\n\nExact final"
+        let pasteboard = NSPasteboard(name: .init("cmux-full-run-copy-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        pasteboard.setString("preserve", forType: .string)
+        let invocationCounts = FullRunInvocationCounts()
+        var finalGateCount = 0
+        #expect(await AppDelegate.copyFullAgentRun(
+            store: store,
+            runtimeSurfaceID: panel.id,
+            to: pasteboard,
+            generate: { context in
+                await invocationCounts.recordGeneration()
+                return AgentReportFullRunExport(
+                    body: exact,
+                    transcriptBinding: context.transcriptBinding
+                )
+            },
+            authorize: { context in
+                await invocationCounts.recordAuthorization()
+                return context.writeAuthorizationReceipt(
+                    panelInstanceID: ObjectIdentifier(store)
+                )
+            },
+            beforeFinalWrite: { _ in finalGateCount += 1 }
+        ))
+        let counts = await invocationCounts.snapshot()
+        #expect(counts.generations == 1)
+        #expect(counts.authorizations == 1)
+        #expect(finalGateCount == 1)
+        #expect(pasteboard.string(forType: .string) == exact)
+        #expect(!pasteboard.string(forType: .string)!.contains(workspace.id.uuidString))
+
+        pasteboard.clearContents()
+        pasteboard.setString("must remain", forType: .string)
+        let changeCount = pasteboard.changeCount
+        #expect(await AppDelegate.copyFullAgentRun(
+            store: store,
+            runtimeSurfaceID: panel.id,
+            to: pasteboard,
+            generate: { _ in nil },
+            authorize: { _ in nil }
+        ) == false)
+        #expect(pasteboard.changeCount == changeCount)
+        #expect(pasteboard.string(forType: .string) == "must remain")
+
+        #expect(await AppDelegate.copyFullAgentRun(
+            store: store,
+            runtimeSurfaceID: panel.id,
+            to: pasteboard,
+            generate: { context in
+                AgentReportFullRunExport(
+                    body: "must not write",
+                    transcriptBinding: context.transcriptBinding
+                )
+            },
+            authorize: { context in
+                context.writeAuthorizationReceipt(
+                    panelInstanceID: ObjectIdentifier(store)
+                )
+            },
+            shouldWrite: { _ in false }
+        ) == false)
+        #expect(pasteboard.changeCount == changeCount)
+        #expect(pasteboard.string(forType: .string) == "must remain")
     }
 
     @Test func staleAgentReportAvailabilityCannotCrossSynchronousRevocation() throws {
@@ -970,7 +1056,7 @@ final class TerminalControllerSocketSecurityTests {
         }))
     }
 
-    @Test func shiftCommandCUsesCentralRequestWhileCommandCAndTextInputRemainUntouched() throws {
+    @Test func configuredAgentReportShortcutUsesCentralRequestOnceAndPreservesRoutingPrecedence() throws {
         let previousAppDelegate = AppDelegate.shared
         let app = AppDelegate()
         defer { AppDelegate.shared = previousAppDelegate }
@@ -1022,6 +1108,13 @@ final class TerminalControllerSocketSecurityTests {
             event: shiftCommandC,
             captureEnabled: true,
             firstResponder: NSTextView(),
+            targetResolver: { _ in (workspaceID, surfaceID) },
+            performCopy: { requests.append(($0, $1)) }
+        ))
+        #expect(!app.handleAgentReportCopyShortcut(
+            event: shiftCommandC,
+            captureEnabled: true,
+            firstResponder: NSTextField(),
             targetResolver: { _ in (workspaceID, surfaceID) },
             performCopy: { requests.append(($0, $1)) }
         ))
@@ -1084,6 +1177,195 @@ final class TerminalControllerSocketSecurityTests {
             performCopy: { requests.append(($0, $1)) }
         ))
         #expect(requests.count == 1)
+
+        let remapped = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command, .option],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "r",
+            charactersIgnoringModifiers: "r",
+            isARepeat: false,
+            keyCode: 15
+        ))
+        #expect(app.handleAgentReportCopyShortcut(
+            event: remapped,
+            captureEnabled: true,
+            targetResolver: { _ in (workspaceID, surfaceID) },
+            configuredShortcutMatchesEvent: { $0 === remapped },
+            performCopy: { requests.append(($0, $1)) }
+        ))
+        #expect(requests.count == 2)
+        #expect(!app.handleAgentReportCopyShortcut(
+            event: shiftCommandC,
+            captureEnabled: true,
+            targetResolver: { _ in (workspaceID, surfaceID) },
+            configuredShortcutMatchesEvent: { _ in false },
+            performCopy: { requests.append(($0, $1)) }
+        ))
+
+        let repeated = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command, .option],
+            timestamp: 1,
+            windowNumber: 0,
+            context: nil,
+            characters: "r",
+            charactersIgnoringModifiers: "r",
+            isARepeat: true,
+            keyCode: 15
+        ))
+        #expect(!app.handleAgentReportCopyShortcut(
+            event: repeated,
+            captureEnabled: true,
+            targetResolver: { _ in (workspaceID, surfaceID) },
+            configuredShortcutMatchesEvent: { _ in true },
+            performCopy: { requests.append(($0, $1)) }
+        ))
+        #expect(requests.count == 2)
+    }
+
+    @Test func managedAgentReportShortcutRestoresUpdatesResetsAndClearsWithoutFixedFallback() throws {
+        let app = AppDelegate()
+        let originalStore = KeyboardShortcutSettings.settingsFileStore
+        let action = KeyboardShortcutSettings.Action.copyAgentReport
+        let defaultsKey = action.defaultsKey
+        let originalDefaults = UserDefaults.standard.object(forKey: defaultsKey)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-agent-report-shortcut-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let settingsURL = directory.appendingPathComponent("cmux.json")
+        defer {
+            KeyboardShortcutSettings.settingsFileStore = originalStore
+            if let originalDefaults {
+                UserDefaults.standard.set(originalDefaults, forKey: defaultsKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: defaultsKey)
+            }
+            try? FileManager.default.removeItem(at: directory)
+        }
+        UserDefaults.standard.removeObject(forKey: defaultsKey)
+
+        func install(_ shortcutValue: String?) throws {
+            let shortcutJSON = shortcutValue.map { #""copyAgentReport": "\#($0)""# }
+                ?? #""copyAgentReport": null"#
+            try "{\"shortcuts\":{\(shortcutJSON)}}".write(
+                to: settingsURL,
+                atomically: true,
+                encoding: .utf8
+            )
+            KeyboardShortcutSettings.settingsFileStore = KeyboardShortcutSettingsFileStore(
+                primaryPath: settingsURL.path,
+                fallbackPath: nil,
+                startWatching: false
+            )
+        }
+
+        func event(key: String, flags: NSEvent.ModifierFlags, keyCode: UInt16) throws -> NSEvent {
+            try #require(NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: flags,
+                timestamp: 0,
+                windowNumber: 0,
+                context: nil,
+                characters: key,
+                charactersIgnoringModifiers: key,
+                isARepeat: false,
+                keyCode: keyCode
+            ))
+        }
+
+        let defaultEvent = try event(key: "c", flags: [.command, .shift], keyCode: 8)
+        let firstCustomEvent = try event(key: "r", flags: [.command, .option], keyCode: 15)
+        let secondCustomEvent = try event(key: "k", flags: [.command, .control], keyCode: 40)
+        var count = 0
+        let target = (UUID(), UUID())
+
+        try install("cmd+alt+r")
+        #expect(
+            KeyboardShortcutSettings.menuShortcut(for: action)
+                == StoredShortcut(key: "r", command: true, shift: false, option: true, control: false)
+        )
+        #expect(app.handleAgentReportCopyShortcut(
+            event: firstCustomEvent,
+            captureEnabled: true,
+            targetResolver: { _ in target },
+            performCopy: { _, _ in count += 1 }
+        ))
+        #expect(!app.handleAgentReportCopyShortcut(
+            event: defaultEvent,
+            captureEnabled: true,
+            targetResolver: { _ in target },
+            performCopy: { _, _ in count += 1 }
+        ))
+
+        try install("cmd+ctrl+k")
+        #expect(
+            KeyboardShortcutSettings.menuShortcut(for: action)
+                == StoredShortcut(key: "k", command: true, shift: false, option: false, control: true)
+        )
+        #expect(app.handleAgentReportCopyShortcut(
+            event: secondCustomEvent,
+            captureEnabled: true,
+            targetResolver: { _ in target },
+            performCopy: { _, _ in count += 1 }
+        ))
+        #expect(!app.handleAgentReportCopyShortcut(
+            event: firstCustomEvent,
+            captureEnabled: true,
+            targetResolver: { _ in target },
+            performCopy: { _, _ in count += 1 }
+        ))
+
+        try "{\"shortcuts\":{}}".write(to: settingsURL, atomically: true, encoding: .utf8)
+        KeyboardShortcutSettings.settingsFileStore = KeyboardShortcutSettingsFileStore(
+            primaryPath: settingsURL.path,
+            fallbackPath: nil,
+            startWatching: false
+        )
+        #expect(KeyboardShortcutSettings.menuShortcut(for: action) == action.defaultShortcut)
+        #expect(app.handleAgentReportCopyShortcut(
+            event: defaultEvent,
+            captureEnabled: true,
+            targetResolver: { _ in target },
+            performCopy: { _, _ in count += 1 }
+        ))
+
+        try install(nil)
+        #expect(KeyboardShortcutSettings.menuShortcut(for: action).isUnbound)
+        #expect(!app.handleAgentReportCopyShortcut(
+            event: defaultEvent,
+            captureEnabled: true,
+            targetResolver: { _ in target },
+            performCopy: { _, _ in count += 1 }
+        ))
+        #expect(!app.handleAgentReportCopyShortcut(
+            event: secondCustomEvent,
+            captureEnabled: true,
+            targetResolver: { _ in target },
+            performCopy: { _, _ in count += 1 }
+        ))
+
+        try install("cmd+c")
+        #expect(KeyboardShortcutSettings.menuShortcut(for: action).isUnbound)
+        let ordinaryCommandC = try event(key: "c", flags: [.command], keyCode: 8)
+        #expect(!app.handleAgentReportCopyShortcut(
+            event: ordinaryCommandC,
+            captureEnabled: true,
+            targetResolver: { _ in target },
+            performCopy: { _, _ in count += 1 }
+        ))
+        #expect(!app.handleAgentReportCopyShortcut(
+            event: defaultEvent,
+            captureEnabled: true,
+            targetResolver: { _ in target },
+            performCopy: { _, _ in count += 1 }
+        ))
+        #expect(count == 3)
     }
 
     @Test func representedMenuAndSmallButtonExposeOnlyLocalizedContentFreeState() throws {
@@ -1092,9 +1374,12 @@ final class TerminalControllerSocketSecurityTests {
         let panel = try #require(workspace.focusedTerminalPanel)
         let surfaceView = panel.hostedView.surfaceView
         var requests: [(UUID, UUID)] = []
+        var fullRunRequests: [(UUID, UUID)] = []
         surfaceView.agentReportCopyRequestHandler = { requests.append(($0, $1)) }
+        surfaceView.agentReportFullRunCopyRequestHandler = { fullRunRequests.append(($0, $1)) }
         defer {
             surfaceView.agentReportCopyRequestHandler = nil
+            surfaceView.agentReportFullRunCopyRequestHandler = nil
             workspace.teardownAllPanels()
         }
 
@@ -1112,7 +1397,26 @@ final class TerminalControllerSocketSecurityTests {
         )
         #expect(enabledItem.title == String(localized: "agentReport.copy", defaultValue: "Copy Agent Report"))
         #expect(enabledItem.isEnabled)
+        #expect(enabledItem.keyEquivalent == "c")
+        #expect(enabledItem.keyEquivalentModifierMask.contains([.command, .shift]))
         #expect(!unavailableItem.isEnabled)
+        let fullRunItem = surfaceView.makeAgentReportFullRunCopyMenuItem(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: panel.id,
+            isCaptureEnabled: true,
+            hasReport: true
+        )
+        #expect(
+            fullRunItem.title
+                == String(localized: "agentReport.copyFullRun", defaultValue: "Copy Full Run")
+        )
+        #expect(fullRunItem.isEnabled)
+        #expect(!surfaceView.makeAgentReportFullRunCopyMenuItem(
+            workspaceID: workspace.id,
+            runtimeSurfaceID: panel.id,
+            isCaptureEnabled: true,
+            hasReport: false
+        ).isEnabled)
 
         // The represented IDs remain authoritative even if app focus changes
         // after the menu was constructed.
@@ -1120,19 +1424,65 @@ final class TerminalControllerSocketSecurityTests {
         #expect(requests.count == 1)
         #expect(requests.first?.0 == workspace.id)
         #expect(requests.first?.1 == panel.id)
+        surfaceView.copyFullAgentRun(fullRunItem)
+        #expect(fullRunRequests.count == 1)
+        #expect(fullRunRequests.first?.0 == workspace.id)
+        #expect(fullRunRequests.first?.1 == panel.id)
 
         let hostedView = panel.hostedView
         hostedView.frame = NSRect(x: 0, y: 0, width: 44, height: 40)
-        hostedView.layoutSubtreeIfNeeded()
         hostedView.applyAgentReportCopyControlState(isCaptureEnabled: true, hasReport: true)
+        hostedView.layoutSubtreeIfNeeded()
         let button = hostedView.agentReportCopyButtonForTesting
+        let branch = hostedView.gitBranchIndicatorForTesting
         let localizedTitle = String(localized: "agentReport.copy", defaultValue: "Copy Agent Report")
+        func reportCopyButtons(in root: NSView) -> [NSButton] {
+            var buttons: [NSButton] = []
+            if let candidate = root as? NSButton,
+               candidate.identifier?.rawValue == "AgentReportCopyButton" {
+                buttons.append(candidate)
+            }
+            for subview in root.subviews {
+                buttons.append(contentsOf: reportCopyButtons(in: subview))
+            }
+            return buttons
+        }
+        func requiredSizeConstraints(
+            _ attribute: NSLayoutConstraint.Attribute
+        ) -> [NSLayoutConstraint] {
+            button.constraints.filter { constraint in
+                let firstItem = constraint.firstItem as AnyObject?
+                return constraint.isActive
+                    && firstItem === button
+                    && constraint.secondItem == nil
+                    && constraint.firstAttribute == attribute
+                    && constraint.relation == .equal
+                    && constraint.constant == 22
+                    && constraint.priority == .required
+            }
+        }
+        func hasExactContainedButtonGeometry() -> Bool {
+            button.frame.width == 22
+                && button.frame.height == 22
+                && hostedView.bounds.contains(button.frame)
+        }
+
+        let initialButtons = reportCopyButtons(in: hostedView)
+        #expect(initialButtons.count == 1)
+        #expect(initialButtons.first === button)
+        #expect(initialButtons.filter { !$0.isHidden }.count == 1)
         #expect(!button.isHidden)
         #expect(button.isEnabled)
+        #expect(!button.translatesAutoresizingMaskIntoConstraints)
+        #expect(requiredSizeConstraints(.width).count == 1)
+        #expect(requiredSizeConstraints(.height).count == 1)
         #expect(button.toolTip == localizedTitle)
         #expect(button.accessibilityLabel() == localizedTitle)
         #expect(button.title.isEmpty)
-        #expect(hostedView.bounds.contains(button.frame))
+        #expect(button.image != nil)
+        #expect(hasExactContainedButtonGeometry())
+        #expect(branch.label.isHidden)
+        #expect(branch.label.stringValue.isEmpty)
         #expect(!String(describing: button).contains("PRIVATE-REPORT"))
 
         button.performClick(nil)
@@ -1141,10 +1491,140 @@ final class TerminalControllerSocketSecurityTests {
         #expect(requests.last?.1 == panel.id)
 
         hostedView.applyAgentReportCopyControlState(isCaptureEnabled: true, hasReport: false)
+        hostedView.layoutSubtreeIfNeeded()
         #expect(!button.isHidden)
         #expect(!button.isEnabled)
+        #expect(hasExactContainedButtonGeometry())
         hostedView.applyAgentReportCopyControlState(isCaptureEnabled: false, hasReport: false)
+        hostedView.layoutSubtreeIfNeeded()
         #expect(button.isHidden)
+        #expect(button.frame.size == NSSize(width: 22, height: 22))
+
+        hostedView.applyAgentReportCopyControlState(isCaptureEnabled: true, hasReport: true)
+        hostedView.layoutSubtreeIfNeeded()
+        #expect(!button.isHidden)
+        #expect(button.isEnabled)
+        #expect(hasExactContainedButtonGeometry())
+
+        hostedView.applyGitBranchDisplayForTesting("feat/short")
+        hostedView.layoutSubtreeIfNeeded()
+        #expect(!branch.label.isHidden)
+        #expect(hostedView.bounds.contains(branch.controls.frame))
+        #expect(hasExactContainedButtonGeometry())
+        #expect(branch.controls.frame.maxX <= button.frame.minX)
+
+        hostedView.applyGitBranchDisplayForTesting(
+            "feature/this-is-a-deliberately-long-branch-name-for-narrow-layout"
+        )
+        hostedView.layoutSubtreeIfNeeded()
+        #expect(!branch.label.isHidden)
+        #expect(branch.label.lineBreakMode == .byTruncatingTail)
+        #expect(branch.label.maximumNumberOfLines == 1)
+        #expect(branch.label.toolTip?.contains(branch.label.stringValue) == true)
+        #expect(branch.label.accessibilityLabel()?.contains(branch.label.stringValue) == true)
+        #expect(branch.label.frame.width < branch.label.intrinsicContentSize.width)
+        #expect(branch.controls.frame.minX >= 0)
+        #expect(branch.controls.frame.minY >= 0)
+        #expect(button.frame.minX >= 0)
+        #expect(button.frame.minY >= 0)
+        #expect(hostedView.bounds.contains(branch.controls.frame))
+        #expect(hasExactContainedButtonGeometry())
+        #expect(branch.controls.frame.maxX <= button.frame.minX)
+
+        hostedView.applyGitBranchDisplayForTesting(nil)
+        hostedView.layoutSubtreeIfNeeded()
+        #expect(branch.label.isHidden)
+        #expect(branch.label.stringValue.isEmpty)
+        #expect(branch.label.toolTip == nil)
+        #expect(branch.controls.frame.width == 0)
+        #expect(hasExactContainedButtonGeometry())
+
+        let replacementWorkspaceID = UUID()
+        let replacementPanel = TerminalPanel(workspaceId: replacementWorkspaceID)
+        defer {
+            hostedView.attachSurface(panel.surface)
+            replacementPanel.surface.teardownSurface()
+        }
+        hostedView.attachSurface(replacementPanel.surface)
+        hostedView.applyAgentReportCopyControlState(isCaptureEnabled: true, hasReport: true)
+        hostedView.layoutSubtreeIfNeeded()
+        let reusedButton = hostedView.agentReportCopyButtonForTesting
+        let reusedButtons = reportCopyButtons(in: hostedView)
+        #expect(reusedButton === button)
+        #expect(reusedButtons.count == 1)
+        #expect(reusedButtons.filter { !$0.isHidden }.count == 1)
+        #expect(requiredSizeConstraints(.width).count == 1)
+        #expect(requiredSizeConstraints(.height).count == 1)
+        #expect(hasExactContainedButtonGeometry())
+        reusedButton.performClick(nil)
+        #expect(requests.count == 3)
+        #expect(requests.last?.0 == replacementWorkspaceID)
+        #expect(requests.last?.1 == replacementPanel.id)
+
+        hostedView.applyAgentReportCopyControlState(isCaptureEnabled: false, hasReport: false)
+        hostedView.layoutSubtreeIfNeeded()
+        #expect(button.isHidden)
+        #expect(button.frame.size == NSSize(width: 22, height: 22))
+    }
+
+    @Test func gitBranchResolutionRejectsOlderCwdTransferRespawnAndClosedSurfaceResults() {
+        let requestID = UUID()
+        let workspaceID = UUID()
+        let surfaceID = UUID()
+        let firstSurface = NSObject()
+        let firstPanel = NSObject()
+        let secondSurface = NSObject()
+        let secondPanel = NSObject()
+        let expected = TerminalGitBranchResolutionIdentity(
+            workspaceID: workspaceID,
+            surfaceID: surfaceID,
+            surfaceInstanceID: ObjectIdentifier(firstSurface),
+            panelInstanceID: ObjectIdentifier(firstPanel),
+            directory: "/repo/first"
+        )
+
+        #expect(GhosttySurfaceScrollView.gitBranchResolutionIsCurrent(
+            requestID: requestID,
+            latestRequestID: requestID,
+            expected: expected,
+            current: expected
+        ))
+        #expect(!GhosttySurfaceScrollView.gitBranchResolutionIsCurrent(
+            requestID: requestID,
+            latestRequestID: UUID(),
+            expected: expected,
+            current: expected
+        ))
+        #expect(!GhosttySurfaceScrollView.gitBranchResolutionIsCurrent(
+            requestID: requestID,
+            latestRequestID: requestID,
+            expected: expected,
+            current: TerminalGitBranchResolutionIdentity(
+                workspaceID: workspaceID,
+                surfaceID: surfaceID,
+                surfaceInstanceID: ObjectIdentifier(firstSurface),
+                panelInstanceID: ObjectIdentifier(firstPanel),
+                directory: "/repo/second"
+            )
+        ))
+        #expect(!GhosttySurfaceScrollView.gitBranchResolutionIsCurrent(
+            requestID: requestID,
+            latestRequestID: requestID,
+            expected: expected,
+            current: TerminalGitBranchResolutionIdentity(
+                workspaceID: workspaceID,
+                surfaceID: surfaceID,
+                surfaceInstanceID: ObjectIdentifier(secondSurface),
+                panelInstanceID: ObjectIdentifier(secondPanel),
+                directory: "/repo/first"
+            )
+        ))
+        #expect(!GhosttySurfaceScrollView.gitBranchResolutionIsCurrent(
+            requestID: requestID,
+            latestRequestID: requestID,
+            expected: expected,
+            current: nil
+        ))
     }
 
     @Test(arguments: ["tab", "pane", "workspace"])
@@ -4606,6 +5086,18 @@ private actor AgentReportAuthorityPublicationSuspensionGate {
         let waiters = resumeWaiters
         resumeWaiters.removeAll()
         waiters.forEach { $0.resume() }
+    }
+}
+
+private actor FullRunInvocationCounts {
+    private var generations = 0
+    private var authorizations = 0
+
+    func recordGeneration() { generations += 1 }
+    func recordAuthorization() { authorizations += 1 }
+
+    func snapshot() -> (generations: Int, authorizations: Int) {
+        (generations, authorizations)
     }
 }
 

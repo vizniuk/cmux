@@ -157,6 +157,35 @@ struct AgentChatSessionRegistryLifecycleReviewRegressionTests {
         #expect(staleFallback.transcriptBinding == missingFallback.transcriptBinding)
         #expect(outsideFallback.transcriptBinding == missingFallback.transcriptBinding)
 
+        let missingFullRun = try #require(await resolver.exportCodexFullRun(
+            recordedPath: nil,
+            sessionID: sessionID,
+            turnID: turnID,
+            expectedBinding: missingFallback.transcriptBinding
+        ))
+        #expect(missingFullRun.transcriptBinding == missingFallback.transcriptBinding)
+        #expect(missingFullRun.body.hasPrefix("ASSISTANT\n\n"))
+        #expect(
+            missingFullRun.body.contains("fallback F1")
+                || missingFullRun.body.contains("fallback F2")
+        )
+        let staleFullRun = try #require(await resolver.exportCodexFullRun(
+            recordedPath: directory.appendingPathComponent("missing.jsonl").path,
+            sessionID: sessionID,
+            turnID: turnID,
+            expectedBinding: missingFallback.transcriptBinding
+        ))
+        #expect(staleFullRun == missingFullRun)
+        let otherBinding = missingFallback.transcriptBinding == firstDirect.transcriptBinding
+            ? secondDirect.transcriptBinding
+            : firstDirect.transcriptBinding
+        #expect(await resolver.exportCodexFullRun(
+            recordedPath: nil,
+            sessionID: sessionID,
+            turnID: turnID,
+            expectedBinding: otherBinding
+        ) == nil)
+
         let primaryAuthority = try #require(await resolver.validatePrimaryCodexSession(
             recordedPath: nil,
             sessionID: sessionID

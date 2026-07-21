@@ -435,4 +435,67 @@ import CmuxSettings
                 )
         )
     }
+
+    @Test func agentReportShortcutPersistsUpdatesResetsAndRemainsUnboundWhenCleared() async throws {
+        let (store, catalog, errorLog) = makeStore()
+        let action = ShortcutAction.copyAgentReport
+        let custom = StoredShortcut(first: ShortcutStroke(
+            key: "r",
+            command: true,
+            option: true
+        ))
+        var changeCount = 0
+        let model = ShortcutListModel(
+            jsonStore: store,
+            catalog: catalog,
+            errorLog: errorLog,
+            onShortcutsChanged: { changeCount += 1 }
+        )
+
+        #expect(model.effective(for: action) == action.defaultShortcut)
+        #expect(
+            model.scopeCaption(for: action)
+                == String(
+                    localized: "settings.app.agentReportShortcut.subtitle",
+                    defaultValue: "Choose the keyboard shortcut that copies the latest Agent Report."
+                )
+        )
+
+        await model.assign(stroke: custom.first, to: action)
+        #expect(model.effective(for: action) == custom)
+        #expect(changeCount == 1)
+        #expect(await store.value(for: catalog.shortcuts.bindings)[action.rawValue] == custom)
+
+        let restored = ShortcutListModel(jsonStore: store, catalog: catalog, errorLog: errorLog)
+        restored.startObserving()
+        await spin(until: { restored.effective(for: action) == custom })
+        #expect(restored.effective(for: action) == custom)
+
+        await model.clearOrRestore(for: action)
+        #expect(model.effective(for: action) == .unbound)
+        #expect(await store.value(for: catalog.shortcuts.bindings)[action.rawValue] == .unbound)
+        #expect(model.effective(for: action) != action.defaultShortcut)
+
+        await model.resetAll()
+        #expect(model.effective(for: action) == action.defaultShortcut)
+        #expect(await store.value(for: catalog.shortcuts.bindings)[action.rawValue] == nil)
+    }
+
+    @Test func agentReportShortcutRejectsOrdinaryCommandCThroughExistingReservedUI() async {
+        let (store, catalog, errorLog) = makeStore()
+        let action = ShortcutAction.copyAgentReport
+        let model = ShortcutListModel(jsonStore: store, catalog: catalog, errorLog: errorLog)
+
+        await model.assign(stroke: ShortcutStroke(key: "c", command: true), to: action)
+
+        #expect(await store.value(for: catalog.shortcuts.bindings)[action.rawValue] == nil)
+        #expect(model.reservedShortcutRejections.contains(action.rawValue))
+        #expect(
+            model.validationMessage(for: action)
+                == String(
+                    localized: "shortcut.recorder.error.reservedBySystem",
+                    defaultValue: "This keystroke is reserved by macOS."
+                )
+        )
+    }
 }

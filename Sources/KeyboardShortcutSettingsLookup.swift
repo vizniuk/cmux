@@ -9,7 +9,10 @@ extension KeyboardShortcutSettings {
         #endif
 
         if let managedShortcut = settingsFileStore.override(for: action) {
-            return managedShortcut.isUnbound ? nil : managedShortcut
+            return managedShortcut.isUnbound
+                || action.isReservedShortcut(managedShortcut)
+                ? nil
+                : managedShortcut
         }
 
         guard let data = UserDefaults.standard.data(forKey: action.defaultsKey),
@@ -17,7 +20,10 @@ extension KeyboardShortcutSettings {
             let defaultShortcut = action.defaultShortcut
             return defaultShortcut.isUnbound ? nil : defaultShortcut
         }
-        return shortcut.isUnbound ? nil : shortcut
+        return shortcut.isUnbound
+            || action.isReservedShortcut(shortcut)
+            ? nil
+            : shortcut
     }
 
     static func shortcut(for action: Action) -> StoredShortcut {

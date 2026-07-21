@@ -201,6 +201,70 @@ public actor AgentReportCaptureStore {
         return (report.finalReply, receipt)
     }
 
+    /// Generates and authorizes one exact completed Full Run on explicit demand.
+    ///
+    /// The generator receives only body-free committed authority and must use a
+    /// descriptor-pinned resolver. Actor policy, latest-winner identity, lifecycle,
+    /// binding, and final-write capability are revalidated after both asynchronous
+    /// generation and application authorization. No generated body is retained.
+    ///
+    /// - Parameters:
+    ///   - runtimeSurfaceID: Exact represented process-local surface.
+    ///   - capturePolicyRevision: Main-actor policy revision observed by the caller.
+    ///   - availabilityRevision: Exact host-accepted availability revision.
+    ///   - generate: Trusted exact-turn transcript renderer.
+    ///   - authorize: Fresh application authority check returning a body-free receipt.
+    /// - Returns: A transient exact body and receipt, or `nil` when any authority changed.
+    public func authorizedFullRun(
+        runtimeSurfaceID: UUID,
+        capturePolicyRevision: UInt64,
+        availabilityRevision: AgentReportAvailabilityRevision,
+        generate: @escaping @Sendable (
+            AgentReportCopyAuthorizationContext
+        ) async -> AgentReportFullRunExport?,
+        authorize: @escaping @Sendable (
+            AgentReportCopyAuthorizationContext
+        ) async -> AgentReportWriteAuthorizationReceipt?
+    ) async -> (body: String, receipt: AgentReportWriteAuthorizationReceipt)? {
+        guard policy.isEnabled,
+              let report = latestByRuntimeSurfaceID[runtimeSurfaceID],
+              let committedAuthority = committedAuthorityByRuntimeSurfaceID[runtimeSurfaceID],
+              Self.authority(committedAuthority, matches: report),
+              let finalWriteCapability = latestFinalWriteCapabilityByRuntimeSurfaceID[runtimeSurfaceID],
+              finalWriteCapability.isValid,
+              !exhaustedLifecycleSurfaceIDs.contains(runtimeSurfaceID),
+              capturedLifecycleGenerationByRuntimeSurfaceID[runtimeSurfaceID]
+                == lifecycleGenerationByRuntimeSurfaceID[runtimeSurfaceID, default: 0] else {
+            return nil
+        }
+        let context = AgentReportCopyAuthorizationContext(
+            report: report,
+            captureStorePolicyGeneration: policyGeneration,
+            capturePolicyRevision: capturePolicyRevision,
+            availabilityRevision: availabilityRevision,
+            finalWriteCapability: finalWriteCapability
+        )
+        guard let export = await generate(context),
+              export.body.utf8.count <= AgentReportResourceLimits.maximumFullRunExportBytes,
+              export.transcriptBinding == context.transcriptBinding,
+              let receipt = await authorize(context),
+              policy.isEnabled,
+              latestByRuntimeSurfaceID[runtimeSurfaceID] == report,
+              committedAuthorityByRuntimeSurfaceID[runtimeSurfaceID] == committedAuthority,
+              Self.authority(committedAuthority, matches: report),
+              latestFinalWriteCapabilityByRuntimeSurfaceID[runtimeSurfaceID]
+                === finalWriteCapability,
+              finalWriteCapability.isValid,
+              receipt.matches(context),
+              context.captureStorePolicyGeneration == policyGeneration,
+              !exhaustedLifecycleSurfaceIDs.contains(runtimeSurfaceID),
+              capturedLifecycleGenerationByRuntimeSurfaceID[runtimeSurfaceID]
+                == lifecycleGenerationByRuntimeSurfaceID[runtimeSurfaceID, default: 0] else {
+            return nil
+        }
+        return (export.body, receipt)
+    }
+
     /// Advances a synchronous host revocation barrier in the store's ordering domain.
     ///
     /// - Returns: A revision newer than every snapshot already produced.

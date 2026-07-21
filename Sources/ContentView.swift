@@ -797,6 +797,9 @@ private final class SelectedWorkspaceDirectoryObserver: ObservableObject {
 }
 
 struct ContentView: View {
+    private static let commandPaletteAgentReportFullRunAvailableKey =
+        CommandPaletteContextKeys(rawValue: "agentReport.fullRunAvailable")
+
     var updateViewModel: UpdateStateModel
     let windowId: UUID
     @EnvironmentObject var tabManager: TabManager
@@ -6180,6 +6183,17 @@ struct ContentView: View {
             snapshot.setBool(CommandPaletteContextKeys.panelHasUnread, hasUnread)
 
             if panelIsTerminal {
+                if let terminalPanel = panelContext.panel as? TerminalPanel {
+                    let availability = AppDelegate.shared?.agentReportCopyControlAvailability(
+                        workspaceID: workspace.id,
+                        runtimeSurfaceID: panelId,
+                        representedSurface: terminalPanel.surface
+                    )
+                    snapshot.setBool(
+                        Self.commandPaletteAgentReportFullRunAvailableKey,
+                        availability?.hasReport == true
+                    )
+                }
                 let availableTargets = terminalOpenTargets ?? TerminalDirectoryOpenTarget.availableTargets()
                 for target in TerminalDirectoryOpenTarget.commandPaletteShortcutTargets {
                     snapshot.setBool(
@@ -6268,6 +6282,17 @@ struct ContentView: View {
 
         var contributions: [CommandPaletteCommandContribution] = []
         contributions.append(contentsOf: Self.commandPaletteCloudCommandContributions())
+
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.copyFullAgentRun",
+                title: constant(String(localized: "agentReport.copyFullRun", defaultValue: "Copy Full Run")),
+                subtitle: terminalPanelSubtitle,
+                keywords: ["copy", "agent", "report", "full", "run", "transcript"],
+                when: { $0.bool(CommandPaletteContextKeys.panelIsTerminal) },
+                enablement: { $0.bool(Self.commandPaletteAgentReportFullRunAvailableKey) }
+            )
+        )
 
         contributions.append(
             CommandPaletteCommandContribution(
@@ -7802,6 +7827,23 @@ struct ContentView: View {
             notificationStore.markUnread(forTabId: workspaceId)
         }
         registerIdentifierCopyCommandHandlers(&registry)
+        registry.register(commandId: "palette.copyFullAgentRun") {
+            guard let panelContext = focusedPanelContext,
+                  let terminalPanel = panelContext.panel as? TerminalPanel,
+                  terminalPanel.surface.id == panelContext.panelId,
+                  let app = AppDelegate.shared else {
+                NSSound.beep()
+                return
+            }
+            let workspaceID = panelContext.workspace.id
+            let surfaceID = panelContext.panelId
+            Task { @MainActor in
+                _ = await app.copyFullAgentRun(
+                    workspaceID: workspaceID,
+                    runtimeSurfaceID: surfaceID
+                )
+            }
+        }
 
         registry.register(commandId: "palette.renameTab") {
             beginRenameTabFlow()

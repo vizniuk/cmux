@@ -3,6 +3,9 @@
 /// These limits are measured in UTF-8 or raw file bytes as appropriate. They
 /// are process-internal product policy, not user-configurable settings.
 struct AgentReportResourceLimits: Sendable, Equatable {
+    /// Maximum UTF-8 bytes rendered for one exact completed Full Run export.
+    static let maximumFullRunExportBytes = 8 * 1024 * 1024
+
     /// The fixed Slice A policy used by production capture paths.
     static let sliceA = AgentReportResourceLimits(
         maximumReportBodyBytes: 2 * 1024 * 1024,

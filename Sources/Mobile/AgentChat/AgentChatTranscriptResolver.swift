@@ -8,6 +8,8 @@ import Foundation
 /// cannot share internal declarations across their target boundaries. Focused
 /// invariant tests pin every mirror to these byte counts.
 struct AgentReportResourceLimits: Sendable, Equatable {
+    static let maximumFullRunExportBytes = 8 * 1024 * 1024
+
     static let sliceA = AgentReportResourceLimits(
         maximumReportBodyBytes: 2 * 1024 * 1024,
         maximumJSONLRecordBytes: 8 * 1024 * 1024,
@@ -449,6 +451,44 @@ struct AgentChatTranscriptResolver: Sendable {
 }
 
 extension AgentChatTranscriptResolver: AgentReportTranscriptRecovering {
+    /// Renders the exact completed turn from the descriptor-selected transcript.
+    ///
+    /// The selected descriptor binding must equal the report's committed binding
+    /// before any transcript record is exported. No path is reopened and no
+    /// terminal, network, or provider fallback exists.
+    func exportCodexFullRun(
+        recordedPath: String?,
+        sessionID: String,
+        turnID: String,
+        expectedBinding: AgentReportTranscriptBinding
+    ) async -> AgentReportFullRunExport? {
+        let resolver = self
+        return await Task.detached(priority: .utility) {
+            guard let lines = resolver.openCodexTranscript(
+                recordedPath: recordedPath,
+                sessionID: sessionID
+            ), lines.transcriptBinding == expectedBinding else {
+                return nil
+            }
+            defer { lines.close() }
+            let body = CodexFullRunExporter().export(
+                records: lines,
+                sessionID: sessionID,
+                turnID: turnID
+            )
+            guard !lines.didFailTrustedRead,
+                  !lines.didViolateResourceLimit,
+                  let body,
+                  body.utf8.count <= AgentReportResourceLimits.maximumFullRunExportBytes else {
+                return nil
+            }
+            return AgentReportFullRunExport(
+                body: body,
+                transcriptBinding: lines.transcriptBinding
+            )
+        }.value
+    }
+
     /// Proves primary-session metadata using off-main streaming JSONL I/O.
     ///
     /// - Parameters:

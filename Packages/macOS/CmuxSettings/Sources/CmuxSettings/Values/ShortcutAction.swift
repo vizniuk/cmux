@@ -40,6 +40,8 @@ public enum ShortcutAction: String, CaseIterable, Sendable, Hashable, SettingCod
     case switchRightSidebarToFeed
     case switchRightSidebarToDock
     case triggerFlash
+    /// Copies the latest authorized Agent Report for the represented terminal.
+    case copyAgentReport
 
     // MARK: Navigation
     case nextSurface
@@ -173,6 +175,17 @@ public enum ShortcutAction: String, CaseIterable, Sendable, Hashable, SettingCod
 }
 
 extension ShortcutAction {
+    /// Whether this binding would steal the terminal's ordinary Copy command.
+    public func isReservedShortcut(_ shortcut: StoredShortcut) -> Bool {
+        guard self == .copyAgentReport, !shortcut.isUnbound else { return false }
+        let first = shortcut.first
+        return first.key.lowercased() == "c"
+            && first.command
+            && !first.shift
+            && !first.option
+            && !first.control
+    }
+
     /// Which group this action belongs to in the settings pane.
     public var group: Group {
         switch self {
@@ -184,7 +197,7 @@ extension ShortcutAction {
              .showNotifications, .jumpToUnread, .toggleUnread, .markOldestUnreadAndJumpNext,
              .focusRightSidebar, .switchRightSidebarToFiles, .switchRightSidebarToFind,
              .switchRightSidebarToSessions, .switchRightSidebarToFeed,
-             .switchRightSidebarToDock, .triggerFlash:
+             .switchRightSidebarToDock, .triggerFlash, .copyAgentReport:
             return .workspace
         case .nextSurface, .prevSurface, .moveSurfaceLeft, .moveSurfaceRight, .selectSurfaceByNumber,
              .nextSidebarTab, .prevSidebarTab, .moveWorkspaceUp, .moveWorkspaceDown, .focusHistoryBack, .focusHistoryForward,
@@ -287,7 +300,7 @@ extension ShortcutAction {
             return .atom(.sidebarFocus)
         case .commandPaletteNext, .commandPalettePrevious:
             return .key(ShortcutContextKnownKey.commandPaletteVisible.rawValue)
-        case .renameTab, .renameWorkspace:
+        case .renameTab, .renameWorkspace, .copyAgentReport:
             return .and(.not(.atom(.browserFocus)), .not(.atom(.sidebarFocus)))
         case .sendCtrlFToTerminal, .clearScreenKeepScrollback:
             return .and(.not(.atom(.browserFocus)), .not(.atom(.sidebarFocus)))
@@ -358,6 +371,11 @@ extension ShortcutAction {
         case .switchRightSidebarToFeed: return "Show Sidebar Feed"
         case .switchRightSidebarToDock: return "Show Sidebar Dock"
         case .triggerFlash: return "Flash Focused Panel"
+        case .copyAgentReport:
+            return String(
+                localized: "settings.app.agentReportShortcut",
+                defaultValue: "Copy Agent Report Shortcut"
+            )
         case .nextSurface: return "Next Surface"
         case .prevSurface: return "Previous Surface"
         case .moveSurfaceLeft: return String(localized: "shortcut.moveSurfaceLeft.label", defaultValue: "Move Surface Left")

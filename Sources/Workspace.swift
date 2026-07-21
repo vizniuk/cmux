@@ -4487,6 +4487,13 @@ final class Workspace: Identifiable, ObservableObject {
         if usesRemoteDirectoryProvenance {
             notifyPresentedCurrentDirectoryChanged(from: previousPresentedDirectory, force: provenanceChanged)
         }
+        if directoryChanged || provenanceChanged {
+            NotificationCenter.default.post(
+                name: .terminalGitBranchRefreshRequested,
+                object: nil,
+                userInfo: ["workspaceID": id, "surfaceID": panelId]
+            )
+        }
         return true
     }
 
@@ -4692,6 +4699,11 @@ final class Workspace: Identifiable, ObservableObject {
         let branchChanged = existing?.branch != nil && existing?.branch != branch
         if existing?.branch != branch || existing?.isDirty != isDirty {
             panelGitBranches[panelId] = state
+            NotificationCenter.default.post(
+                name: .terminalGitBranchRefreshRequested,
+                object: nil,
+                userInfo: ["workspaceID": id, "surfaceID": panelId]
+            )
         }
         if branchChanged {
             if panelPullRequests[panelId] != nil {
@@ -4721,6 +4733,11 @@ final class Workspace: Identifiable, ObservableObject {
                 pullRequest = nil
             }
         }
+        NotificationCenter.default.post(
+            name: .terminalGitBranchRefreshRequested,
+            object: nil,
+            userInfo: ["workspaceID": id, "surfaceID": panelId]
+        )
     }
 
     func updatePanelPullRequest(

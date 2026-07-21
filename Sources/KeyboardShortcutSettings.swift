@@ -95,6 +95,7 @@ enum KeyboardShortcutSettings {
         case switchRightSidebarToFeed
         case switchRightSidebarToDock
         case triggerFlash
+        case copyAgentReport
 
         // Navigation
         case nextSurface
@@ -228,6 +229,11 @@ enum KeyboardShortcutSettings {
             case .switchRightSidebarToFeed: return String(localized: "shortcut.switchRightSidebarToFeed.label", defaultValue: "Show Sidebar Feed")
             case .switchRightSidebarToDock: return String(localized: "shortcut.switchRightSidebarToDock.label", defaultValue: "Show Sidebar Dock")
             case .triggerFlash: return String(localized: "shortcut.flashFocusedPanel.label", defaultValue: "Flash Focused Panel")
+            case .copyAgentReport:
+                return String(
+                    localized: "settings.app.agentReportShortcut",
+                    defaultValue: "Copy Agent Report Shortcut"
+                )
             case .nextSurface: return String(localized: "shortcut.nextSurface.label", defaultValue: "Next Surface")
             case .prevSurface: return String(localized: "shortcut.previousSurface.label", defaultValue: "Previous Surface")
             case .moveSurfaceLeft: return String(localized: "shortcut.moveSurfaceLeft.label", defaultValue: "Move Surface Left")
@@ -326,6 +332,16 @@ enum KeyboardShortcutSettings {
             }
         }
 
+        /// Whether this runtime binding would steal ordinary terminal Copy.
+        func isReservedShortcut(_ shortcut: StoredShortcut) -> Bool {
+            guard self == .copyAgentReport, !shortcut.isUnbound else { return false }
+            return shortcut.key.lowercased() == "c"
+                && shortcut.command
+                && !shortcut.shift
+                && !shortcut.option
+                && !shortcut.control
+        }
+
         var defaultsKey: String { "shortcut.\(rawValue)" }
 
         var defaultShortcut: StoredShortcut {
@@ -395,6 +411,8 @@ enum KeyboardShortcutSettings {
                 return StoredShortcut(key: "5", command: false, shift: false, option: false, control: true)
             case .triggerFlash:
                 return StoredShortcut(key: "h", command: true, shift: true, option: false, control: false)
+            case .copyAgentReport:
+                return StoredShortcut(key: "c", command: true, shift: true, option: false, control: false)
             case .nextSidebarTab:
                 return StoredShortcut(key: "]", command: true, shift: false, option: false, control: true)
             case .prevSidebarTab:
@@ -668,6 +686,9 @@ enum KeyboardShortcutSettings {
             if shortcut.isUnbound {
                 return .accepted(.unbound)
             }
+            if isReservedShortcut(shortcut) {
+                return .rejected(.reservedBySystem)
+            }
             if shortcut.hasChord && !allowsChordShortcut {
                 return .rejected(.reservedBySystem)
             }
@@ -686,6 +707,9 @@ enum KeyboardShortcutSettings {
             // cmux.json can load while the global settings store is still initializing.
             // Keep this path free of conflict and hotkey checks that consult global shortcut state.
             if shortcut.isUnbound {
+                return .unbound
+            }
+            if isReservedShortcut(shortcut) {
                 return .unbound
             }
             if shortcut.hasChord && !allowsChordShortcut {
@@ -918,6 +942,9 @@ enum KeyboardShortcutSettings {
         action: Action
     ) -> StoredShortcut? {
         if shortcut.isUnbound { return shortcut }
+        if action.isReservedShortcut(shortcut) {
+            return nil
+        }
         if shortcut.hasChord && !action.allowsChordShortcut { return nil }
 
         switch action.resolvedRecordedShortcutIgnoringConflicts(shortcut) {

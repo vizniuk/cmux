@@ -836,6 +836,121 @@ struct AgentReportCaptureStoreTests {
         )
     }
 
+    @Test("Full Run is transient and requires the exact committed binding")
+    func authorizedFullRunIsExactAndTransient() async throws {
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
+        )
+        #expect(await store.capture(request(raw: "report body"), target: target()) == .captured)
+        let fullRunBody = "USER\n\nhello\n\nASSISTANT\n\ndone"
+        let revision = AgentReportAvailabilityRevisionAuthority().advance()
+        let authorized = try #require(await store.authorizedFullRun(
+            runtimeSurfaceID: surfaceID,
+            capturePolicyRevision: 9,
+            availabilityRevision: revision,
+            generate: { context in
+                AgentReportFullRunExport(
+                    body: fullRunBody,
+                    transcriptBinding: context.transcriptBinding
+                )
+            },
+            authorize: { context in
+                context.writeAuthorizationReceipt(panelInstanceID: ObjectIdentifier(store))
+            }
+        ))
+
+        #expect(authorized.body == fullRunBody)
+        #expect(authorized.receipt.capturePolicyRevision == 9)
+        #expect(await store.latestReport(runtimeSurfaceID: surfaceID)?.finalReply == "report body")
+        #expect(String(describing: AgentReportFullRunExport(
+            body: "PRIVATE",
+            transcriptBinding: transcriptBinding
+        )) == "AgentReportFullRunExport")
+
+        #expect(await store.authorizedFullRun(
+            runtimeSurfaceID: surfaceID,
+            capturePolicyRevision: 9,
+            availabilityRevision: revision,
+            generate: { _ in
+                AgentReportFullRunExport(
+                    body: "wrong",
+                    transcriptBinding: AgentReportTranscriptBinding(testIdentity: "wrong-binding")
+                )
+            },
+            authorize: { context in
+                context.writeAuthorizationReceipt(panelInstanceID: ObjectIdentifier(store))
+            }
+        ) == nil)
+    }
+
+    @Test("F1 Full Run cannot authorize after F2 replaces the report")
+    func fullRunReplacementRaceFailsClosed() async {
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
+        )
+        #expect(await store.capture(request(raw: "F1"), target: target()) == .captured)
+        let suspended = SuspendedFullRunGeneration()
+        let copyF1 = Task {
+            await store.authorizedFullRun(
+                runtimeSurfaceID: surfaceID,
+                capturePolicyRevision: 1,
+                availabilityRevision: AgentReportAvailabilityRevisionAuthority().advance(),
+                generate: { context in
+                    await suspended.generate(binding: context.transcriptBinding)
+                },
+                authorize: { context in
+                    context.writeAuthorizationReceipt(panelInstanceID: ObjectIdentifier(store))
+                }
+            )
+        }
+        await suspended.waitUntilStarted()
+
+        #expect(await store.capture(
+            request(raw: "F2", turnID: "turn-2", completionTimestamp: 200),
+            target: target(turnID: "turn-2")
+        ) == .captured)
+        await suspended.resume()
+
+        #expect(await copyF1.value == nil)
+        #expect(await store.latestReport(runtimeSurfaceID: surfaceID)?.finalReply == "F2")
+    }
+
+    @Test("Full Run is denied after lifecycle invalidation, purge, or disable")
+    func fullRunInvalidationPathsFailClosed() async {
+        for invalidation in ["lifecycle", "purge", "disable"] {
+            let store = AgentReportCaptureStore(
+                policy: .enabled,
+                transcriptRecovery: StubAgentReportTranscriptRecovery(reply: nil)
+            )
+            #expect(await store.capture(request(raw: invalidation), target: target()) == .captured)
+            switch invalidation {
+            case "lifecycle":
+                await store.invalidatePendingCapture(runtimeSurfaceID: surfaceID)
+            case "purge":
+                await store.purge(runtimeSurfaceID: surfaceID)
+            default:
+                await store.setPolicy(.disabled)
+            }
+
+            #expect(await store.authorizedFullRun(
+                runtimeSurfaceID: surfaceID,
+                capturePolicyRevision: 1,
+                availabilityRevision: AgentReportAvailabilityRevisionAuthority().advance(),
+                generate: { context in
+                    AgentReportFullRunExport(
+                        body: "must not export",
+                        transcriptBinding: context.transcriptBinding
+                    )
+                },
+                authorize: { context in
+                    context.writeAuthorizationReceipt(panelInstanceID: ObjectIdentifier(store))
+                }
+            ) == nil)
+        }
+    }
+
     @Test("availability observation contains only live topology identities")
     func availabilitySnapshotsAreContentFree() async throws {
         let store = AgentReportCaptureStore(
@@ -1313,6 +1428,31 @@ private actor StubAgentReportTranscriptRecovery: AgentReportTranscriptRecovering
         return reply.map {
             AgentReportRecoveryResult(body: $0, transcriptBinding: transcriptBinding)
         }
+    }
+}
+
+private actor SuspendedFullRunGeneration {
+    private var started = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func generate(binding: AgentReportTranscriptBinding) async -> AgentReportFullRunExport {
+        started = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { continuation = $0 }
+        return AgentReportFullRunExport(body: "F1 full run", transcriptBinding: binding)
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func resume() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 

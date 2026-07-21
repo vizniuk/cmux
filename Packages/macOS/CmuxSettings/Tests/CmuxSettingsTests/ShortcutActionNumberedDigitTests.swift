@@ -79,4 +79,26 @@ struct ShortcutActionNumberedDigitTests {
         #expect(!ShortcutAction.fileExplorerOpenSelection.allowsChordShortcut)
         #expect(!ShortcutAction.fileExplorerOpenSelectionFinderAlias.allowsChordShortcut)
     }
+
+    @Test func copyAgentReportUsesEstablishedConfigurableShortcutContract() {
+        let action = ShortcutAction.copyAgentReport
+
+        #expect(action.defaultShortcut == StoredShortcut(
+            first: ShortcutStroke(key: "c", command: true, shift: true)
+        ))
+        #expect(action.group == .workspace)
+        #expect(ShortcutAction.settingsVisibleActions.contains(action))
+        #expect(
+            action.defaultFocusWhenClause
+                == .and(.not(.atom(.browserFocus)), .not(.atom(.sidebarFocus)))
+        )
+        #expect(action.isReservedShortcut(StoredShortcut(
+            first: ShortcutStroke(key: "c", command: true)
+        )))
+        #expect(action.isReservedShortcut(StoredShortcut(
+            first: ShortcutStroke(key: "c", command: true),
+            second: ShortcutStroke(key: "r")
+        )))
+        #expect(!action.isReservedShortcut(action.defaultShortcut!))
+    }
 }
