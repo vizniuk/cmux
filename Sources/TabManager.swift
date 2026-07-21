@@ -8,6 +8,7 @@ import CmuxBrowser
 import CmuxGit
 import CmuxNotifications
 import CmuxPanes
+import CmuxRemoteSession
 import CmuxSettings
 import CmuxSidebar
 import CmuxSidebarGit
@@ -391,6 +392,7 @@ class TabManager: ObservableObject {
     /// Typed synchronous settings access (CmuxSettings).
     private let settings: any SettingsWriting
     private let settingsCatalog = SettingCatalog()
+    let nativeSSHConnectionBroker: NativeSSHConnectionBroker
 
     @Published private(set) var focusHistoryRevision: UInt64 = 0 {
         didSet {
@@ -456,9 +458,8 @@ class TabManager: ObservableObject {
     // entry points.
     let sidebarGitMetadataService: any SidebarGitMetadataServing
     let pullRequestProbing: any PullRequestProbing
-    /// Process-scoped GitHub transport state. AppDelegate passes this same
-    /// value to every subsequently-created window so their pollers share one
-    /// session, ETag cache, backoff deadline, and request queue.
+    /// GitHub transport state injected process-wide by the app composition root.
+    /// The fallback initializer is retained for isolated `TabManager` tests.
     let pullRequestProbeService: PullRequestProbeService
 
     init(
@@ -474,9 +475,11 @@ class TabManager: ObservableObject {
         gitProbeLimiter: WorkspaceGitMetadataProbeLimiter? = nil,
         panelTitleUpdateCoalescer: NotificationBurstCoalescer? = nil,
         settings: any SettingsWriting = UserDefaultsSettingsClient(defaults: .standard),
+        nativeSSHConnectionBroker: NativeSSHConnectionBroker = NativeSSHConnectionBroker(),
         closeTabWarningDefaults: UserDefaults = .standard
     ) {
         self.settings = settings
+        self.nativeSSHConnectionBroker = nativeSSHConnectionBroker
         self.panelTitleUpdateCoalescer = panelTitleUpdateCoalescer ?? NotificationBurstCoalescer()
         self.closeTabWarningDefaults = closeTabWarningDefaults
         workspaceReordering = WorkspaceReorderCoordinator(model: workspaces)
@@ -957,7 +960,8 @@ class TabManager: ObservableObject {
             initialBrowserTransparentBackground: initialBrowserTransparentBackground,
             workspaceEnvironment: workspaceEnvironment,
             allowTextBoxFocusDefault: allowTextBoxFocusDefault,
-            closeTabWarningDefaults: closeTabWarningDefaults
+            closeTabWarningDefaults: closeTabWarningDefaults,
+            nativeSSHConnectionBroker: nativeSSHConnectionBroker
         )
     }
 
@@ -2160,6 +2164,7 @@ class TabManager: ObservableObject {
             guard confirmClose(
                 title: prompt.title,
                 message: prompt.message,
+                scrollableDetails: prompt.details,
                 acceptCmdD: false
             ) else { return }
         }
@@ -2251,6 +2256,7 @@ class TabManager: ObservableObject {
             guard confirmClose(
                 title: plan.title,
                 message: plan.message,
+                scrollableDetails: plan.details,
                 acceptCmdD: plan.acceptCmdD
             ) else { return }
         }
@@ -2330,18 +2336,25 @@ class TabManager: ObservableObject {
         }
     }
 
-    func confirmClose(title: String, message: String, acceptCmdD: Bool) -> Bool {
+    func confirmClose(
+        title: String,
+        message: String,
+        scrollableDetails: String? = nil,
+        acceptCmdD: Bool
+    ) -> Bool {
         guard beginCloseConfirmationSession() else { return false }
         defer { endCloseConfirmationSession() }
 
+        let content = scrollableDetails.map {
+            CmuxAlertContent(flattenedText: message, separatingScrollableDetails: $0)
+        } ?? CmuxAlertContent(informativeText: message)
         if let confirmCloseHandler {
-            return confirmCloseHandler(title, message, acceptCmdD)
+            return confirmCloseHandler(title, content.flattenedText, acceptCmdD)
         }
         _ = acceptCmdD
 
         let alert = NSAlert()
         alert.messageText = title
-        alert.informativeText = message
         alert.alertStyle = .warning
         alert.addButton(withTitle: String(localized: "dialog.closeTab.close", defaultValue: "Close"))
         alert.addButton(withTitle: String(localized: "dialog.closeTab.cancel", defaultValue: "Cancel"))
@@ -2363,18 +2376,21 @@ class TabManager: ObservableObject {
         ])
         #endif
 
-        return runCloseConfirmationAlert(alert) == .alertFirstButtonReturn
+        return runCloseConfirmationAlert(alert, content: content) == .alertFirstButtonReturn
     }
 
-    private func runCloseConfirmationAlert(_ alert: NSAlert) -> NSApplication.ModalResponse {
+    private func runCloseConfirmationAlert(
+        _ alert: NSAlert,
+        content: CmuxAlertContent? = nil
+    ) -> NSApplication.ModalResponse {
         // Presentation (activate + sheet-on-main-window, else app-modal) is
-        // shared with every other cmux dialog via `runCmuxModalAlert`. This
+        // shared with every other cmux dialog via `NSAlert.runCmuxModal`. This
         // wrapper only adds the close-confirmation-specific UITest telemetry,
         // recorded from the presenter's actual path so the label can never
         // disagree with how the alert was really shown.
-        return runCmuxModalAlert(
-            alert,
-            presentingWindow: closeConfirmationPresentingWindow()
+        return alert.runCmuxModal(
+            presentingWindow: closeConfirmationPresentingWindow(),
+            content: content
         ) { presentation in
             #if DEBUG
             switch presentation {
@@ -2398,7 +2414,7 @@ class TabManager: ObservableObject {
     }
 
     private func closeConfirmationPresentingWindow() -> NSWindow? {
-        cmuxMainWindowForModalPresentation(preferring: window)
+        NSApp.cmuxMainWindowForModalPresentation(preferring: window)
     }
 
     private struct CloseOtherTabsInFocusedPanePlan {
@@ -2411,6 +2427,7 @@ class TabManager: ObservableObject {
         let workspaces: [Workspace]
         let title: String
         let message: String
+        let details: String
         let acceptCmdD: Bool
     }
 
@@ -2488,6 +2505,7 @@ class TabManager: ObservableObject {
             workspaces: workspaces,
             title: title,
             message: message,
+            details: titleLines,
             acceptCmdD: willCloseWindow
         )
     }
@@ -5677,7 +5695,6 @@ extension TabManager {
             hasher.combine(false)
             return
         }
-
         hasher.combine(true)
         hasher.combine(snapshot.kind.rawValue)
         hasher.combine(snapshot.sessionId)
@@ -5746,6 +5763,7 @@ extension TabManager {
         hashOptionalString(snapshot.source, into: &hasher)
         hashStringMap(snapshot.environment, into: &hasher)
         hasher.combine(snapshot.allowsAutomaticResume)
+        hasher.combine(snapshot.launchFlavor)
         if snapshot.isProcessDetected {
             hasher.combine(false)
         } else {
@@ -5934,19 +5952,12 @@ extension TabManager {
         return (filtered, remappedSelection)
     }
 
-    private static func isCloudVMSessionRestoreWorkspace(_ snapshot: SessionWorkspaceSnapshot) -> Bool {
-        isManagedCloudVMSessionRestoreWorkspace(snapshot)
-    }
-
-    private static func isManagedCloudVMSessionRestoreWorkspace(_ snapshot: SessionWorkspaceSnapshot) -> Bool {
-        guard let managedCloudVMID = snapshot.remote?.managedCloudVMID else { return false }
-        return !managedCloudVMID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
     @discardableResult
     func restoreSessionSnapshot(
         _ snapshot: SessionTabManagerSnapshot,
-        remapClosedPanelHistory: Bool = true, excludingStableIdentities: Set<UUID> = []
+        remapClosedPanelHistory: Bool = true,
+        excludingStableIdentities: Set<UUID> = [],
+        workspaceCreateIdempotencyCache: TerminalController.WorkspaceCreateIdempotencyCache? = nil
     ) -> [[UUID: UUID]] {
         isRestoringSessionSnapshot = true
         defer { isRestoringSessionSnapshot = false }
@@ -5990,10 +6001,12 @@ extension TabManager {
                 title: workspaceSnapshot.processTitle,
                 workingDirectory: workspaceSnapshot.currentDirectory,
                 portOrdinal: ordinal,
-                closeTabWarningDefaults: closeTabWarningDefaults
+                closeTabWarningDefaults: closeTabWarningDefaults,
+                nativeSSHConnectionBroker: nativeSSHConnectionBroker
             )
             workspace.owningTabManager = self
             let restoredPanelIds = workspace.restoreSessionSnapshot(workspaceSnapshot, excludingStableIdentities: excludingStableIdentities)
+            Self.recordRestoredTaskCreateProvenance(for: workspace, in: workspaceCreateIdempotencyCache)
             wireClosedBrowserTracking(for: workspace)
             newTabs.append(workspace)
             restoredPanelIdsByWorkspaceIndex.append(restoredPanelIds)
@@ -6003,7 +6016,12 @@ extension TabManager {
         if newTabs.isEmpty {
             let ordinal = Self.nextPortOrdinal
             Self.nextPortOrdinal += 1
-            let fallback = Workspace(title: "Terminal 1", portOrdinal: ordinal, closeTabWarningDefaults: closeTabWarningDefaults)
+            let fallback = Workspace(
+                title: "Terminal 1",
+                portOrdinal: ordinal,
+                closeTabWarningDefaults: closeTabWarningDefaults,
+                nativeSSHConnectionBroker: nativeSSHConnectionBroker
+            )
             fallback.owningTabManager = self
             wireClosedBrowserTracking(for: fallback)
             newTabs.append(fallback)

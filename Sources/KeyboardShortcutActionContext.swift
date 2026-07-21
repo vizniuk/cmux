@@ -209,7 +209,8 @@ extension KeyboardShortcutSettings.Action {
              .copyAgentReport:
             return .nonBrowserPanel
         case .browserBack, .browserForward, .browserReload, .browserHardReload,
-             .toggleBrowserDeveloperTools, .showBrowserJavaScriptConsole, .toggleBrowserFocusMode:
+             .toggleBrowserDeveloperTools, .showBrowserJavaScriptConsole, .toggleBrowserFocusMode,
+             .toggleBrowserDesignMode:
             return .browserPanel
         case .browserZoomIn, .browserZoomOut, .browserZoomReset:
             return .browserOrFilePreviewTextEditor

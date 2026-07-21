@@ -373,6 +373,8 @@ Hook subcommands:
 | `hooks feed --source <agent>` | Convert agent hook events into Feed context. |
 | `hooks <agent> <event>` | Generic hook surface for `grok`, `opencode`, `pi`, `amp`, `cursor`, `gemini`, `kimi`, `rovodev`, `copilot`, `codebuddy`, `factory`, and `qoder`. |
 
+Kimi hook setup targets `${KIMI_SHARE_DIR:-~/.kimi}/config.toml`. Setup and uninstall also remove only cmux's marker-delimited block from the legacy `${KIMI_CODE_HOME:-~/.kimi-code}/config.toml` path.
+
 Right sidebar commands:
 
 | Command | Contract |
@@ -469,6 +471,14 @@ Each workspace carries a persisted checklist plus a todo lifecycle status,
 shared by the sidebar row, the checklist popover, the todo pane, `cmux todo`
 / `cmux workspace status`, and the `workspace.todo.*` / `workspace.status.*`
 socket verbs (all funnel through the same mutation entry points).
+
+Agent policy: the checklist and manual status pins belong to the user.
+Coding agents must not create, edit, complete, remove, or replace checklist
+items, and must not `set`/`cycle` the status, unless the user explicitly
+asks them to manage that surface — a request to manage checklist items or
+a request to manage manual status pins. The status lane already tracks
+agent activity automatically through inference; agents should keep their
+own plans in their internal task tracking.
 
 Item schema (wire and `todo list --json` shape):
 
@@ -573,6 +583,11 @@ the expected text without connecting to a cmux socket.
 - `cmux list-workspaces --help` -> `Usage: cmux list-workspaces`
 - `cmux ssh --help` -> `Usage: cmux ssh <destination>`
 - `cmux ssh --help` -> `--forward-agent`
+- `cmux ssh --help` -> `--transport <ssh|mosh>`
+- `cmux mosh --help` -> `Usage: cmux mosh <destination>`
+- `cmux mosh-tmux --help` -> `Usage: cmux mosh-tmux <destination>`
+- `cmux mosh-tmux --help` -> `--session <name>`
+- `cmux ssh --help` -> `--command <text>`
 - `cmux ssh-session-list --help` -> `Usage: cmux ssh-session-list`
 - `cmux ssh-session-attach --help` -> `Usage: cmux ssh-session-attach --session-id <id>`
 - `cmux ssh-session-cleanup --help` -> `Usage: cmux ssh-session-cleanup`
