@@ -498,4 +498,54 @@ import CmuxSettings
                 )
         )
     }
+
+    @Test func clearAllNotificationsShortcutPersistsReloadsUnbindsResetsAndValidates() async throws {
+        let (store, catalog, errorLog) = makeStore()
+        let action = ShortcutAction.clearAllNotifications
+        let custom = StoredShortcut(first: ShortcutStroke(
+            key: "k",
+            command: true,
+            shift: true,
+            option: true,
+            control: true
+        ))
+        let chord = StoredShortcut(
+            first: ShortcutStroke(key: "k", command: true, option: true),
+            second: ShortcutStroke(key: "x", command: true, option: true)
+        )
+        let model = ShortcutListModel(jsonStore: store, catalog: catalog, errorLog: errorLog)
+
+        #expect(action.defaultShortcut == nil)
+        #expect(model.effective(for: action) == nil)
+
+        await model.assign(stroke: custom.first, to: action)
+        #expect(model.effective(for: action) == custom)
+        #expect(await store.value(for: catalog.shortcuts.bindings)[action.rawValue] == custom)
+
+        let reloaded = ShortcutListModel(jsonStore: store, catalog: catalog, errorLog: errorLog)
+        reloaded.startObserving()
+        await spin(until: { reloaded.effective(for: action) == custom })
+        #expect(reloaded.effective(for: action) == custom)
+
+        await model.clearOrRestore(for: action)
+        #expect(model.effective(for: action) == .unbound)
+        #expect(await store.value(for: catalog.shortcuts.bindings)[action.rawValue] == .unbound)
+
+        await model.resetAll()
+        #expect(model.effective(for: action) == nil)
+        #expect(await store.value(for: catalog.shortcuts.bindings)[action.rawValue] == nil)
+
+        await model.assign(stroke: ShortcutStroke(key: "x"), to: action)
+        #expect(model.bareKeyRejections.contains(action.rawValue))
+        #expect(await store.value(for: catalog.shortcuts.bindings)[action.rawValue] == nil)
+
+        let closeWindowDefault = try #require(ShortcutAction.closeWindow.defaultShortcut)
+        await model.assign(stroke: closeWindowDefault.first, to: action)
+        #expect(model.conflictRejections[action.rawValue] == .closeWindow)
+        #expect(await store.value(for: catalog.shortcuts.bindings)[action.rawValue] == nil)
+
+        await model.assignChord(chord, to: action)
+        #expect(model.effective(for: action) == chord)
+        #expect(await store.value(for: catalog.shortcuts.bindings)[action.rawValue] == chord)
+    }
 }

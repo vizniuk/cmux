@@ -33,6 +33,7 @@ public enum ShortcutAction: String, CaseIterable, Sendable, Hashable, SettingCod
     case jumpToUnread
     case toggleUnread
     case markOldestUnreadAndJumpNext
+    case clearAllNotifications
     case focusRightSidebar
     case switchRightSidebarToFiles
     case switchRightSidebarToFind
@@ -195,6 +196,7 @@ extension ShortcutAction {
         case .toggleSidebar, .newTab, .newBrowserWorkspace, .saveLayoutTemplate, .openFolder, .reopenPreviousSession, .goToWorkspace,
              .commandPalette, .commandPaletteNext, .commandPalettePrevious, .sendFeedback,
              .showNotifications, .jumpToUnread, .toggleUnread, .markOldestUnreadAndJumpNext,
+             .clearAllNotifications,
              .focusRightSidebar, .switchRightSidebarToFiles, .switchRightSidebarToFind,
              .switchRightSidebarToSessions, .switchRightSidebarToFeed,
              .switchRightSidebarToDock, .triggerFlash, .copyAgentReport:
@@ -364,6 +366,8 @@ extension ShortcutAction {
         case .jumpToUnread: return "Jump to Latest Unread"
         case .toggleUnread: return "Toggle Unread"
         case .markOldestUnreadAndJumpNext: return "Mark as Oldest Unread and Jump to Next Latest Unread"
+        case .clearAllNotifications:
+            return String(localized: "shortcut.clearAllNotifications.label", defaultValue: "Clear All Notifications")
         case .focusRightSidebar: return "Toggle Right Sidebar Focus"
         case .switchRightSidebarToFiles: return "Show Sidebar Files"
         case .switchRightSidebarToFind: return "Show Sidebar Find"

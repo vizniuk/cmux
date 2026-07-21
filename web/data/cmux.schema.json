@@ -1599,6 +1599,7 @@
               "jumpToUnread",
               "toggleUnread",
               "markOldestUnreadAndJumpNext",
+              "clearAllNotifications",
               "focusRightSidebar",
               "switchRightSidebarToFiles",
               "switchRightSidebarToFind",

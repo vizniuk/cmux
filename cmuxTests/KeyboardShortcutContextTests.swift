@@ -264,6 +264,74 @@ final class KeyboardShortcutContextTests: XCTestCase {
         XCTAssertEqual(settingsAction.displayName, KeyboardShortcutSettings.Action.newBrowserWorkspace.label)
     }
 
+    func testClearAllNotificationsCatalogDefaultsOrderingAndConflictsStayAligned() throws {
+        let runtimeAction = KeyboardShortcutSettings.Action.clearAllNotifications
+        let settingsAction = ShortcutAction.clearAllNotifications
+        let runtimeActions = KeyboardShortcutSettings.settingsVisibleActions
+        let settingsActions = ShortcutAction.settingsVisibleActions
+        let runtimeIndex = try XCTUnwrap(runtimeActions.firstIndex(of: runtimeAction))
+        let settingsIndex = try XCTUnwrap(settingsActions.firstIndex(of: settingsAction))
+        let commandC = StoredShortcut(
+            key: "c",
+            command: true,
+            shift: false,
+            option: false,
+            control: false
+        )
+
+        XCTAssertEqual(runtimeAction.rawValue, "clearAllNotifications")
+        XCTAssertEqual(settingsAction.rawValue, runtimeAction.rawValue)
+        XCTAssertEqual(
+            KeyboardShortcutSettings.Action.allCases.filter { $0.rawValue == runtimeAction.rawValue }.count,
+            1
+        )
+        XCTAssertEqual(ShortcutAction.allCases.filter { $0.rawValue == settingsAction.rawValue }.count, 1)
+        XCTAssertEqual(runtimeAction.defaultShortcut, .unbound)
+        XCTAssertNil(settingsAction.defaultShortcut)
+        XCTAssertNil(settingsAction.defaultStroke)
+        XCTAssertEqual(runtimeAction.shortcutContext, .application)
+        XCTAssertEqual(settingsAction.defaultFocusWhenClause, .always)
+        XCTAssertEqual(settingsAction.group, .workspace)
+        XCTAssertEqual(
+            runtimeAction.label,
+            String(
+                localized: "shortcut.clearAllNotifications.label",
+                defaultValue: "Clear All Notifications"
+            )
+        )
+        XCTAssertEqual(settingsAction.displayName, runtimeAction.label)
+        XCTAssertEqual(
+            runtimeIndex,
+            try XCTUnwrap(runtimeActions.firstIndex(of: .markOldestUnreadAndJumpNext)) + 1
+        )
+        XCTAssertEqual(
+            settingsIndex,
+            try XCTUnwrap(settingsActions.firstIndex(of: .markOldestUnreadAndJumpNext)) + 1
+        )
+        XCTAssertLessThan(runtimeIndex, try XCTUnwrap(runtimeActions.firstIndex(of: .focusRightSidebar)))
+        XCTAssertLessThan(settingsIndex, try XCTUnwrap(settingsActions.firstIndex(of: .focusRightSidebar)))
+        XCTAssertFalse(runtimeAction.isReservedShortcut(commandC))
+        XCTAssertTrue(KeyboardShortcutSettings.Action.copyAgentReport.isReservedShortcut(commandC))
+        XCTAssertEqual(
+            runtimeAction.normalizedRecordedShortcutResult(
+                KeyboardShortcutSettings.Action.closeWindow.defaultShortcut
+            ),
+            .rejected(.conflictsWithAction(.closeWindow))
+        )
+        XCTAssertEqual(
+            KeyboardShortcutSettings.Action.showNotifications.defaultShortcut,
+            StoredShortcut(key: "i", command: true, shift: false, option: false, control: false)
+        )
+        XCTAssertEqual(
+            KeyboardShortcutSettings.Action.jumpToUnread.defaultShortcut,
+            StoredShortcut(key: "u", command: true, shift: true, option: false, control: false)
+        )
+        XCTAssertEqual(
+            KeyboardShortcutSettings.Action.copyAgentReport.defaultShortcut,
+            StoredShortcut(key: "c", command: true, shift: true, option: false, control: false)
+        )
+    }
+
     func testSettingsPackageDefaultWhenClausesMatchRuntimeShortcutContexts() {
         for action in KeyboardShortcutSettings.Action.allCases {
             guard let settingsAction = ShortcutAction(rawValue: action.rawValue) else {

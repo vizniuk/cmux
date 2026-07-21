@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import CmuxSettings
 
@@ -100,5 +101,44 @@ struct ShortcutActionNumberedDigitTests {
             second: ShortcutStroke(key: "r")
         )))
         #expect(!action.isReservedShortcut(action.defaultShortcut!))
+    }
+
+    @Test func clearAllNotificationsUsesUnboundWorkspaceShortcutContract() throws {
+        let action = ShortcutAction.clearAllNotifications
+        let visibleActions = ShortcutAction.settingsVisibleActions
+        let actionIndex = try #require(visibleActions.firstIndex(of: action))
+        let notificationAnchorIndex = try #require(
+            visibleActions.firstIndex(of: .markOldestUnreadAndJumpNext)
+        )
+        let rightSidebarIndex = try #require(visibleActions.firstIndex(of: .focusRightSidebar))
+        let commandC = StoredShortcut(first: ShortcutStroke(key: "c", command: true))
+
+        #expect(action.rawValue == "clearAllNotifications")
+        #expect(ShortcutAction.allCases.filter { $0.rawValue == action.rawValue }.count == 1)
+        #expect(action.defaultShortcut == nil)
+        #expect(action.defaultStroke == nil)
+        #expect(action.group == .workspace)
+        #expect(action.defaultFocusWhenClause == .always)
+        #expect(!action.allowsBareFirstStroke)
+        #expect(action.allowsChordShortcut)
+        #expect(actionIndex == notificationAnchorIndex + 1)
+        #expect(actionIndex < rightSidebarIndex)
+        #expect(
+            action.displayName
+                == String(
+                    localized: "shortcut.clearAllNotifications.label",
+                    defaultValue: "Clear All Notifications"
+                )
+        )
+        #expect(!action.isReservedShortcut(commandC))
+        #expect(ShortcutAction.copyAgentReport.isReservedShortcut(commandC))
+        #expect(
+            ShortcutAction.showNotifications.defaultShortcut
+                == StoredShortcut(first: ShortcutStroke(key: "i", command: true))
+        )
+        #expect(
+            ShortcutAction.jumpToUnread.defaultShortcut
+                == StoredShortcut(first: ShortcutStroke(key: "u", command: true, shift: true))
+        )
     }
 }

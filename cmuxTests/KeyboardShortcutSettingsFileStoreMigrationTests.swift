@@ -15,6 +15,78 @@ private final class ShortcutSettingsLookupRecorder: @unchecked Sendable {
 }
 
 final class KeyboardShortcutSettingsFileStoreMigrationTests: XCTestCase {
+    @MainActor
+    func testClearAllNotificationsBindingReloadUnbindAndResetUseCanonicalConfig() throws {
+        let action = KeyboardShortcutSettings.Action.clearAllNotifications
+        let originalSettingsFileStore = KeyboardShortcutSettings.settingsFileStore
+        let originalDefaultsData = UserDefaults.standard.data(forKey: action.defaultsKey)
+        let directoryURL = try makeTemporaryDirectory()
+        defer {
+            KeyboardShortcutSettings.settingsFileStore = originalSettingsFileStore
+            if let originalDefaultsData {
+                UserDefaults.standard.set(originalDefaultsData, forKey: action.defaultsKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: action.defaultsKey)
+            }
+            try? FileManager.default.removeItem(at: directoryURL)
+        }
+
+        UserDefaults.standard.removeObject(forKey: action.defaultsKey)
+        let settingsFileURL = directoryURL.appendingPathComponent("cmux.json", isDirectory: false)
+        try writeSettingsFile(
+            """
+            {
+              "shortcuts": {
+                "bindings": {
+                  "clearAllNotifications": "cmd+shift+opt+ctrl+k"
+                }
+              }
+            }
+            """,
+            to: settingsFileURL
+        )
+        let store = KeyboardShortcutSettingsFileStore(
+            primaryPath: settingsFileURL.path,
+            fallbackPath: nil,
+            additionalFallbackPaths: [],
+            startWatching: false
+        )
+        KeyboardShortcutSettings.settingsFileStore = store
+        let custom = StoredShortcut(
+            key: "k",
+            command: true,
+            shift: true,
+            option: true,
+            control: true
+        )
+
+        XCTAssertEqual(store.override(for: action), custom)
+        XCTAssertEqual(KeyboardShortcutSettings.shortcut(for: action), custom)
+
+        try writeSettingsFile(
+            """
+            {
+              "shortcuts": {
+                "bindings": {
+                  "clearAllNotifications": "none"
+                }
+              }
+            }
+            """,
+            to: settingsFileURL
+        )
+        XCTAssertTrue(store.reload())
+        XCTAssertEqual(store.override(for: action), .unbound)
+        XCTAssertEqual(KeyboardShortcutSettings.shortcut(for: action), .unbound)
+
+        try writeSettingsFile(#"{"shortcuts":{"bindings":{}}}"#, to: settingsFileURL)
+        XCTAssertTrue(store.reload())
+        KeyboardShortcutSettings.resetShortcut(for: action)
+        XCTAssertNil(store.override(for: action))
+        XCTAssertNil(UserDefaults.standard.data(forKey: action.defaultsKey))
+        XCTAssertEqual(KeyboardShortcutSettings.shortcut(for: action), .unbound)
+    }
+
     func testBootstrapMigratesLegacySettingsIntoCanonicalConfig() throws {
         let directoryURL = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directoryURL) }

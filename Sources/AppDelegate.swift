@@ -14047,6 +14047,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return true
         }
 
+        if matchConfiguredShortcut(event: event, action: .clearAllNotifications) {
+            if let notificationStore {
+                notificationStore.clearAll()
+            }
+            return true
+        }
+
         // Flash the currently focused panel so the user can visually confirm focus.
         if matchConfiguredShortcut(event: event, action: .triggerFlash) {
             if performFocusedDockShortcut(.triggerFlash, event: event) { return true }

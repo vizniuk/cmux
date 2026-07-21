@@ -20,6 +20,7 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
     private let onQuitApp: () -> Void
     private var notificationMenuSnapshotCancellable: AnyCancellable?
     private var globalFontObserver: NSObjectProtocol?
+    private var shortcutSettingsObserver: NSObjectProtocol?
     private let buildHintTitle: String?
 
     private let stateHintItem = NSMenuItem(title: String(localized: "statusMenu.noUnread", defaultValue: "No unread notifications"), action: nil, keyEquivalent: "")
@@ -83,6 +84,13 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
             }
         globalFontObserver = NotificationCenter.default.addObserver(
             forName: GlobalFontMagnification.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshUI() }
+        }
+        shortcutSettingsObserver = NotificationCenter.default.addObserver(
+            forName: KeyboardShortcutSettings.didChangeNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
@@ -175,6 +183,10 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
             NotificationCenter.default.removeObserver(globalFontObserver)
             self.globalFontObserver = nil
         }
+        if let shortcutSettingsObserver {
+            NotificationCenter.default.removeObserver(shortcutSettingsObserver)
+            self.shortcutSettingsObserver = nil
+        }
         statusItem.menu = nil
         NSStatusBar.system.removeStatusItem(statusItem)
     }
@@ -200,6 +212,7 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
         applyShortcut(KeyboardShortcutSettings.menuShortcut(for: .globalSearch), to: globalSearchItem)
         applyShortcut(KeyboardShortcutSettings.menuShortcut(for: .showNotifications), to: showNotificationsItem)
         applyShortcut(KeyboardShortcutSettings.menuShortcut(for: .jumpToUnread), to: jumpToUnreadItem)
+        applyShortcut(KeyboardShortcutSettings.menuShortcut(for: .clearAllNotifications), to: clearAllItem)
 
         jumpToUnreadItem.isEnabled = snapshot.hasUnreadNotifications
         markAllReadItem.isEnabled = snapshot.hasUnreadNotifications
@@ -226,6 +239,11 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
         item.keyEquivalent = keyEquivalent
         item.keyEquivalentModifierMask = shortcut.modifierFlags
     }
+
+#if DEBUG
+    var clearAllItemForTesting: NSMenuItem { clearAllItem }
+    var markAllReadItemForTesting: NSMenuItem { markAllReadItem }
+#endif
 
     private func rebuildInlineNotificationItems(recentNotifications: [TerminalNotification]) {
         for item in notificationItems {

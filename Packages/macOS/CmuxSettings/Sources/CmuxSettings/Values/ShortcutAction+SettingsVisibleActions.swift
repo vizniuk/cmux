@@ -20,7 +20,8 @@ private extension ShortcutAction {
         let actionSet = Set(colocatedSidebarActions)
         let baseActions = actions.filter { !actionSet.contains($0) }
 
-        guard let anchorIndex = baseActions.firstIndex(of: .markOldestUnreadAndJumpNext)
+        guard let anchorIndex = baseActions.firstIndex(of: .clearAllNotifications)
+            ?? baseActions.firstIndex(of: .markOldestUnreadAndJumpNext)
             ?? baseActions.firstIndex(of: .jumpToUnread) else {
             return colocatedSidebarActions + baseActions
         }

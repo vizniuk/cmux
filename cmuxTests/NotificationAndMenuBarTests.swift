@@ -653,6 +653,134 @@ final class NotificationDockBadgeTests: XCTestCase {
         super.tearDown()
     }
 
+    func testClearAllMenuShortcutRepresentationRefreshEnablementAndActionEquivalence() throws {
+#if DEBUG
+        let action = KeyboardShortcutSettings.Action.clearAllNotifications
+        let store = TerminalNotificationStore.shared
+        let appDelegate = AppDelegate.shared ?? AppDelegate()
+        let originalNotificationStore = appDelegate.notificationStore
+        let originalSettingsFileStore = KeyboardShortcutSettings.settingsFileStore
+        let originalDefaultsData = UserDefaults.standard.data(forKey: action.defaultsKey)
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-clear-all-menu-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer {
+            store.replaceNotificationsForTesting([])
+            appDelegate.notificationStore = originalNotificationStore
+            KeyboardShortcutSettings.settingsFileStore = originalSettingsFileStore
+            if let originalDefaultsData {
+                UserDefaults.standard.set(originalDefaultsData, forKey: action.defaultsKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: action.defaultsKey)
+            }
+            try? FileManager.default.removeItem(at: directoryURL)
+        }
+
+        let settingsFileURL = directoryURL.appendingPathComponent("cmux.json", isDirectory: false)
+        try "{}".write(to: settingsFileURL, atomically: true, encoding: .utf8)
+        KeyboardShortcutSettings.settingsFileStore = KeyboardShortcutSettingsFileStore(
+            primaryPath: settingsFileURL.path,
+            fallbackPath: nil,
+            additionalFallbackPaths: [],
+            startWatching: false
+        )
+        UserDefaults.standard.removeObject(forKey: action.defaultsKey)
+        store.replaceNotificationsForTesting([])
+        appDelegate.notificationStore = store
+
+        let controller = MenuBarExtraController(
+            notificationStore: store,
+            onShowGlobalSearch: { _, _ in },
+            onShowMainWindow: {},
+            onShowNotifications: {},
+            onOpenNotification: { _ in },
+            onJumpToLatestUnread: {},
+            onOpenTaskManager: {},
+            onToggleSleepyMode: {},
+            onCheckForUpdates: {},
+            onOpenPreferences: {},
+            onQuitApp: {}
+        )
+        defer { controller.removeFromMenuBar() }
+
+        let clearItem = controller.clearAllItemForTesting
+        let markReadItem = controller.markAllReadItemForTesting
+        XCTAssertEqual(clearItem.keyEquivalent, "")
+        XCTAssertEqual(clearItem.keyEquivalentModifierMask, [])
+        XCTAssertFalse(clearItem.isEnabled)
+
+        let custom = StoredShortcut(
+            key: "k",
+            command: true,
+            shift: false,
+            option: true,
+            control: false
+        )
+        KeyboardShortcutSettings.setShortcut(custom, for: action)
+        XCTAssertEqual(clearItem.keyEquivalent, "k")
+        XCTAssertEqual(clearItem.keyEquivalentModifierMask, [.command, .option])
+
+        KeyboardShortcutSettings.clearShortcut(for: action)
+        XCTAssertEqual(clearItem.keyEquivalent, "")
+        XCTAssertEqual(clearItem.keyEquivalentModifierMask, [])
+
+        KeyboardShortcutSettings.setShortcut(custom, for: action)
+        KeyboardShortcutSettings.resetShortcut(for: action)
+        XCTAssertEqual(clearItem.keyEquivalent, "")
+        XCTAssertEqual(clearItem.keyEquivalentModifierMask, [])
+
+        KeyboardShortcutSettings.setShortcut(custom, for: action)
+        let notifications = [
+            TerminalNotification(
+                id: UUID(),
+                tabId: UUID(),
+                surfaceId: UUID(),
+                title: "Unread",
+                subtitle: "",
+                body: "",
+                createdAt: Date(),
+                isRead: false
+            ),
+            TerminalNotification(
+                id: UUID(),
+                tabId: UUID(),
+                surfaceId: UUID(),
+                title: "Read",
+                subtitle: "",
+                body: "",
+                createdAt: Date(),
+                isRead: true
+            ),
+        ]
+        store.replaceNotificationsForTesting(notifications)
+        controller.refreshForDebugControls()
+        XCTAssertTrue(clearItem.isEnabled)
+        XCTAssertTrue(markReadItem.isEnabled)
+
+        XCTAssertTrue(NSApp.sendAction(markReadItem.action!, to: markReadItem.target, from: markReadItem))
+        XCTAssertEqual(store.notifications.count, notifications.count)
+        XCTAssertEqual(store.unreadCount, 0)
+        controller.refreshForDebugControls()
+        XCTAssertTrue(clearItem.isEnabled)
+        XCTAssertFalse(markReadItem.isEnabled)
+
+        XCTAssertTrue(NSApp.sendAction(clearItem.action!, to: clearItem.target, from: clearItem))
+        let menuSnapshot = store.notificationMenuSnapshot
+        XCTAssertTrue(store.notifications.isEmpty)
+        controller.refreshForDebugControls()
+        XCTAssertFalse(clearItem.isEnabled)
+
+        store.replaceNotificationsForTesting(notifications)
+        let event = try XCTUnwrap(makeShortcutEvent(custom))
+        XCTAssertTrue(appDelegate.debugHandleCustomShortcut(event: event))
+        let shortcutSnapshot = store.notificationMenuSnapshot
+        XCTAssertEqual(shortcutSnapshot, menuSnapshot)
+        XCTAssertTrue(store.notifications.isEmpty)
+#else
+        XCTFail("Menu shortcut test accessors are only available in DEBUG")
+#endif
+    }
+
     func testNotificationClickActionRoundTripsAndIsStored() {
         let store = TerminalNotificationStore.shared
         let path = "/tmp/cmux-crash-\(UUID().uuidString).ghosttycrash"
@@ -1571,6 +1699,26 @@ final class NotificationDockBadgeTests: XCTestCase {
 
         store.clearLatestNotification(forTabId: tab)
         XCTAssertEqual(store.latestNotification(forTabId: tab)?.id, previousNotification.id)
+    }
+
+    private func makeShortcutEvent(_ shortcut: StoredShortcut) -> NSEvent? {
+        guard !shortcut.isUnbound,
+              !shortcut.hasChord,
+              let keyCode = shortcut.firstStroke.resolvedKeyCode() else {
+            return nil
+        }
+        return NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: shortcut.modifierFlags,
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: 0,
+            context: nil,
+            characters: shortcut.menuItemKeyEquivalent ?? shortcut.key,
+            charactersIgnoringModifiers: shortcut.menuItemKeyEquivalent ?? shortcut.key,
+            isARepeat: false,
+            keyCode: keyCode
+        )
     }
 }
 

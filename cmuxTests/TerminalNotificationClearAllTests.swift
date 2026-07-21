@@ -11,6 +11,109 @@ import CmuxSidebar
 
 @MainActor
 final class TerminalNotificationClearAllTests: XCTestCase {
+    func testConfiguredClearAllNotificationsShortcutRoutesOnceHandlesEmptyAndPassesThroughWhenUnbound() throws {
+        let action = KeyboardShortcutSettings.Action.clearAllNotifications
+        let appDelegate = AppDelegate.shared ?? AppDelegate()
+        let store = TerminalNotificationStore.shared
+        let originalNotificationStore = appDelegate.notificationStore
+        let originalSettingsFileStore = KeyboardShortcutSettings.settingsFileStore
+        let originalDefaultsData = UserDefaults.standard.data(forKey: action.defaultsKey)
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmux-clear-all-shortcut-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer {
+            store.replaceNotificationsForTesting([])
+            appDelegate.notificationStore = originalNotificationStore
+            KeyboardShortcutSettings.settingsFileStore = originalSettingsFileStore
+            if let originalDefaultsData {
+                UserDefaults.standard.set(originalDefaultsData, forKey: action.defaultsKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: action.defaultsKey)
+            }
+            try? FileManager.default.removeItem(at: directoryURL)
+        }
+
+        let settingsFileURL = directoryURL.appendingPathComponent("cmux.json", isDirectory: false)
+        try "{}".write(to: settingsFileURL, atomically: true, encoding: .utf8)
+        KeyboardShortcutSettings.settingsFileStore = KeyboardShortcutSettingsFileStore(
+            primaryPath: settingsFileURL.path,
+            fallbackPath: nil,
+            additionalFallbackPaths: [],
+            startWatching: false
+        )
+        UserDefaults.standard.removeObject(forKey: action.defaultsKey)
+        appDelegate.notificationStore = store
+
+        let custom = StoredShortcut(
+            key: "k",
+            command: true,
+            shift: true,
+            option: true,
+            control: true
+        )
+        KeyboardShortcutSettings.setShortcut(custom, for: action)
+        let event = try XCTUnwrap(makeShortcutEvent(custom))
+        let notifications = [
+            TerminalNotification(
+                id: UUID(),
+                tabId: UUID(),
+                surfaceId: UUID(),
+                title: "First",
+                subtitle: "",
+                body: "",
+                createdAt: Date(),
+                isRead: false
+            ),
+            TerminalNotification(
+                id: UUID(),
+                tabId: UUID(),
+                surfaceId: UUID(),
+                title: "Second",
+                subtitle: "",
+                body: "",
+                createdAt: Date(),
+                isRead: true
+            ),
+        ]
+        store.replaceNotificationsForTesting(notifications)
+        let populatedGeneration = TerminalMutationBus.shared.notificationGenerationSnapshot()
+
+#if DEBUG
+        XCTAssertTrue(appDelegate.debugHandleCustomShortcut(event: event))
+#else
+        XCTFail("debugHandleCustomShortcut is only available in DEBUG")
+#endif
+        XCTAssertEqual(
+            TerminalMutationBus.shared.notificationGenerationSnapshot(),
+            populatedGeneration + 1,
+            "The shortcut must invoke the authoritative clear path exactly once"
+        )
+        XCTAssertTrue(store.notifications.isEmpty)
+        XCTAssertEqual(store.unreadCount, 0)
+
+        let emptyGeneration = TerminalMutationBus.shared.notificationGenerationSnapshot()
+#if DEBUG
+        XCTAssertTrue(appDelegate.debugHandleCustomShortcut(event: event))
+#else
+        XCTFail("debugHandleCustomShortcut is only available in DEBUG")
+#endif
+        XCTAssertEqual(TerminalMutationBus.shared.notificationGenerationSnapshot(), emptyGeneration + 1)
+        XCTAssertTrue(store.notifications.isEmpty)
+
+        KeyboardShortcutSettings.clearShortcut(for: action)
+        let unboundGeneration = TerminalMutationBus.shared.notificationGenerationSnapshot()
+#if DEBUG
+        XCTAssertFalse(
+            appDelegate.debugHandleCustomShortcut(event: event),
+            "An unbound app-local action must not consume ordinary terminal input"
+        )
+#else
+        XCTFail("debugHandleCustomShortcut is only available in DEBUG")
+#endif
+        XCTAssertEqual(TerminalMutationBus.shared.notificationGenerationSnapshot(), unboundGeneration)
+        XCTAssertTrue(store.notifications.isEmpty)
+    }
+
     func testQueuedClearAllRemovesAlreadyDeliveredNotification() throws {
         let store = TerminalNotificationStore.shared
         let appDelegate = AppDelegate.shared ?? AppDelegate()
@@ -694,6 +797,26 @@ final class TerminalNotificationClearAllTests: XCTestCase {
         XCTAssertEqual(
             destinationWorkspace.restoredAgentSnapshotForTesting(panelId: movingPanelId)?.sessionId,
             "restored-only"
+        )
+    }
+
+    private func makeShortcutEvent(_ shortcut: StoredShortcut) -> NSEvent? {
+        guard !shortcut.isUnbound,
+              !shortcut.hasChord,
+              let keyCode = shortcut.firstStroke.resolvedKeyCode() else {
+            return nil
+        }
+        return NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: shortcut.modifierFlags,
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: 0,
+            context: nil,
+            characters: shortcut.menuItemKeyEquivalent ?? shortcut.key,
+            charactersIgnoringModifiers: shortcut.menuItemKeyEquivalent ?? shortcut.key,
+            isARepeat: false,
+            keyCode: keyCode
         )
     }
 }

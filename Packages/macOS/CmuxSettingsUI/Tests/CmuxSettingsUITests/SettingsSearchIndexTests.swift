@@ -88,6 +88,12 @@ struct SettingsSearchIndexTests {
         #expect(result.contains { $0.id == "setting:keyboardShortcuts:modifier-hold-hints" })
     }
 
+    @Test func clearAllNotificationsFindsKeyboardShortcutSetting() {
+        let index = SettingsSearchIndex(catalog: SettingCatalog())
+        let result = index.match("Clear All Notifications")
+        #expect(result.contains { $0.id == "setting:keyboardShortcuts:shortcuts" })
+    }
+
     @Test(arguments: [
         ("naming", "setting:automation:workspace-auto-naming"),
         ("nmaing", "setting:automation:workspace-auto-naming"),
