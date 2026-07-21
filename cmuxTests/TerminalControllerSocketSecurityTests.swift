@@ -1114,16 +1114,102 @@ final class TerminalControllerSocketSecurityTests {
         let gitDirectory = root.appendingPathComponent(".git", isDirectory: true)
         try FileManager.default.createDirectory(at: gitDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        try Data("ref: refs/heads/safe\ninjected\n".utf8).write(
-            to: gitDirectory.appendingPathComponent("HEAD")
-        )
+        let manager = TabManager(initialWorkingDirectory: root.path)
+        let workspace = try #require(manager.selectedWorkspace)
+        let panel = try #require(workspace.focusedTerminalPanel)
+        let hostedView = panel.hostedView
+        let indicator = hostedView.gitBranchIndicatorForTesting
+        let service = GitMetadataService()
+        defer { workspace.teardownAllPanels() }
 
-        #expect(await GitMetadataService().branchDisplaySnapshot(forDirectory: root.path) == nil)
+        func writeHead(_ contents: String) throws {
+            try Data(contents.utf8).write(to: gitDirectory.appendingPathComponent("HEAD"))
+        }
+
+        func applyRepresentedBranchSnapshot() async -> GitBranchDisplaySnapshot? {
+            let representedDirectory = manager.gitProbeDirectory(
+                for: workspace,
+                panelId: panel.id
+            )
+            let snapshot: GitBranchDisplaySnapshot?
+            if let representedDirectory {
+                snapshot = await service.branchDisplaySnapshot(forDirectory: representedDirectory)
+            } else {
+                snapshot = nil
+            }
+            hostedView.applyGitBranchDisplayForTesting(snapshot?.displayName)
+            hostedView.layoutSubtreeIfNeeded()
+            return snapshot
+        }
+
+        func assertExactRepresentedSurface() {
+            #expect(hostedView.surfaceView.terminalSurface === panel.surface)
+            #expect(panel.surface.tabId == workspace.id)
+            #expect(panel.surface.id == panel.id)
+            #expect(manager.gitProbeDirectory(for: workspace, panelId: panel.id) == root.path)
+        }
+
+        let validBranch = "feature/🚀-valid"
+        try writeHead("ref: refs/heads/\(validBranch)\n")
+        let initialSnapshot = try #require(await applyRepresentedBranchSnapshot())
+        #expect(initialSnapshot.displayName == validBranch)
+        #expect(!indicator.label.isHidden)
+        #expect(indicator.label.stringValue == validBranch)
+        assertExactRepresentedSurface()
+
+        let multilineBranches = [
+            "topic\u{2028}second-line",
+            "topic\u{2029}second-paragraph",
+            "topic\u{0085}next-line",
+        ]
+        for invalidBranch in multilineBranches {
+            try writeHead("ref: refs/heads/\(invalidBranch)\n")
+            let snapshot = await applyRepresentedBranchSnapshot()
+
+            #expect(snapshot == nil)
+            #expect(indicator.label.isHidden)
+            #expect(indicator.label.stringValue.isEmpty)
+            #expect(indicator.label.toolTip == nil)
+            #expect(indicator.label.accessibilityLabel() == nil)
+            let appKitValues = [
+                indicator.label.stringValue,
+                indicator.label.toolTip ?? "",
+                indicator.label.accessibilityLabel() ?? "",
+                indicator.label.accessibilityHelp() ?? "",
+                indicator.label.accessibilityValue() as? String ?? "",
+            ]
+            for value in appKitValues {
+                #expect(!value.contains(invalidBranch))
+                #expect(!value.contains(validBranch))
+                #expect(!value.unicodeScalars.contains(where: CharacterSet.newlines.contains))
+                #expect(!value.contains(root.path))
+            }
+            let diagnostic = String(describing: snapshot)
+            #expect(!diagnostic.contains(invalidBranch))
+            #expect(!diagnostic.contains(root.path))
+            #expect(!diagnostic.contains("detached@"))
+            assertExactRepresentedSurface()
+
+            try writeHead("ref: refs/heads/\(validBranch)\n")
+            let recoveredSnapshot = try #require(await applyRepresentedBranchSnapshot())
+            #expect(recoveredSnapshot.displayName == validBranch)
+            #expect(!indicator.label.isHidden)
+            #expect(indicator.label.stringValue == validBranch)
+            assertExactRepresentedSurface()
+        }
+
+        try writeHead("ref: refs/heads/safe\ninjected\n")
+        #expect(await applyRepresentedBranchSnapshot() == nil)
+        #expect(indicator.label.isHidden)
+        #expect(indicator.label.stringValue.isEmpty)
 
         try Data(repeating: 0x61, count: 1 * 1024 * 1024 + 1).write(
             to: gitDirectory.appendingPathComponent("HEAD")
         )
-        #expect(await GitMetadataService().branchDisplaySnapshot(forDirectory: root.path) == nil)
+        #expect(await applyRepresentedBranchSnapshot() == nil)
+        #expect(indicator.label.isHidden)
+        #expect(indicator.label.stringValue.isEmpty)
+        assertExactRepresentedSurface()
     }
 
     @Test func staleAgentReportAvailabilityCannotCrossSynchronousRevocation() throws {

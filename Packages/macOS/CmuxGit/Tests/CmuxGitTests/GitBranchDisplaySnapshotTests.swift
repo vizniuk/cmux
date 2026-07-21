@@ -82,6 +82,53 @@ struct GitBranchDisplaySnapshotTests {
         ) == nil)
     }
 
+    @Test("Unicode newline separators fail closed through HEAD resolution")
+    func unicodeNewlineBranchValues() async throws {
+        let cases = [
+            (name: "NEXT LINE", branch: "topic\u{0085}next-line", suffix: "next-line"),
+            (name: "LINE SEPARATOR", branch: "topic\u{2028}second-line", suffix: "second-line"),
+            (
+                name: "PARAGRAPH SEPARATOR",
+                branch: "topic\u{2029}second-paragraph",
+                suffix: "second-paragraph"
+            ),
+        ]
+
+        for testCase in cases {
+            let fixture = try GitRepositoryFixture()
+            try Data("ref: refs/heads/\(testCase.branch)\n".utf8).write(
+                to: fixture.gitDirectory.appendingPathComponent("HEAD")
+            )
+
+            let snapshot = await GitMetadataService().branchDisplaySnapshot(
+                forDirectory: fixture.root.path
+            )
+
+            #expect(snapshot == nil, "\(testCase.name) must not produce a branch snapshot")
+            for diagnostic in [String(describing: snapshot), String(reflecting: snapshot)] {
+                #expect(!diagnostic.contains("topic"))
+                #expect(!diagnostic.contains(testCase.suffix))
+                #expect(!diagnostic.contains("detached@"))
+                #expect(!diagnostic.contains(fixture.root.path))
+            }
+        }
+    }
+
+    @Test("valid Unicode and emoji branch names remain visible")
+    func validUnicodeBranchValues() async throws {
+        for branch in ["feature/café-修正", "feature/🚀-launch"] {
+            let fixture = try GitRepositoryFixture()
+            try Data("ref: refs/heads/\(branch)\n".utf8).write(
+                to: fixture.gitDirectory.appendingPathComponent("HEAD")
+            )
+
+            let snapshot = try #require(await GitMetadataService().branchDisplaySnapshot(
+                forDirectory: fixture.root.path
+            ))
+            #expect(snapshot.displayName == branch)
+        }
+    }
+
     @Test("malformed git indirection and oversized commondir fail closed")
     func malformedRepositoryIndirection() async throws {
         let base = FileManager.default.temporaryDirectory

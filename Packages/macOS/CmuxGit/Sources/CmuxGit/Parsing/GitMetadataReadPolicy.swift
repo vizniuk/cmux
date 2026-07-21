@@ -98,6 +98,7 @@ struct GitMetadataReadPolicy: Sendable {
               !value.contains("@{"),
               !value.unicodeScalars.contains(where: {
                   CharacterSet.controlCharacters.contains($0)
+                      || CharacterSet.newlines.contains($0)
                       || forbiddenRefCharacters.contains($0)
               }) else {
             return nil
