@@ -6,6 +6,7 @@ import CmuxCore
 import CmuxGit
 import Darwin
 import Foundation
+import SwiftUI
 import Testing
 import CmuxTerminal
 import struct CmuxSettings.IntegrationsCatalogSection
@@ -706,6 +707,229 @@ final class TerminalControllerSocketSecurityTests {
         XCTAssertNotEqual(workerError["code"] as? String, "invalid_dispatch")
         XCTAssertNotEqual(workerError["code"] as? String, "method_not_found")
         XCTAssertEqual(workerError["code"] as? String, "not_found")
+    }
+
+    @Test func xmuxEditionIdentityIsBoundedToExplicitBundlePrefix() {
+        #expect(!CmuxFeatureFlags.isXmuxEdition(bundleIdentifier: "com.cmuxterm.app"))
+        #expect(!CmuxFeatureFlags.isXmuxEdition(bundleIdentifier: "com.cmuxterm.app.debug"))
+        #expect(!CmuxFeatureFlags.isXmuxEdition(bundleIdentifier: "com.cmuxterm.app.debug.ordinary-tag"))
+        #expect(CmuxFeatureFlags.isXmuxEdition(bundleIdentifier: "com.cmuxterm.app.debug.xmux-main"))
+        #expect(CmuxFeatureFlags.isXmuxEdition(bundleIdentifier: "com.cmuxterm.app.debug.xmux-validation-42"))
+        #expect(!CmuxFeatureFlags.isXmuxEdition(bundleIdentifier: "com.cmuxterm.app.debug.xmuxmain"))
+        #expect(!CmuxFeatureFlags.isXmuxEdition(bundleIdentifier: "com.cmuxterm.app.debug.xmux-"))
+        #expect(!CmuxFeatureFlags.isXmuxEdition(bundleIdentifier: "org.example.com.cmuxterm.app.debug.xmux-main"))
+        #expect(!CmuxFeatureFlags.isXmuxEdition(bundleIdentifier: nil))
+    }
+
+    @Test func xmuxFooterBrandingAndUpgradeSuppressionPreserveNonXmuxBehavior() {
+        #if DEBUG
+        #expect(
+            SidebarDevFooter.bannerTitle(isXmuxEdition: false)
+                == String(localized: "debug.devBuildBanner.title", defaultValue: "THIS IS A DEV BUILD")
+        )
+        #expect(SidebarDevFooter.bannerColor(isXmuxEdition: false) == .red)
+        #expect(
+            SidebarDevFooter.bannerTitle(isXmuxEdition: true)
+                == String(localized: "xmux.editionBanner.title", defaultValue: "Xaero Edition")
+        )
+        #expect(
+            SidebarDevFooter.bannerColor(isXmuxEdition: true)
+                == Color(nsColor: .secondaryLabelColor)
+        )
+        #expect(SidebarDevFooter.bannerIsVisible(preference: true))
+        #expect(!SidebarDevFooter.bannerIsVisible(preference: false))
+        #endif
+
+        #expect(SidebarProBadge.isVisible(isXmuxEdition: false))
+        #expect(!SidebarProBadge.isVisible(isXmuxEdition: true))
+    }
+
+    @Test func terminalViewportAndPaneChromeShareCopyResponseTopSection() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repoRoot.appendingPathComponent("Sources/GhosttyTerminalView.swift"),
+            encoding: .utf8
+        )
+        #expect(source.contains(
+            "override func menu(for event: NSEvent) -> NSMenu? {\n" +
+                "        makeContextMenu(for: event, sendsTerminalPointerEvent: true)\n" +
+                "    }"
+        ))
+        #expect(source.contains(
+            "func paneContextMenu(for event: NSEvent) -> NSMenu? {\n" +
+                "        makeContextMenu(for: event, sendsTerminalPointerEvent: false)\n" +
+                "    }"
+        ))
+
+        let builderStart = try #require(source.range(of: "    private func makeContextMenu("))
+        let builderEnd = try #require(source.range(
+            of: "    /// Builds the response alias",
+            range: builderStart.upperBound..<source.endIndex
+        ))
+        let builder = String(source[builderStart.lowerBound..<builderEnd.lowerBound])
+        var cursor = builder.startIndex
+        for token in [
+            "menu.addItem(makeAgentReportResponseCopyMenuItem(",
+            "menu.addItem(.separator())",
+            "menu.addItem(makeAgentReportCopyMenuItem(",
+            "menu.addItem(makeAgentReportFullRunCopyMenuItem(",
+            "menu.addItem(.separator())",
+            "if onTriggerFlash != nil",
+            "if hasCopyableTerminalSelection(surface: surface)",
+            "let pasteItem = menu.addItem(",
+            "let splitHorizontallyItem = menu.addItem(",
+            "let splitVerticallyItem = menu.addItem(",
+            "appendCurrentSurfaceContextMenuItems(to: menu)",
+            "let resetTerminalItem = menu.addItem(",
+            "appendReconnectRemotePaneMenuItem(to: menu)",
+        ] {
+            let match = try #require(builder.range(of: token, range: cursor..<builder.endIndex))
+            cursor = match.upperBound
+        }
+
+        let surfaceView = GhosttyNSView(frame: .zero)
+        let workspaceID = UUID()
+        let runtimeSurfaceID = UUID()
+        let responseItem = surfaceView.makeAgentReportResponseCopyMenuItem(
+            workspaceID: workspaceID,
+            runtimeSurfaceID: runtimeSurfaceID,
+            isCaptureEnabled: false,
+            hasReport: true
+        )
+        let reportItem = surfaceView.makeAgentReportCopyMenuItem(
+            workspaceID: workspaceID,
+            runtimeSurfaceID: runtimeSurfaceID,
+            isCaptureEnabled: false,
+            hasReport: true
+        )
+        let fullRunItem = surfaceView.makeAgentReportFullRunCopyMenuItem(
+            workspaceID: workspaceID,
+            runtimeSurfaceID: runtimeSurfaceID,
+            isCaptureEnabled: false,
+            hasReport: true
+        )
+        let menu = NSMenu()
+        menu.addItem(responseItem)
+        menu.addItem(.separator())
+        menu.addItem(reportItem)
+        menu.addItem(fullRunItem)
+        menu.addItem(.separator())
+
+        let expectedTop = [
+            String(localized: "agentReport.copyResponse", defaultValue: "Copy Response"),
+            "separator",
+            String(localized: "agentReport.copy", defaultValue: "Copy Agent Report"),
+            String(localized: "agentReport.copyFullRun", defaultValue: "Copy Full Run"),
+            "separator",
+        ]
+        let signature = menu.items.map { $0.isSeparatorItem ? "separator" : $0.title }
+        #expect(signature == expectedTop)
+        #expect(!responseItem.isEnabled)
+        #expect(!zip(signature, signature.dropFirst()).contains { pair in
+            pair.0 == "separator" && pair.1 == "separator"
+        })
+    }
+
+    @Test func copyResponseUsesRepresentedAuthorityAndAgentReportBytes() async throws {
+        let manager = TabManager()
+        let representedWorkspace = try #require(manager.selectedWorkspace)
+        let representedPanel = try #require(representedWorkspace.focusedTerminalPanel)
+        let activeWorkspace = manager.addWorkspace(select: true)
+        let surfaceView = representedPanel.hostedView.surfaceView
+        defer { manager.tabs.forEach { $0.teardownAllPanels() } }
+
+        let exact = "  response bytes ✅\nno-extra-newline"
+        let store = AgentReportCaptureStore(
+            policy: .enabled,
+            transcriptRecovery: SuspendedEndpointAgentReportRecovery(reply: "unused")
+        )
+        let request = agentReportRequest(
+            workspace: representedWorkspace,
+            panel: representedPanel,
+            raw: exact
+        )
+        let target = agentReportTarget(workspace: representedWorkspace, panel: representedPanel)
+        #expect(await store.capture(
+            request,
+            target: target,
+            revalidateTarget: { _ in target },
+            publishResolvedAuthority: { _ in true },
+            discardResolvedAuthority: { _ in }
+        ) == .captured)
+
+        var requestedTargets: [(UUID, UUID)] = []
+        surfaceView.agentReportCopyRequestHandler = { requestedTargets.append(($0, $1)) }
+        defer { surfaceView.agentReportCopyRequestHandler = nil }
+        let responseItem = surfaceView.makeAgentReportResponseCopyMenuItem(
+            workspaceID: representedWorkspace.id,
+            runtimeSurfaceID: representedPanel.id,
+            isCaptureEnabled: true,
+            hasReport: true
+        )
+        let reportItem = surfaceView.makeAgentReportCopyMenuItem(
+            workspaceID: representedWorkspace.id,
+            runtimeSurfaceID: representedPanel.id,
+            isCaptureEnabled: true,
+            hasReport: true
+        )
+        #expect(responseItem.title == String(
+            localized: "agentReport.copyResponse",
+            defaultValue: "Copy Response"
+        ))
+        #expect(responseItem.action == reportItem.action)
+        #expect(responseItem.keyEquivalent.isEmpty)
+        #expect(manager.selectedWorkspace?.id == activeWorkspace.id)
+
+        surfaceView.copyAgentReport(responseItem)
+        #expect(requestedTargets.count == 1)
+        #expect(requestedTargets[0].0 == representedWorkspace.id)
+        #expect(requestedTargets[0].1 == representedPanel.id)
+        surfaceView.copyAgentReport(reportItem)
+        #expect(requestedTargets.count == 2)
+        #expect(requestedTargets[1].0 == representedWorkspace.id)
+        #expect(requestedTargets[1].1 == representedPanel.id)
+
+        let responsePasteboard = NSPasteboard(name: .init("cmux-copy-response-\(UUID().uuidString)"))
+        let reportPasteboard = NSPasteboard(name: .init("cmux-copy-report-\(UUID().uuidString)"))
+        for (capturedTarget, pasteboard) in zip(requestedTargets, [responsePasteboard, reportPasteboard]) {
+            #expect(await AppDelegate.copyLatestAgentReport(
+                store: store,
+                runtimeSurfaceID: capturedTarget.1,
+                to: pasteboard,
+                authorize: { context in
+                    guard context.workspaceID == capturedTarget.0,
+                          context.runtimeSurfaceID == capturedTarget.1 else {
+                        return nil
+                    }
+                    return context.writeAuthorizationReceipt(
+                        panelInstanceID: ObjectIdentifier(store)
+                    )
+                }
+            ))
+        }
+        #expect(responsePasteboard.string(forType: .string) == exact)
+        #expect(reportPasteboard.string(forType: .string) == exact)
+        #expect(responsePasteboard.data(forType: .string) == reportPasteboard.data(forType: .string))
+
+        let deniedPasteboard = NSPasteboard(name: .init("cmux-copy-response-denied-\(UUID().uuidString)"))
+        deniedPasteboard.clearContents()
+        deniedPasteboard.setString("preserve", forType: .string)
+        let deniedChangeCount = deniedPasteboard.changeCount
+        #expect(await AppDelegate.copyLatestAgentReport(
+            store: store,
+            runtimeSurfaceID: representedPanel.id,
+            to: deniedPasteboard,
+            authorize: { _ in nil }
+        ) == false)
+        #expect(deniedPasteboard.changeCount == deniedChangeCount)
+        #expect(deniedPasteboard.string(forType: .string) == "preserve")
+
+        let malformedItem = NSMenuItem()
+        malformedItem.representedObject = ["workspaceID": activeWorkspace.id.uuidString]
+        surfaceView.copyAgentReport(malformedItem)
+        #expect(requestedTargets.count == 2)
     }
 
     @Test func privateAgentReportCaptureRoutesOnWorkerAndDisabledGateRetainsNothing() async throws {

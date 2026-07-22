@@ -7251,6 +7251,33 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         }
 
         let menu = NSMenu()
+        if let terminalSurface {
+            let availability = AppDelegate.shared?.agentReportCopyControlAvailability(
+                workspaceID: terminalSurface.tabId,
+                runtimeSurfaceID: terminalSurface.id,
+                representedSurface: terminalSurface
+            ) ?? (isCaptureEnabled: false, hasReport: false)
+            menu.addItem(makeAgentReportResponseCopyMenuItem(
+                workspaceID: terminalSurface.tabId,
+                runtimeSurfaceID: terminalSurface.id,
+                isCaptureEnabled: availability.isCaptureEnabled,
+                hasReport: availability.hasReport
+            ))
+            menu.addItem(.separator())
+            menu.addItem(makeAgentReportCopyMenuItem(
+                workspaceID: terminalSurface.tabId,
+                runtimeSurfaceID: terminalSurface.id,
+                isCaptureEnabled: availability.isCaptureEnabled,
+                hasReport: availability.hasReport
+            ))
+            menu.addItem(makeAgentReportFullRunCopyMenuItem(
+                workspaceID: terminalSurface.tabId,
+                runtimeSurfaceID: terminalSurface.id,
+                isCaptureEnabled: availability.isCaptureEnabled,
+                hasReport: availability.hasReport
+            ))
+            menu.addItem(.separator())
+        }
         if onTriggerFlash != nil {
             let flashItem = menu.addItem(
                 withTitle: String(localized: "terminalContextMenu.triggerFlash", defaultValue: "Trigger Flash"),
@@ -7268,25 +7295,6 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
             )
             item.target = self
             addTranslateSelectionMenuItem(to: menu, surface: surface)
-        }
-        if let terminalSurface {
-            let availability = AppDelegate.shared?.agentReportCopyControlAvailability(
-                workspaceID: terminalSurface.tabId,
-                runtimeSurfaceID: terminalSurface.id,
-                representedSurface: terminalSurface
-            ) ?? (isCaptureEnabled: false, hasReport: false)
-            menu.addItem(makeAgentReportCopyMenuItem(
-                workspaceID: terminalSurface.tabId,
-                runtimeSurfaceID: terminalSurface.id,
-                isCaptureEnabled: availability.isCaptureEnabled,
-                hasReport: availability.hasReport
-            ))
-            menu.addItem(makeAgentReportFullRunCopyMenuItem(
-                workspaceID: terminalSurface.tabId,
-                runtimeSurfaceID: terminalSurface.id,
-                isCaptureEnabled: availability.isCaptureEnabled,
-                hasReport: availability.hasReport
-            ))
         }
         let pasteItem = menu.addItem(
             withTitle: String(localized: "terminalContextMenu.paste", defaultValue: "Paste"),
@@ -7348,6 +7356,23 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         return menu
     }
 
+    /// Builds the response alias through the same represented-surface copy action.
+    func makeAgentReportResponseCopyMenuItem(
+        workspaceID: UUID,
+        runtimeSurfaceID: UUID,
+        isCaptureEnabled: Bool,
+        hasReport: Bool
+    ) -> NSMenuItem {
+        makeRepresentedAgentReportCopyMenuItem(
+            title: String(localized: "agentReport.copyResponse", defaultValue: "Copy Response"),
+            workspaceID: workspaceID,
+            runtimeSurfaceID: runtimeSurfaceID,
+            isCaptureEnabled: isCaptureEnabled,
+            hasReport: hasReport,
+            appliesConfiguredShortcut: false
+        )
+    }
+
     /// Builds the represented-surface menu item without report-derived state.
     func makeAgentReportCopyMenuItem(
         workspaceID: UUID,
@@ -7355,7 +7380,24 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         isCaptureEnabled: Bool,
         hasReport: Bool
     ) -> NSMenuItem {
-        let title = String(localized: "agentReport.copy", defaultValue: "Copy Agent Report")
+        makeRepresentedAgentReportCopyMenuItem(
+            title: String(localized: "agentReport.copy", defaultValue: "Copy Agent Report"),
+            workspaceID: workspaceID,
+            runtimeSurfaceID: runtimeSurfaceID,
+            isCaptureEnabled: isCaptureEnabled,
+            hasReport: hasReport,
+            appliesConfiguredShortcut: true
+        )
+    }
+
+    private func makeRepresentedAgentReportCopyMenuItem(
+        title: String,
+        workspaceID: UUID,
+        runtimeSurfaceID: UUID,
+        isCaptureEnabled: Bool,
+        hasReport: Bool,
+        appliesConfiguredShortcut: Bool
+    ) -> NSMenuItem {
         let item = NSMenuItem(
             title: title,
             action: #selector(copyAgentReport(_:)),
@@ -7363,10 +7405,12 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         )
         item.target = self
         item.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: title)
-        applyConfiguredMenuShortcut(
-            KeyboardShortcutSettings.menuShortcut(for: .copyAgentReport),
-            to: item
-        )
+        if appliesConfiguredShortcut {
+            applyConfiguredMenuShortcut(
+                KeyboardShortcutSettings.menuShortcut(for: .copyAgentReport),
+                to: item
+            )
+        }
         item.representedObject = [
             "workspaceID": workspaceID.uuidString,
             "runtimeSurfaceID": runtimeSurfaceID.uuidString,

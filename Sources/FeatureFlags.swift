@@ -31,6 +31,21 @@ struct CmuxFeatureFlagDefinition: Identifiable, Equatable {
 final class CmuxFeatureFlags {
     static let shared = CmuxFeatureFlags()
 
+    nonisolated static let xmuxEditionBundleIdentifierPrefix = "com.cmuxterm.app.debug.xmux-"
+
+    /// Returns whether a bundle identifier carries the explicit xmux edition prefix.
+    nonisolated static func isXmuxEdition(bundleIdentifier: String?) -> Bool {
+        guard let bundleIdentifier,
+              bundleIdentifier.hasPrefix(xmuxEditionBundleIdentifierPrefix) else {
+            return false
+        }
+        return bundleIdentifier.count > xmuxEditionBundleIdentifierPrefix.count
+    }
+
+    nonisolated static var currentBuildIsXmuxEdition: Bool {
+        isXmuxEdition(bundleIdentifier: Bundle.main.bundleIdentifier)
+    }
+
     #if DEBUG
     private static let proUpgradeUIDefault = true
     #else

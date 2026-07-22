@@ -47,16 +47,46 @@ struct SidebarDevFooter: View {
     @ObservedObject var fileExplorerState: FileExplorerState
     let modifierKeyMonitor: WindowScopedShortcutHintModifierMonitor
     let onSendFeedback: () -> Void
+    let isXmuxEdition: Bool
     @AppStorage(DevBuildBannerDebugSettings.sidebarBannerVisibleKey)
     private var showSidebarDevBuildBanner = DevBuildBannerDebugSettings.defaultShowSidebarBanner
+
+    init(
+        updateViewModel: UpdateStateModel,
+        fileExplorerState: FileExplorerState,
+        modifierKeyMonitor: WindowScopedShortcutHintModifierMonitor,
+        onSendFeedback: @escaping () -> Void,
+        isXmuxEdition: Bool = CmuxFeatureFlags.currentBuildIsXmuxEdition
+    ) {
+        self.updateViewModel = updateViewModel
+        self.fileExplorerState = fileExplorerState
+        self.modifierKeyMonitor = modifierKeyMonitor
+        self.onSendFeedback = onSendFeedback
+        self.isXmuxEdition = isXmuxEdition
+    }
+
+    static func bannerTitle(isXmuxEdition: Bool) -> String {
+        if isXmuxEdition {
+            return String(localized: "xmux.editionBanner.title", defaultValue: "Xaero Edition")
+        }
+        return String(localized: "debug.devBuildBanner.title", defaultValue: "THIS IS A DEV BUILD")
+    }
+
+    static func bannerColor(isXmuxEdition: Bool) -> Color {
+        isXmuxEdition ? Color(nsColor: .secondaryLabelColor) : .red
+    }
+
+    static func bannerIsVisible(preference: Bool) -> Bool {
+        preference
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             SidebarFooterButtons(updateViewModel: updateViewModel, fileExplorerState: fileExplorerState, modifierKeyMonitor: modifierKeyMonitor, onSendFeedback: onSendFeedback)
-            if showSidebarDevBuildBanner {
-                Text(String(localized: "debug.devBuildBanner.title", defaultValue: "THIS IS A DEV BUILD"))
+            if Self.bannerIsVisible(preference: showSidebarDevBuildBanner) {
+                Text(Self.bannerTitle(isXmuxEdition: isXmuxEdition))
                     .cmuxFont(size: 11, weight: .semibold)
-                    .foregroundColor(.red)
+                    .foregroundColor(Self.bannerColor(isXmuxEdition: isXmuxEdition))
             }
         }
         .padding(.leading, 6)
