@@ -86,7 +86,7 @@ Run the committed scripts from the repository root, in order:
    ./xmux/06_launch_and_verify_xmux.sh
    ```
 
-The backup excludes credential files and never copies Keychain material. The build uses `scripts/reload.sh` with `CMUX_SKIP_ZIG_BUILD=1`, `--tag xmux-main`, `--name xmux`, `--prod-auth`, and `--no-global-cli-links`; it does not pass `--launch`. Set `XMUX_SWIFT_FRONTEND_WORKAROUND=1` only when the documented Swift frontend workaround is needed.
+The backup excludes credential files and never copies Keychain material. If the official macOS defaults domain does not exist, the backup records it as absent/skipped and still succeeds with every available source. If the domain exists, a failed or empty export is a hard error and is never reported as a successful plist. The build uses `scripts/reload.sh` with `CMUX_SKIP_ZIG_BUILD=1`, `--tag xmux-main`, `--name xmux`, `--prod-auth`, and `--no-global-cli-links`; it does not pass `--launch`. Set `XMUX_SWIFT_FRONTEND_WORKAROUND=1` only when the documented Swift frontend workaround is needed.
 
 ## Shared and bundle-specific state
 
@@ -111,7 +111,7 @@ The scripts never copy Keychain entries. Authentication remains independently ma
 
 Every migration is opt-in and has `_OPTIONAL_` in its filename. Each refuses to run until both official cmux and xmux are fully stopped, creates a timestamped pre-migration backup, preserves source data, and is safe when its source is absent.
 
-- `./xmux/07_OPTIONAL_copy_existing_session.sh` copies the official primary and previous session snapshots to xmux-specific filenames. **Restoring those sessions may restart represented commands. Never copy sessions while either application is running.**
+- `./xmux/07_OPTIONAL_copy_existing_session.sh` copies the official primary and previous session snapshots to xmux-specific filenames. Its final receipt reports exact copied, skipped, and backed-up counts and identifies each source and target separately. **Restoring those sessions may restart represented commands. Never copy sessions while either application is running.**
 - `./xmux/08_OPTIONAL_copy_notification_history.sh` copies only the bundle-specific notification history file and does not touch active notification state.
 - `./xmux/09_OPTIONAL_copy_macos_preferences.sh` exports official macOS defaults and imports them into the xmux domain. It does not copy `cmux.json`, which is already shared.
 
@@ -143,7 +143,7 @@ Preview it with:
 ./xmux/11_OPTIONAL_uninstall_xmux.sh --confirm-remove-xmux --dry-run
 ```
 
-Uninstall stops only the exact xmux bundle and removes only `/Applications/xmux.app`, the xmux CLI wrapper, xmux DerivedData, xmux sockets, bundle-specific session files, bundle-specific notification history, and the xmux defaults domain. It preserves `/Applications/cmux.app`, both shared configuration directories, official sessions, and official notification history.
+Official cmux may remain running during uninstall and is never queried for termination or stopped. If exact xmux is active, uninstall requests only the process whose bundle identifier and executable path match `/Applications/xmux.app`, waits for it to exit within a bounded timeout, and aborts before every deletion if it remains active. Similar-name or wrong-executable processes are not killed. After that gate, uninstall removes only `/Applications/xmux.app`, the xmux CLI wrapper, xmux DerivedData, xmux sockets, bundle-specific session files, bundle-specific notification history, and the xmux defaults domain. It preserves `/Applications/cmux.app`, both shared configuration directories, official sessions, and official notification history.
 
 ## Recovery
 
@@ -180,7 +180,7 @@ Do not bypass verification. Rerun the build, verify that the built app exists at
 
 ### Socket unavailable
 
-Make sure only the explicit launch script is being used, then rerun it. It waits for `/tmp/cmux-debug-xmux-main.sock` with a bounded timeout and returns nonzero if startup cannot be verified.
+Make sure only the explicit launch script is being used, then rerun it. Before launch it distinguishes an exact live xmux socket from an unowned stale socket, a foreign-owned socket, and a non-socket path. It removes only an unowned stale socket at the guarded custom location. Success requires the exact installed xmux process, a newly established socket when a launch was needed, an owner matching that executable, and a content-free `ping` response of `PONG`, all within a bounded wait. An already-running exact xmux is verified without claiming a new launch. Any foreign owner, failed ping, or timeout returns nonzero without claiming success.
 
 ```bash
 ./xmux/06_launch_and_verify_xmux.sh

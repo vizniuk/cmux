@@ -744,92 +744,208 @@ final class TerminalControllerSocketSecurityTests {
         #expect(!SidebarProBadge.isVisible(isXmuxEdition: true))
     }
 
-    @Test func terminalViewportAndPaneChromeShareCopyResponseTopSection() throws {
-        let repoRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let source = try String(
-            contentsOf: repoRoot.appendingPathComponent("Sources/GhosttyTerminalView.swift"),
-            encoding: .utf8
-        )
-        #expect(source.contains(
-            "override func menu(for event: NSEvent) -> NSMenu? {\n" +
-                "        makeContextMenu(for: event, sendsTerminalPointerEvent: true)\n" +
-                "    }"
-        ))
-        #expect(source.contains(
-            "func paneContextMenu(for event: NSEvent) -> NSMenu? {\n" +
-                "        makeContextMenu(for: event, sendsTerminalPointerEvent: false)\n" +
-                "    }"
-        ))
+    @Test func terminalViewportAndPaneChromeShareCopyResponseTopSection() async throws {
+#if DEBUG
+        let manager = TabManager()
+        let workspace = try #require(manager.selectedWorkspace)
+        let panel = try #require(workspace.focusedTerminalPanel)
+        let surfaceView = panel.hostedView.surfaceView
+        defer { manager.tabs.forEach { $0.teardownAllPanels() } }
 
-        let builderStart = try #require(source.range(of: "    private func makeContextMenu("))
-        let builderEnd = try #require(source.range(
-            of: "    /// Builds the response alias",
-            range: builderStart.upperBound..<source.endIndex
-        ))
-        let builder = String(source[builderStart.lowerBound..<builderEnd.lowerBound])
-        var cursor = builder.startIndex
-        for token in [
-            "menu.addItem(makeAgentReportResponseCopyMenuItem(",
-            "menu.addItem(.separator())",
-            "menu.addItem(makeAgentReportCopyMenuItem(",
-            "menu.addItem(makeAgentReportFullRunCopyMenuItem(",
-            "menu.addItem(.separator())",
-            "if onTriggerFlash != nil",
-            "if hasCopyableTerminalSelection(surface: surface)",
-            "let pasteItem = menu.addItem(",
-            "let splitHorizontallyItem = menu.addItem(",
-            "let splitVerticallyItem = menu.addItem(",
-            "appendCurrentSurfaceContextMenuItems(to: menu)",
-            "let resetTerminalItem = menu.addItem(",
-            "appendReconnectRemotePaneMenuItem(to: menu)",
-        ] {
-            let match = try #require(builder.range(of: token, range: cursor..<builder.endIndex))
-            cursor = match.upperBound
+        #expect(surfaceView.usesRealContextMenuRuntimeForTesting)
+        var availabilityChecks = 0
+        var mouseCaptureChecks = 0
+        var pointerForwards = 0
+        var selectionAppends = 0
+        surfaceView.contextMenuRuntimeOverrideForTesting = .init(
+            isSurfaceAvailable: {
+                availabilityChecks += 1
+                return true
+            },
+            isMouseCaptured: {
+                mouseCaptureChecks += 1
+                return false
+            },
+            forwardPointerEvent: { _ in pointerForwards += 1 },
+            appendSelectionItems: { menu in
+                selectionAppends += 1
+                menu.addItem(NSMenuItem(
+                    title: String(localized: "terminalContextMenu.copy", defaultValue: "Copy"),
+                    action: nil,
+                    keyEquivalent: ""
+                ))
+                menu.addItem(NSMenuItem(
+                    title: String(
+                        localized: "terminalContextMenu.translateSelection",
+                        defaultValue: "Translate Selection"
+                    ),
+                    action: nil,
+                    keyEquivalent: ""
+                ))
+            }
+        )
+        #expect(!surfaceView.usesRealContextMenuRuntimeForTesting)
+
+        surfaceView.onTriggerFlash = {}
+        var copyRequests: [(UUID, UUID)] = []
+        surfaceView.agentReportCopyRequestHandler = { copyRequests.append(($0, $1)) }
+        var fullRunRequests: [(UUID, UUID)] = []
+        let (fullRunStream, fullRunContinuation) = AsyncStream<(UUID, UUID)>.makeStream()
+        surfaceView.agentReportFullRunCopyRequestHandler = {
+            fullRunRequests.append(($0, $1))
+            fullRunContinuation.yield(($0, $1))
+            return true
+        }
+        defer {
+            surfaceView.contextMenuRuntimeOverrideForTesting = nil
+            surfaceView.onTriggerFlash = nil
+            surfaceView.agentReportCopyRequestHandler = nil
+            surfaceView.agentReportFullRunCopyRequestHandler = nil
+            fullRunContinuation.finish()
         }
 
-        let surfaceView = GhosttyNSView(frame: .zero)
-        let workspaceID = UUID()
-        let runtimeSurfaceID = UUID()
-        let responseItem = surfaceView.makeAgentReportResponseCopyMenuItem(
-            workspaceID: workspaceID,
-            runtimeSurfaceID: runtimeSurfaceID,
-            isCaptureEnabled: false,
-            hasReport: true
-        )
-        let reportItem = surfaceView.makeAgentReportCopyMenuItem(
-            workspaceID: workspaceID,
-            runtimeSurfaceID: runtimeSurfaceID,
-            isCaptureEnabled: false,
-            hasReport: true
-        )
-        let fullRunItem = surfaceView.makeAgentReportFullRunCopyMenuItem(
-            workspaceID: workspaceID,
-            runtimeSurfaceID: runtimeSurfaceID,
-            isCaptureEnabled: false,
-            hasReport: true
-        )
-        let menu = NSMenu()
-        menu.addItem(responseItem)
-        menu.addItem(.separator())
-        menu.addItem(reportItem)
-        menu.addItem(fullRunItem)
-        menu.addItem(.separator())
+        let event = try #require(NSEvent.mouseEvent(
+            with: .rightMouseDown,
+            location: NSPoint(x: 1, y: 1),
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        ))
+        let viewportMenu = try #require(surfaceView.menu(for: event))
+        let paneMenu = try #require(surfaceView.paneContextMenu(for: event))
+        #expect(viewportMenu.items.count >= 6)
+        #expect(paneMenu.items.count >= 6)
+        #expect(availabilityChecks == 2)
+        #expect(mouseCaptureChecks == 1)
+        #expect(pointerForwards == 1)
+        #expect(selectionAppends == 2)
 
-        let expectedTop = [
-            String(localized: "agentReport.copyResponse", defaultValue: "Copy Response"),
-            "separator",
-            String(localized: "agentReport.copy", defaultValue: "Copy Agent Report"),
-            String(localized: "agentReport.copyFullRun", defaultValue: "Copy Full Run"),
-            "separator",
-        ]
-        let signature = menu.items.map { $0.isSeparatorItem ? "separator" : $0.title }
-        #expect(signature == expectedTop)
-        #expect(!responseItem.isEnabled)
-        #expect(!zip(signature, signature.dropFirst()).contains { pair in
-            pair.0 == "separator" && pair.1 == "separator"
-        })
+        for menu in [viewportMenu, paneMenu] {
+            #expect(menu.items[0].title == String(
+                localized: "agentReport.copyResponse",
+                defaultValue: "Copy Response"
+            ))
+            #expect(menu.items[1].isSeparatorItem)
+            #expect(menu.items[2].title == String(
+                localized: "agentReport.copy",
+                defaultValue: "Copy Agent Report"
+            ))
+            #expect(menu.items[3].title == String(
+                localized: "agentReport.copyFullRun",
+                defaultValue: "Copy Full Run"
+            ))
+            #expect(menu.items[4].isSeparatorItem)
+            #expect(!menu.items[0].isEnabled)
+            #expect(menu.items[5].title == String(
+                localized: "terminalContextMenu.triggerFlash",
+                defaultValue: "Trigger Flash"
+            ))
+            #expect(menu.items[6].isSeparatorItem)
+            #expect(menu.items[7].title == String(
+                localized: "terminalContextMenu.copy",
+                defaultValue: "Copy"
+            ))
+            #expect(menu.items[8].title == String(
+                localized: "terminalContextMenu.translateSelection",
+                defaultValue: "Translate Selection"
+            ))
+            #expect(menu.items[9].title == String(
+                localized: "terminalContextMenu.paste",
+                defaultValue: "Paste"
+            ))
+            #expect(!zip(menu.items, menu.items.dropFirst()).contains { pair in
+                pair.0.isSeparatorItem && pair.1.isSeparatorItem
+            })
+            #expect(menu.items.first?.isSeparatorItem == false)
+            #expect(menu.items.last?.isSeparatorItem == false)
+
+            let copyIndex = try #require(menu.items.firstIndex(where: {
+                $0.title == String(localized: "terminalContextMenu.copy", defaultValue: "Copy")
+            }))
+            let translateIndex = try #require(menu.items.firstIndex(where: {
+                $0.title == String(
+                    localized: "terminalContextMenu.translateSelection",
+                    defaultValue: "Translate Selection"
+                )
+            }))
+            let pasteIndex = try #require(menu.items.firstIndex(where: {
+                $0.title == String(localized: "terminalContextMenu.paste", defaultValue: "Paste")
+            }))
+            let splitHorizontalIndex = try #require(menu.items.firstIndex(where: {
+                $0.title == String(
+                    localized: "terminalContextMenu.splitHorizontally",
+                    defaultValue: "Split Horizontally"
+                )
+            }))
+            let splitVerticalIndex = try #require(menu.items.firstIndex(where: {
+                $0.title == String(
+                    localized: "terminalContextMenu.splitVertically",
+                    defaultValue: "Split Vertically"
+                )
+            }))
+            let resetIndex = try #require(menu.items.firstIndex(where: {
+                $0.title == String(localized: "terminalContextMenu.resetTerminal", defaultValue: "Reset Terminal")
+            }))
+            let identifiersIndex = try #require(menu.items.firstIndex(where: {
+                $0.title == String(localized: "terminalContextMenu.copyIdentifiers", defaultValue: "Copy IDs")
+            }))
+            let linkIndex = try #require(menu.items.firstIndex(where: {
+                $0.title == String(localized: "command.copySurfaceLink.title", defaultValue: "Copy Surface Link")
+            }))
+            #expect(copyIndex < translateIndex)
+            #expect(translateIndex < pasteIndex)
+            #expect(pasteIndex < splitHorizontalIndex)
+            #expect(splitHorizontalIndex < splitVerticalIndex)
+            #expect(splitVerticalIndex < resetIndex)
+            #expect(resetIndex < identifiersIndex)
+            #expect(identifiersIndex < linkIndex)
+            if let reconnectIndex = menu.items.firstIndex(where: {
+                $0.title == String(localized: "terminalContextMenu.reconnectPane", defaultValue: "Reconnect Pane")
+            }) {
+                #expect(resetIndex < reconnectIndex)
+                #expect(reconnectIndex < identifiersIndex)
+            }
+        }
+
+        for index in 0...4 {
+            #expect(viewportMenu.items[index].title == paneMenu.items[index].title)
+            #expect(viewportMenu.items[index].isSeparatorItem == paneMenu.items[index].isSeparatorItem)
+        }
+
+        let responseItem = paneMenu.items[0]
+        let reportItem = paneMenu.items[2]
+        let fullRunItem = paneMenu.items[3]
+        for item in [responseItem, reportItem, fullRunItem] {
+            let represented = try #require(item.representedObject as? [String: String])
+            #expect(represented["workspaceID"] == workspace.id.uuidString)
+            #expect(represented["runtimeSurfaceID"] == panel.id.uuidString)
+        }
+
+        surfaceView.contextMenuRuntimeOverrideForTesting = nil
+        #expect(surfaceView.usesRealContextMenuRuntimeForTesting)
+
+        surfaceView.copyAgentReport(responseItem)
+        #expect(copyRequests.count == 1)
+        #expect(copyRequests[0].0 == workspace.id)
+        #expect(copyRequests[0].1 == panel.id)
+        surfaceView.copyAgentReport(reportItem)
+        #expect(copyRequests.count == 2)
+        #expect(copyRequests[1].0 == workspace.id)
+        #expect(copyRequests[1].1 == panel.id)
+
+        var fullRunIterator = fullRunStream.makeAsyncIterator()
+        surfaceView.copyFullAgentRun(fullRunItem)
+        let fullRunRequest = await fullRunIterator.next()
+        #expect(fullRunRequest?.0 == workspace.id)
+        #expect(fullRunRequest?.1 == panel.id)
+        #expect(fullRunRequests.count == 1)
+#else
+        Issue.record("Production context-menu seam requires a DEBUG test host")
+#endif
     }
 
     @Test func copyResponseUsesRepresentedAuthorityAndAgentReportBytes() async throws {

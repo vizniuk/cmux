@@ -6,12 +6,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 xmux_parse_dry_run "$@"
-xmux_require_not_official_target "$XMUX_INSTALLED_APP"
-xmux_verify_app_identity "$XMUX_BUILT_APP"
-
 install_parent="$(dirname "$XMUX_INSTALLED_APP")"
 staging_app="$install_parent/.xmux.app.staging.$$"
 previous_app="$install_parent/.xmux.app.previous.$$"
+xmux_require_safe_destructive_target "$XMUX_INSTALLED_APP"
+xmux_require_safe_destructive_target "$staging_app"
+xmux_require_safe_destructive_target "$previous_app"
+xmux_verify_app_identity "$XMUX_BUILT_APP"
+
 replacement_started=0
 replacement_complete=0
 

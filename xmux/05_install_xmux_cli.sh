@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 xmux_parse_dry_run "$@"
-xmux_require_not_official_target "$XMUX_INSTALLED_APP"
+xmux_require_safe_destructive_target "$XMUX_INSTALLED_APP"
 
 installed_cli="$XMUX_INSTALLED_APP/Contents/Resources/bin/cmux"
 [[ -x "$installed_cli" ]] || xmux_die "installed xmux CLI is missing: $installed_cli"
@@ -14,6 +14,9 @@ installed_cli="$XMUX_INSTALLED_APP/Contents/Resources/bin/cmux"
 cli_directory="$(dirname "$XMUX_CLI_PATH")"
 temporary_wrapper="$cli_directory/.xmux-wrapper.$$"
 path_line="export PATH=\"${cli_directory}:\$PATH\" # xmux operations kit"
+xmux_require_safe_destructive_target "$XMUX_CLI_PATH"
+xmux_require_safe_destructive_target "$temporary_wrapper"
+xmux_require_safe_destructive_target "$XMUX_ZSHRC"
 
 if [[ "$XMUX_DRY_RUN" -eq 1 ]]; then
   xmux_print_command /bin/mkdir -p "$cli_directory"

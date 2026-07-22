@@ -17,14 +17,24 @@ done
   || xmux_die "explicit confirmation required: --confirm-remove-xmux"
 
 xmux_note "OPTIONAL uninstall: remove only the xmux edition and its bundle-specific state."
-xmux_require_not_official_target "$XMUX_INSTALLED_APP"
+xmux_require_safe_destructive_target "$XMUX_INSTALLED_APP"
 [[ "$XMUX_BUNDLE_ID" != "$XMUX_OFFICIAL_BUNDLE_ID" ]] \
   || xmux_die "xmux and official bundle identifiers must differ"
-xmux_stop_xmux
 
 xmux_session_primary="$(xmux_session_primary_path "$XMUX_BUNDLE_ID")"
 xmux_session_previous="$(xmux_session_previous_path "$XMUX_BUNDLE_ID")"
 xmux_notification_history="$(xmux_notification_history_path "$XMUX_BUNDLE_ID")"
+xmux_require_safe_destructive_target "$XMUX_CLI_PATH"
+xmux_require_safe_destructive_target "$XMUX_DERIVED_DATA"
+xmux_require_safe_socket_target "$XMUX_SOCKET_PATH"
+xmux_require_safe_destructive_target "$XMUX_DAEMON_SOCKET"
+xmux_require_safe_destructive_target "$xmux_session_primary"
+xmux_require_safe_destructive_target "$xmux_session_previous"
+xmux_require_safe_destructive_target "$xmux_notification_history"
+if [[ -d "$XMUX_INSTALLED_APP" ]]; then
+  xmux_verify_app_identity "$XMUX_INSTALLED_APP"
+fi
+xmux_stop_xmux
 
 xmux_run_as_admin /bin/rm -rf "$XMUX_INSTALLED_APP"
 xmux_run /bin/rm -f "$XMUX_CLI_PATH"

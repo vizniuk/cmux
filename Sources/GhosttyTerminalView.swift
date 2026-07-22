@@ -3384,6 +3384,23 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
     }
 
     weak var terminalSurface: TerminalSurface?
+#if DEBUG
+    /// View-scoped replacement for Ghostty C-runtime facts and leaf selection
+    /// items used by context-menu tests. Menu composition remains in
+    /// `makeContextMenu(for:sendsTerminalPointerEvent:)`.
+    struct ContextMenuRuntimeOverrideForTesting {
+        let isSurfaceAvailable: () -> Bool
+        let isMouseCaptured: () -> Bool
+        let forwardPointerEvent: (NSEvent) -> Void
+        let appendSelectionItems: (NSMenu) -> Void
+    }
+
+    var contextMenuRuntimeOverrideForTesting: ContextMenuRuntimeOverrideForTesting?
+
+    var usesRealContextMenuRuntimeForTesting: Bool {
+        contextMenuRuntimeOverrideForTesting == nil
+    }
+#endif
     /// View-scoped ingress keeps title churn independent across terminal surfaces.
     fileprivate let titleUpdateIngress = GhosttyTitleUpdateIngress()
     /// Retained independently because the weak surface can clear before view teardown.
@@ -7233,21 +7250,41 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         for event: NSEvent,
         sendsTerminalPointerEvent: Bool
     ) -> NSMenu? {
-        guard let surface = surface else { return nil }
-        if sendsTerminalPointerEvent, ghostty_surface_mouse_captured(surface) {
+        let runtimeSurface = surface
+#if DEBUG
+        let runtimeOverride = contextMenuRuntimeOverrideForTesting
+        let isSurfaceAvailable: Bool
+        if let runtimeOverride {
+            isSurfaceAvailable = runtimeOverride.isSurfaceAvailable()
+        } else {
+            isSurfaceAvailable = runtimeSurface != nil
+        }
+        guard isSurfaceAvailable else { return nil }
+        if sendsTerminalPointerEvent {
+            if let runtimeOverride {
+                guard !runtimeOverride.isMouseCaptured() else { return nil }
+            } else if let runtimeSurface, ghostty_surface_mouse_captured(runtimeSurface) {
+                return nil
+            }
+        }
+#else
+        guard let runtimeSurface else { return nil }
+        if sendsTerminalPointerEvent, ghostty_surface_mouse_captured(runtimeSurface) {
             return nil
         }
+#endif
 
         window?.makeFirstResponder(self)
         if sendsTerminalPointerEvent {
-            let point = convert(event.locationInWindow, from: nil)
-            ghostty_surface_mouse_pos(surface, point.x, bounds.height - point.y, mouseModsFromEvent(event))
-            _ = ghostty_surface_mouse_button(
-                surface,
-                GHOSTTY_MOUSE_PRESS,
-                GHOSTTY_MOUSE_RIGHT,
-                mouseModsFromEvent(event)
-            )
+#if DEBUG
+            if let runtimeOverride {
+                runtimeOverride.forwardPointerEvent(event)
+            } else if let runtimeSurface {
+                forwardContextMenuPointerEvent(event, to: runtimeSurface)
+            }
+#else
+            forwardContextMenuPointerEvent(event, to: runtimeSurface)
+#endif
         }
 
         let menu = NSMenu()
@@ -7287,15 +7324,15 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
             flashItem.target = self
             menu.addItem(.separator())
         }
-        if hasCopyableTerminalSelection(surface: surface) {
-            let item = menu.addItem(
-                withTitle: String(localized: "terminalContextMenu.copy", defaultValue: "Copy"),
-                action: #selector(copy(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            addTranslateSelectionMenuItem(to: menu, surface: surface)
+#if DEBUG
+        if let runtimeOverride {
+            runtimeOverride.appendSelectionItems(menu)
+        } else if let runtimeSurface {
+            appendContextMenuSelectionItems(to: menu, surface: runtimeSurface)
         }
+#else
+        appendContextMenuSelectionItems(to: menu, surface: runtimeSurface)
+#endif
         let pasteItem = menu.addItem(
             withTitle: String(localized: "terminalContextMenu.paste", defaultValue: "Paste"),
             action: #selector(paste(_:)),
@@ -7354,6 +7391,28 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
             linkItem.target = self
         }
         return menu
+    }
+
+    private func forwardContextMenuPointerEvent(_ event: NSEvent, to surface: ghostty_surface_t) {
+        let point = convert(event.locationInWindow, from: nil)
+        ghostty_surface_mouse_pos(surface, point.x, bounds.height - point.y, mouseModsFromEvent(event))
+        _ = ghostty_surface_mouse_button(
+            surface,
+            GHOSTTY_MOUSE_PRESS,
+            GHOSTTY_MOUSE_RIGHT,
+            mouseModsFromEvent(event)
+        )
+    }
+
+    private func appendContextMenuSelectionItems(to menu: NSMenu, surface: ghostty_surface_t) {
+        guard hasCopyableTerminalSelection(surface: surface) else { return }
+        let item = menu.addItem(
+            withTitle: String(localized: "terminalContextMenu.copy", defaultValue: "Copy"),
+            action: #selector(copy(_:)),
+            keyEquivalent: ""
+        )
+        item.target = self
+        addTranslateSelectionMenuItem(to: menu, surface: surface)
     }
 
     /// Builds the response alias through the same represented-surface copy action.

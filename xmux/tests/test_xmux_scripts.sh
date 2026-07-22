@@ -3,7 +3,7 @@ set -euo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 XMUX_DIR="$(cd "$TEST_DIR/.." && pwd -P)"
-TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/xmux-script-tests.XXXXXX")"
+TEST_ROOT="$(mktemp -d /tmp/xmux-script-tests.XXXXXX)"
 PASS_COUNT=0
 
 cleanup() {
@@ -33,6 +33,12 @@ assert_contains() {
   /usr/bin/grep -Fq -- "$2" "$1" || fail "$1 does not contain: $2"
 }
 
+assert_not_contains() {
+  if /usr/bin/grep -Fq -- "$2" "$1"; then
+    fail "$1 unexpectedly contains: $2"
+  fi
+}
+
 assert_equals() {
   [[ "$1" == "$2" ]] || fail "expected '$2', got '$1'"
 }
@@ -45,11 +51,15 @@ make_app() {
   /usr/bin/plutil -create xml1 "$app_path/Contents/Info.plist"
   /usr/bin/plutil -insert CFBundleIdentifier -string "$bundle_id" "$app_path/Contents/Info.plist"
   /usr/bin/plutil -insert CFBundleDisplayName -string "$display_name" "$app_path/Contents/Info.plist"
+  /usr/bin/plutil -insert CFBundleExecutable -string 'xmux-test-executable' "$app_path/Contents/Info.plist"
   /usr/bin/plutil -insert LSEnvironment -xml '<dict/>' "$app_path/Contents/Info.plist"
   /usr/bin/plutil -insert LSEnvironment.CMUX_BUNDLED_CLI_PATH -string "/build/cmux" "$app_path/Contents/Info.plist"
   /usr/bin/plutil -insert LSEnvironment.CMUX_SHELL_INTEGRATION_DIR -string "/build/shell-integration" "$app_path/Contents/Info.plist"
   printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$app_path/Contents/Resources/bin/cmux"
   /bin/chmod 0755 "$app_path/Contents/Resources/bin/cmux"
+  /bin/mkdir -p "$app_path/Contents/MacOS"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$app_path/Contents/MacOS/xmux-test-executable"
+  /bin/chmod 0755 "$app_path/Contents/MacOS/xmux-test-executable"
 }
 
 make_stub() {
@@ -61,6 +71,16 @@ make_stub() {
     printf '%s\n' "$@"
   } > "$path"
   /bin/chmod 0755 "$path"
+}
+
+make_socket_path() {
+  local socket_path="$1"
+  /usr/bin/perl -MIO::Socket::UNIX -MSocket=SOCK_STREAM -e '
+    my $path = shift @ARGV;
+    my $socket = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => $path, Listen => 1)
+      or die "socket $path: $!\n";
+    close $socket;
+  ' "$socket_path"
 }
 
 shell_count=0
@@ -153,6 +173,50 @@ DESCENDANT_SHA="$("$(command -v git)" -C "$FIXTURE_REPO" rev-parse HEAD)"
 ) || fail "common library did not resolve repository path with spaces"
 pass "common library resolves an overridden repository path safely"
 
+ALIAS_ROOT="$TEST_ROOT/alias safety"
+ALIAS_REAL_PARENT="$ALIAS_ROOT/real Applications"
+ALIAS_OFFICIAL_APP="$ALIAS_REAL_PARENT/cmux.app"
+ALIAS_MUTATION_MARKER="$ALIAS_ROOT/mutation-marker"
+/bin/mkdir -p "$ALIAS_OFFICIAL_APP/Contents" "$ALIAS_ROOT/relative-work"
+/bin/ln -s "$ALIAS_REAL_PARENT" "$ALIAS_ROOT/symlinked Applications"
+/bin/ln -s "$ALIAS_OFFICIAL_APP" "$ALIAS_ROOT/final-link.app"
+printf '%s\n' official > "$ALIAS_ROOT/official-object"
+/bin/ln "$ALIAS_ROOT/official-object" "$ALIAS_ROOT/hardlink-object"
+
+ALIAS_TEST_COUNT=0
+assert_alias_rejected() {
+  local label="$1"
+  local target="$2"
+  local protected_path="$3"
+  local working_directory="${4:-$TEST_ROOT}"
+  if (
+    cd "$working_directory"
+    XMUX_OFFICIAL_APP="$protected_path"
+    # shellcheck source=xmux/lib/common.sh
+    source "$XMUX_DIR/lib/common.sh"
+    xmux_require_safe_destructive_target "$target"
+    printf '%s\n' "$label" > "$ALIAS_MUTATION_MARKER"
+  ) > /dev/null 2>&1; then
+    fail "accepted official-app alias: $label ($target)"
+  fi
+  assert_file_absent "$ALIAS_MUTATION_MARKER"
+  ALIAS_TEST_COUNT=$((ALIAS_TEST_COUNT + 1))
+}
+
+assert_alias_rejected "literal" "$ALIAS_OFFICIAL_APP" "$ALIAS_OFFICIAL_APP"
+assert_alias_rejected "dot" "$ALIAS_REAL_PARENT/./cmux.app" "$ALIAS_OFFICIAL_APP"
+assert_alias_rejected "dotdot" "$ALIAS_REAL_PARENT/missing/../cmux.app" "$ALIAS_OFFICIAL_APP"
+assert_alias_rejected "repeated separators" "$ALIAS_REAL_PARENT////cmux.app" "$ALIAS_OFFICIAL_APP"
+assert_alias_rejected "symlinked parent" "$ALIAS_ROOT/symlinked Applications/cmux.app" "$ALIAS_OFFICIAL_APP"
+assert_alias_rejected "final symlink" "$ALIAS_ROOT/final-link.app" "$ALIAS_OFFICIAL_APP"
+assert_alias_rejected "same filesystem object" "$ALIAS_ROOT/hardlink-object" "$ALIAS_ROOT/official-object"
+assert_alias_rejected "inside official app" "$ALIAS_OFFICIAL_APP/Contents/Resources" "$ALIAS_OFFICIAL_APP"
+assert_alias_rejected "target contains official child" "$ALIAS_REAL_PARENT" "$ALIAS_OFFICIAL_APP"
+assert_alias_rejected "relative alias" "../real Applications/cmux.app" "$ALIAS_OFFICIAL_APP" "$ALIAS_ROOT/relative-work"
+assert_alias_rejected "configured official redefined" '/Applications/cmux.app' "$ALIAS_ROOT/not-official.app"
+assert_equals "$ALIAS_TEST_COUNT" '11'
+pass "canonical destructive-target guard rejects all 11 official-app alias classes without mutation"
+
 VERIFY_ENV=(
   XMUX_REPO_ROOT="$FIXTURE_REPO"
   XMUX_MINIMUM_BASELINE_SHA="$BASELINE_SHA"
@@ -209,8 +273,16 @@ printf '%s\n' 'ghostty config' > "$CONFIG_ROOT/ghostty/config"
 printf '%s\n' 'session fixture' > "$APP_SUPPORT/state/session.json"
 printf '%s\n' 'must not copy' > "$APP_SUPPORT/state/credentials.json"
 make_stub "$STUB_DIR/defaults" \
-  'if [[ "${1:-}" == export ]]; then mkdir -p "$(dirname "$3")"; printf "plist\n" > "$3"; fi' \
-  'exit 0'
+  'mode="${XMUX_TEST_DEFAULTS_MODE:-present-success}"' \
+  'case "${1:-}" in' \
+  '  read) [[ "$mode" != absent ]] ;;' \
+  '  export)' \
+  '    mkdir -p "$(dirname "$3")"' \
+  '    printf "plist\n" > "$3"' \
+  '    [[ "$mode" != present-export-failure ]]' \
+  '    ;;' \
+  '  *) exit 0 ;;' \
+  'esac'
 env XMUX_BACKUP_ROOT="$BACKUP_ROOT" \
   XMUX_CMUX_CONFIG_DIR="$CONFIG_ROOT/cmux" \
   XMUX_GHOSTTY_CONFIG_DIR="$CONFIG_ROOT/ghostty" \
@@ -225,6 +297,42 @@ assert_file_exists "$BACKUP_PATH/Application Support/cmux/state/session.json"
 assert_file_absent "$BACKUP_PATH/Application Support/cmux/state/credentials.json"
 assert_file_exists "$BACKUP_PATH/com.cmuxterm.app.plist"
 pass "backup creates the expected tree without credentials"
+
+ABSENT_BACKUP_ROOT="$TEST_ROOT/backup defaults absent"
+env XMUX_BACKUP_ROOT="$ABSENT_BACKUP_ROOT" \
+  XMUX_CMUX_CONFIG_DIR="$CONFIG_ROOT/cmux" \
+  XMUX_GHOSTTY_CONFIG_DIR="$TEST_ROOT/missing ghostty" \
+  XMUX_APPLICATION_SUPPORT="$APP_SUPPORT" \
+  XMUX_DEFAULTS_BIN="$STUB_DIR/defaults" \
+  XMUX_TEST_DEFAULTS_MODE=absent \
+  XMUX_TIMESTAMP='20260722-120001' \
+  "$XMUX_DIR/01_backup_existing_cmux.sh" > "$TEST_ROOT/backup-absent.log"
+ABSENT_BACKUP_PATH="$ABSENT_BACKUP_ROOT/cmux-backup-20260722-120001"
+assert_file_exists "$ABSENT_BACKUP_PATH/config/cmux/cmux.json"
+assert_file_exists "$ABSENT_BACKUP_PATH/Application Support/cmux/state/session.json"
+assert_file_absent "$ABSENT_BACKUP_PATH/com.cmuxterm.app.plist"
+assert_contains "$TEST_ROOT/backup-absent.log" 'Official defaults domain is absent; skipped: com.cmuxterm.app'
+assert_contains "$TEST_ROOT/backup-absent.log" "Backup path: $ABSENT_BACKUP_PATH"
+pass "backup treats an absent defaults domain as a nonfatal skipped source"
+
+FAILED_BACKUP_ROOT="$TEST_ROOT/backup defaults failure"
+if env XMUX_BACKUP_ROOT="$FAILED_BACKUP_ROOT" \
+  XMUX_CMUX_CONFIG_DIR="$CONFIG_ROOT/cmux" \
+  XMUX_GHOSTTY_CONFIG_DIR="$TEST_ROOT/missing ghostty" \
+  XMUX_APPLICATION_SUPPORT="$APP_SUPPORT" \
+  XMUX_DEFAULTS_BIN="$STUB_DIR/defaults" \
+  XMUX_TEST_DEFAULTS_MODE=present-export-failure \
+  XMUX_TIMESTAMP='20260722-120002' \
+  "$XMUX_DIR/01_backup_existing_cmux.sh" > "$TEST_ROOT/backup-failure.log" 2>&1; then
+  fail "backup accepted a genuine defaults export failure"
+fi
+FAILED_BACKUP_PATH="$FAILED_BACKUP_ROOT/cmux-backup-20260722-120002"
+assert_file_exists "$FAILED_BACKUP_PATH/config/cmux/cmux.json"
+assert_file_exists "$FAILED_BACKUP_PATH/Application Support/cmux/state/session.json"
+assert_file_absent "$FAILED_BACKUP_PATH/com.cmuxterm.app.plist"
+assert_not_contains "$TEST_ROOT/backup-failure.log" 'Backup path:'
+assert_contains "$TEST_ROOT/backup-failure.log" 'official defaults exist but export failed'
+pass "backup fails a real export error without publishing an empty or successful plist receipt"
 
 make_stub "$STUB_DIR/sudo" \
   'if [[ -n "${XMUX_TEST_SUDO_LOG:-}" ]]; then printf "%s\n" "$*" >> "$XMUX_TEST_SUDO_LOG"; fi' \
@@ -270,6 +378,21 @@ if env XMUX_BUILT_APP="$BUILT_APP" XMUX_INSTALLED_APP="$OFFICIAL_APP" XMUX_OFFIC
 fi
 pass "install never targets official cmux"
 
+/bin/ln -s "$APPLICATIONS_DIR" "$TEST_ROOT/Applications alias"
+ALIAS_INSTALL_LOG="$TEST_ROOT/alias-install-sudo.log"
+if env XMUX_BUILT_APP="$BUILT_APP" \
+  XMUX_INSTALLED_APP="$TEST_ROOT/Applications alias/cmux.app" \
+  XMUX_OFFICIAL_APP="$OFFICIAL_APP" \
+  XMUX_CODESIGN_BIN="$STUB_DIR/codesign-ok" \
+  XMUX_SUDO_BIN="$STUB_DIR/sudo" \
+  XMUX_TEST_SUDO_LOG="$ALIAS_INSTALL_LOG" \
+  "$XMUX_DIR/04_install_xmux.sh" --dry-run > /dev/null 2>&1; then
+  fail "install dry-run accepted a symlink-parent alias to official cmux"
+fi
+assert_file_absent "$ALIAS_INSTALL_LOG"
+assert_file_exists "$OFFICIAL_APP"
+pass "install dry-run validates aliased target, staging, and rollback paths before mutation"
+
 TEST_HOME="$TEST_ROOT/home"
 CLI_PATH="$TEST_HOME/.local/bin/xmux"
 ZSHRC="$TEST_HOME/.zshrc"
@@ -303,6 +426,85 @@ done
 assert_file_absent "$TEST_ROOT/active-backups"
 pass "all optional migrations refuse while either relevant application is active"
 
+SESSION_CASE_ROOT="$TEST_ROOT/session receipt cases"
+SESSION_OFFICIAL_PRIMARY_NAME='session-com.cmuxterm.app.json'
+SESSION_OFFICIAL_PREVIOUS_NAME='session-com.cmuxterm.app-previous.json'
+SESSION_XMUX_PRIMARY_NAME='session-com.cmuxterm.app.debug.xmux-main.json'
+SESSION_XMUX_PREVIOUS_NAME='session-com.cmuxterm.app.debug.xmux-main-previous.json'
+
+SESSION_NONE_SUPPORT="$SESSION_CASE_ROOT/none/support"
+env XMUX_APPLICATION_SUPPORT="$SESSION_NONE_SUPPORT" \
+  XMUX_BACKUP_ROOT="$SESSION_CASE_ROOT/none/backups" \
+  XMUX_OSASCRIPT_BIN="$STUB_DIR/osascript-stopped" \
+  XMUX_TIMESTAMP='20260722-140000' \
+  "$XMUX_DIR/07_OPTIONAL_copy_existing_session.sh" > "$SESSION_CASE_ROOT-none.log"
+assert_contains "$SESSION_CASE_ROOT-none.log" 'Primary snapshot source absent; skipped.'
+assert_contains "$SESSION_CASE_ROOT-none.log" 'Previous snapshot source absent; skipped.'
+assert_contains "$SESSION_CASE_ROOT-none.log" 'Session migration receipt: copied=0 skipped=2 targets_backed_up=0.'
+assert_contains "$SESSION_CASE_ROOT-none.log" 'No session snapshots were migrated.'
+assert_file_absent "$SESSION_NONE_SUPPORT/$SESSION_XMUX_PRIMARY_NAME"
+assert_file_absent "$SESSION_NONE_SUPPORT/$SESSION_XMUX_PREVIOUS_NAME"
+pass "session migration reports neither source as skipped without implying migration"
+
+SESSION_PRIMARY_SUPPORT="$SESSION_CASE_ROOT/primary/support"
+/bin/mkdir -p "$SESSION_PRIMARY_SUPPORT"
+printf '%s\n' primary > "$SESSION_PRIMARY_SUPPORT/$SESSION_OFFICIAL_PRIMARY_NAME"
+env XMUX_APPLICATION_SUPPORT="$SESSION_PRIMARY_SUPPORT" \
+  XMUX_BACKUP_ROOT="$SESSION_CASE_ROOT/primary/backups" \
+  XMUX_OSASCRIPT_BIN="$STUB_DIR/osascript-stopped" \
+  XMUX_TIMESTAMP='20260722-140001' \
+  "$XMUX_DIR/07_OPTIONAL_copy_existing_session.sh" > "$SESSION_CASE_ROOT-primary.log"
+assert_file_exists "$SESSION_PRIMARY_SUPPORT/$SESSION_XMUX_PRIMARY_NAME"
+assert_file_absent "$SESSION_PRIMARY_SUPPORT/$SESSION_XMUX_PREVIOUS_NAME"
+assert_contains "$SESSION_CASE_ROOT-primary.log" "Primary snapshot copied: $SESSION_PRIMARY_SUPPORT/$SESSION_OFFICIAL_PRIMARY_NAME -> $SESSION_PRIMARY_SUPPORT/$SESSION_XMUX_PRIMARY_NAME"
+assert_contains "$SESSION_CASE_ROOT-primary.log" 'Session migration receipt: copied=1 skipped=1 targets_backed_up=0.'
+pass "session migration receipt distinguishes primary-only copy"
+
+SESSION_PREVIOUS_SUPPORT="$SESSION_CASE_ROOT/previous/support"
+/bin/mkdir -p "$SESSION_PREVIOUS_SUPPORT"
+printf '%s\n' previous > "$SESSION_PREVIOUS_SUPPORT/$SESSION_OFFICIAL_PREVIOUS_NAME"
+env XMUX_APPLICATION_SUPPORT="$SESSION_PREVIOUS_SUPPORT" \
+  XMUX_BACKUP_ROOT="$SESSION_CASE_ROOT/previous/backups" \
+  XMUX_OSASCRIPT_BIN="$STUB_DIR/osascript-stopped" \
+  XMUX_TIMESTAMP='20260722-140002' \
+  "$XMUX_DIR/07_OPTIONAL_copy_existing_session.sh" > "$SESSION_CASE_ROOT-previous.log"
+assert_file_absent "$SESSION_PREVIOUS_SUPPORT/$SESSION_XMUX_PRIMARY_NAME"
+assert_file_exists "$SESSION_PREVIOUS_SUPPORT/$SESSION_XMUX_PREVIOUS_NAME"
+assert_contains "$SESSION_CASE_ROOT-previous.log" 'Session migration receipt: copied=1 skipped=1 targets_backed_up=0.'
+pass "session migration receipt distinguishes previous-only copy"
+
+SESSION_BOTH_SUPPORT="$SESSION_CASE_ROOT/both/support"
+/bin/mkdir -p "$SESSION_BOTH_SUPPORT"
+printf '%s\n' primary > "$SESSION_BOTH_SUPPORT/$SESSION_OFFICIAL_PRIMARY_NAME"
+printf '%s\n' previous > "$SESSION_BOTH_SUPPORT/$SESSION_OFFICIAL_PREVIOUS_NAME"
+printf '%s\n' old-target > "$SESSION_BOTH_SUPPORT/$SESSION_XMUX_PRIMARY_NAME"
+env XMUX_APPLICATION_SUPPORT="$SESSION_BOTH_SUPPORT" \
+  XMUX_BACKUP_ROOT="$SESSION_CASE_ROOT/both/backups" \
+  XMUX_OSASCRIPT_BIN="$STUB_DIR/osascript-stopped" \
+  XMUX_TIMESTAMP='20260722-140003' \
+  "$XMUX_DIR/07_OPTIONAL_copy_existing_session.sh" > "$SESSION_CASE_ROOT-both.log"
+assert_contains "$SESSION_CASE_ROOT-both.log" "Primary snapshot target backed up: $SESSION_BOTH_SUPPORT/$SESSION_XMUX_PRIMARY_NAME"
+assert_contains "$SESSION_CASE_ROOT-both.log" 'Session migration receipt: copied=2 skipped=0 targets_backed_up=1.'
+assert_file_exists "$SESSION_CASE_ROOT/both/backups/cmux-pre-session-migration-20260722-140003/$SESSION_XMUX_PRIMARY_NAME"
+pass "session migration receipt reports both copies and exact target-backup count"
+
+make_stub "$STUB_DIR/ditto-fail-session" 'exit 47'
+SESSION_FAILURE_SUPPORT="$SESSION_CASE_ROOT/failure/support"
+/bin/mkdir -p "$SESSION_FAILURE_SUPPORT"
+printf '%s\n' primary > "$SESSION_FAILURE_SUPPORT/$SESSION_OFFICIAL_PRIMARY_NAME"
+if env XMUX_APPLICATION_SUPPORT="$SESSION_FAILURE_SUPPORT" \
+  XMUX_BACKUP_ROOT="$SESSION_CASE_ROOT/failure/backups" \
+  XMUX_OSASCRIPT_BIN="$STUB_DIR/osascript-stopped" \
+  XMUX_DITTO_BIN="$STUB_DIR/ditto-fail-session" \
+  XMUX_TIMESTAMP='20260722-140004' \
+  "$XMUX_DIR/07_OPTIONAL_copy_existing_session.sh" > "$SESSION_CASE_ROOT-failure.log" 2>&1; then
+  fail "session migration accepted a failed copy"
+fi
+assert_file_absent "$SESSION_FAILURE_SUPPORT/$SESSION_XMUX_PRIMARY_NAME"
+assert_not_contains "$SESSION_CASE_ROOT-failure.log" 'Primary snapshot copied:'
+assert_not_contains "$SESSION_CASE_ROOT-failure.log" 'Session migration receipt:'
+pass "session migration reports a snapshot copied only after successful copy"
+
 FAKE_OPERATIONS="$TEST_ROOT/fake operations"
 /bin/mkdir -p "$FAKE_OPERATIONS"
 ORDER_LOG="$TEST_ROOT/update-order.log"
@@ -315,52 +517,110 @@ env XMUX_OPERATIONS_DIR="$FAKE_OPERATIONS" XMUX_TEST_ORDER_LOG="$ORDER_LOG" \
 assert_equals "$(<"$ORDER_LOG")" "$(printf '%s\n' verify build install)"
 pass "update invokes verify, build, and install in order without Git mutation"
 
-UNINSTALL_ROOT="$TEST_ROOT/uninstall"
-UNINSTALL_APP="$UNINSTALL_ROOT/Applications/xmux.app"
-UNINSTALL_OFFICIAL="$UNINSTALL_ROOT/Applications/cmux.app"
-UNINSTALL_CLI="$UNINSTALL_ROOT/home/.local/bin/xmux"
-UNINSTALL_DERIVED="$UNINSTALL_ROOT/DerivedData/cmux-xmux-main"
-UNINSTALL_SUPPORT="$UNINSTALL_ROOT/Application Support/cmux"
-UNINSTALL_SOCKET="$UNINSTALL_ROOT/xmux.sock"
-UNINSTALL_DAEMON="$UNINSTALL_ROOT/cmuxd.sock"
-UNINSTALL_SHARED_CMUX="$UNINSTALL_ROOT/home/.config/cmux/cmux.json"
-UNINSTALL_SHARED_GHOSTTY="$UNINSTALL_ROOT/home/.config/ghostty/config"
-/bin/mkdir -p "$UNINSTALL_APP" "$UNINSTALL_OFFICIAL" "$(dirname "$UNINSTALL_CLI")" "$UNINSTALL_DERIVED" \
-  "$UNINSTALL_SUPPORT" "$(dirname "$UNINSTALL_SHARED_CMUX")" "$(dirname "$UNINSTALL_SHARED_GHOSTTY")"
-printf '%s\n' keep > "$UNINSTALL_OFFICIAL/marker"
-printf '%s\n' remove > "$UNINSTALL_APP/marker"
-printf '%s\n' remove > "$UNINSTALL_CLI"
-printf '%s\n' remove > "$UNINSTALL_SOCKET"
-printf '%s\n' remove > "$UNINSTALL_DAEMON"
-printf '%s\n' keep > "$UNINSTALL_SHARED_CMUX"
-printf '%s\n' keep > "$UNINSTALL_SHARED_GHOSTTY"
-printf '%s\n' remove > "$UNINSTALL_SUPPORT/session-com.cmuxterm.app.debug.xmux-main.json"
-printf '%s\n' remove > "$UNINSTALL_SUPPORT/session-com.cmuxterm.app.debug.xmux-main-previous.json"
-printf '%s\n' remove > "$UNINSTALL_SUPPORT/notification-feed-history-com.cmuxterm.app.debug.xmux-main.json"
-printf '%s\n' keep > "$UNINSTALL_SUPPORT/session-com.cmuxterm.app.json"
+make_stub "$STUB_DIR/osascript-uninstall" \
+  ': "${XMUX_TEST_PROCESS_STATE:?}"' \
+  '[[ -z "${XMUX_TEST_PROCESS_QUERY_LOG:-}" ]] || printf "%s\n" "$*" >> "$XMUX_TEST_PROCESS_QUERY_LOG"' \
+  'state="$(<"$XMUX_TEST_PROCESS_STATE")"' \
+  'case "$state" in' \
+  '  exact-dry|exact-exits|exact-refuses) printf "%s\n" 4242 ;;' \
+  '  foreign) printf "%s\n" 4343 ;;' \
+  '  stale) printf "%s\n" 999999 ;;' \
+  '  stopped) exit 0 ;;' \
+  '  *) exit 91 ;;' \
+  'esac'
+make_stub "$STUB_DIR/lsof-uninstall" \
+  'pid=""' \
+  'while [[ "$#" -gt 0 ]]; do if [[ "$1" == -p ]]; then pid="$2"; break; fi; shift; done' \
+  'case "$pid" in' \
+  '  4242) printf "p4242\nftxt\nn%s\n" "${XMUX_TEST_EXPECTED_EXECUTABLE:?}" ;;' \
+  '  4343) printf "p4343\nftxt\nn%s\n" "${XMUX_TEST_FOREIGN_EXECUTABLE:?}" ;;' \
+  '  *) exit 1 ;;' \
+  'esac'
+make_stub "$STUB_DIR/ps-uninstall" \
+  '[[ "$*" != *999999* ]]'
+make_stub "$STUB_DIR/kill-uninstall" \
+  ': "${XMUX_TEST_PROCESS_STATE:?}"' \
+  '[[ -z "${XMUX_TEST_KILL_LOG:-}" ]] || printf "%s\n" "$*" >> "$XMUX_TEST_KILL_LOG"' \
+  'state="$(<"$XMUX_TEST_PROCESS_STATE")"' \
+  'if [[ "$state" == exact-exits ]]; then printf "%s\n" stopped > "$XMUX_TEST_PROCESS_STATE"; fi' \
+  'exit 0'
 
-UNINSTALL_ENV=(
-  XMUX_INSTALLED_APP="$UNINSTALL_APP"
-  XMUX_OFFICIAL_APP="$UNINSTALL_OFFICIAL"
-  XMUX_CLI_PATH="$UNINSTALL_CLI"
-  XMUX_DERIVED_DATA="$UNINSTALL_DERIVED"
-  XMUX_APPLICATION_SUPPORT="$UNINSTALL_SUPPORT"
-  XMUX_SOCKET_PATH="$UNINSTALL_SOCKET"
-  XMUX_DAEMON_SOCKET="$UNINSTALL_DAEMON"
-  XMUX_SHARED_CMUX_SETTINGS="$UNINSTALL_SHARED_CMUX"
-  XMUX_SHARED_GHOSTTY_SETTINGS="$UNINSTALL_SHARED_GHOSTTY"
-  XMUX_OSASCRIPT_BIN="$STUB_DIR/osascript-stopped"
-  XMUX_SUDO_BIN="$STUB_DIR/sudo"
-  XMUX_DEFAULTS_BIN="$STUB_DIR/defaults"
-)
-env "${UNINSTALL_ENV[@]}" "$XMUX_DIR/11_OPTIONAL_uninstall_xmux.sh" \
-  --confirm-remove-xmux --dry-run > /dev/null
+prepare_uninstall_fixture() {
+  UNINSTALL_ROOT="$1"
+  UNINSTALL_APP="$UNINSTALL_ROOT/Applications/xmux.app"
+  UNINSTALL_OFFICIAL="$UNINSTALL_ROOT/Applications/cmux.app"
+  UNINSTALL_CLI="$UNINSTALL_ROOT/home/.local/bin/xmux"
+  UNINSTALL_DERIVED="$UNINSTALL_ROOT/DerivedData/cmux-xmux-main"
+  UNINSTALL_SUPPORT="$UNINSTALL_ROOT/Application Support/cmux"
+  UNINSTALL_SOCKET="$UNINSTALL_ROOT/cmux-debug-xmux-main.sock"
+  UNINSTALL_DAEMON="$UNINSTALL_ROOT/cmuxd.sock"
+  UNINSTALL_SHARED_CMUX="$UNINSTALL_ROOT/home/.config/cmux/cmux.json"
+  UNINSTALL_SHARED_GHOSTTY="$UNINSTALL_ROOT/home/.config/ghostty/config"
+  UNINSTALL_PROCESS_STATE="$UNINSTALL_ROOT/process-state"
+  UNINSTALL_QUERY_LOG="$UNINSTALL_ROOT/process-query.log"
+  UNINSTALL_KILL_LOG="$UNINSTALL_ROOT/kill.log"
+  make_app "$UNINSTALL_APP" 'com.cmuxterm.app.debug.xmux-main' 'xmux'
+  /usr/bin/plutil -replace LSEnvironment.CMUX_BUNDLED_CLI_PATH -string \
+    "$UNINSTALL_APP/Contents/Resources/bin/cmux" "$UNINSTALL_APP/Contents/Info.plist"
+  /usr/bin/plutil -replace LSEnvironment.CMUX_SHELL_INTEGRATION_DIR -string \
+    "$UNINSTALL_APP/Contents/Resources/shell-integration" "$UNINSTALL_APP/Contents/Info.plist"
+  /bin/mkdir -p "$UNINSTALL_OFFICIAL" "$(dirname "$UNINSTALL_CLI")" "$UNINSTALL_DERIVED" \
+    "$UNINSTALL_SUPPORT" "$(dirname "$UNINSTALL_SHARED_CMUX")" "$(dirname "$UNINSTALL_SHARED_GHOSTTY")"
+  printf '%s\n' keep > "$UNINSTALL_OFFICIAL/marker"
+  printf '%s\n' remove > "$UNINSTALL_APP/marker"
+  printf '%s\n' remove > "$UNINSTALL_CLI"
+  printf '%s\n' remove > "$UNINSTALL_SOCKET"
+  printf '%s\n' remove > "$UNINSTALL_DAEMON"
+  printf '%s\n' keep > "$UNINSTALL_SHARED_CMUX"
+  printf '%s\n' keep > "$UNINSTALL_SHARED_GHOSTTY"
+  printf '%s\n' remove > "$UNINSTALL_SUPPORT/session-com.cmuxterm.app.debug.xmux-main.json"
+  printf '%s\n' remove > "$UNINSTALL_SUPPORT/session-com.cmuxterm.app.debug.xmux-main-previous.json"
+  printf '%s\n' remove > "$UNINSTALL_SUPPORT/notification-feed-history-com.cmuxterm.app.debug.xmux-main.json"
+  printf '%s\n' keep > "$UNINSTALL_SUPPORT/session-com.cmuxterm.app.json"
+}
+
+run_uninstall_fixture() {
+  env \
+    XMUX_INSTALLED_APP="$UNINSTALL_APP" \
+    XMUX_OFFICIAL_APP="$UNINSTALL_OFFICIAL" \
+    XMUX_CLI_PATH="$UNINSTALL_CLI" \
+    XMUX_DERIVED_DATA="$UNINSTALL_DERIVED" \
+    XMUX_APPLICATION_SUPPORT="$UNINSTALL_SUPPORT" \
+    XMUX_SOCKET_ROOT="$UNINSTALL_ROOT" \
+    XMUX_SOCKET_PATH="$UNINSTALL_SOCKET" \
+    XMUX_DAEMON_SOCKET="$UNINSTALL_DAEMON" \
+    XMUX_SHARED_CMUX_SETTINGS="$UNINSTALL_SHARED_CMUX" \
+    XMUX_SHARED_GHOSTTY_SETTINGS="$UNINSTALL_SHARED_GHOSTTY" \
+    XMUX_OSASCRIPT_BIN="$STUB_DIR/osascript-uninstall" \
+    XMUX_LSOF_BIN="$STUB_DIR/lsof-uninstall" \
+    XMUX_PS_BIN="$STUB_DIR/ps-uninstall" \
+    XMUX_KILL_BIN="$STUB_DIR/kill-uninstall" \
+    XMUX_SLEEP_BIN=/usr/bin/true \
+    XMUX_QUIT_TIMEOUT_SECONDS=2 \
+    XMUX_SUDO_BIN="$STUB_DIR/sudo" \
+    XMUX_DEFAULTS_BIN="$STUB_DIR/defaults" \
+    XMUX_CODESIGN_BIN="$STUB_DIR/codesign-ok" \
+    XMUX_TEST_PROCESS_STATE="$UNINSTALL_PROCESS_STATE" \
+    XMUX_TEST_PROCESS_QUERY_LOG="$UNINSTALL_QUERY_LOG" \
+    XMUX_TEST_KILL_LOG="$UNINSTALL_KILL_LOG" \
+    XMUX_TEST_EXPECTED_EXECUTABLE="$UNINSTALL_APP/Contents/MacOS/xmux-test-executable" \
+    XMUX_TEST_FOREIGN_EXECUTABLE="$UNINSTALL_ROOT/Other.app/Contents/MacOS/xmux" \
+    "$XMUX_DIR/11_OPTIONAL_uninstall_xmux.sh" "$@"
+}
+
+prepare_uninstall_fixture "$TEST_ROOT/uninstall dry active"
+printf '%s\n' exact-dry > "$UNINSTALL_PROCESS_STATE"
+run_uninstall_fixture --confirm-remove-xmux --dry-run > "$UNINSTALL_ROOT/dry-run.log"
 assert_file_exists "$UNINSTALL_APP/marker"
 assert_file_exists "$UNINSTALL_CLI"
-pass "uninstall --dry-run causes no mutation"
+assert_file_exists "$UNINSTALL_DERIVED"
+assert_file_absent "$UNINSTALL_KILL_LOG"
+assert_contains "$UNINSTALL_ROOT/dry-run.log" 'DRY RUN: exact xmux process check found pid(s): 4242'
+pass "uninstall dry-run validates exact active xmux without process or filesystem mutation"
 
-env "${UNINSTALL_ENV[@]}" "$XMUX_DIR/11_OPTIONAL_uninstall_xmux.sh" \
-  --confirm-remove-xmux > /dev/null
+prepare_uninstall_fixture "$TEST_ROOT/uninstall stopped"
+printf '%s\n' stopped > "$UNINSTALL_PROCESS_STATE"
+run_uninstall_fixture --confirm-remove-xmux > /dev/null
 assert_file_absent "$UNINSTALL_APP"
 assert_file_absent "$UNINSTALL_CLI"
 assert_file_absent "$UNINSTALL_DERIVED"
@@ -372,7 +632,228 @@ assert_file_exists "$UNINSTALL_OFFICIAL/marker"
 assert_file_exists "$UNINSTALL_SHARED_CMUX"
 assert_file_exists "$UNINSTALL_SHARED_GHOSTTY"
 assert_file_exists "$UNINSTALL_SUPPORT/session-com.cmuxterm.app.json"
-pass "uninstall removes only xmux bundle-specific state and preserves official/shared paths"
+assert_file_absent "$UNINSTALL_KILL_LOG"
+pass "uninstall removes scoped state when exact xmux is not running"
+
+prepare_uninstall_fixture "$TEST_ROOT/uninstall exits"
+printf '%s\n' exact-exits > "$UNINSTALL_PROCESS_STATE"
+run_uninstall_fixture --confirm-remove-xmux > "$UNINSTALL_ROOT/uninstall.log"
+assert_contains "$UNINSTALL_KILL_LOG" '-TERM 4242'
+assert_contains "$UNINSTALL_ROOT/uninstall.log" 'Exact xmux process exited.'
+assert_file_absent "$UNINSTALL_APP"
+assert_file_exists "$UNINSTALL_OFFICIAL/marker"
+pass "uninstall requests only exact xmux to quit and removes files after verified exit"
+
+prepare_uninstall_fixture "$TEST_ROOT/uninstall refuses"
+printf '%s\n' exact-refuses > "$UNINSTALL_PROCESS_STATE"
+if run_uninstall_fixture --confirm-remove-xmux > "$UNINSTALL_ROOT/refuses.log" 2>&1; then
+  fail "uninstall continued while exact xmux refused to exit"
+fi
+assert_contains "$UNINSTALL_KILL_LOG" '-TERM 4242'
+assert_contains "$UNINSTALL_ROOT/refuses.log" 'nothing was removed'
+assert_file_exists "$UNINSTALL_APP/marker"
+assert_file_exists "$UNINSTALL_CLI"
+assert_file_exists "$UNINSTALL_DERIVED"
+assert_file_exists "$UNINSTALL_SOCKET"
+assert_file_exists "$UNINSTALL_DAEMON"
+assert_file_exists "$UNINSTALL_SUPPORT/session-com.cmuxterm.app.debug.xmux-main.json"
+pass "uninstall aborts with zero deletion when exact xmux remains active"
+
+prepare_uninstall_fixture "$TEST_ROOT/uninstall official running"
+printf '%s\n' stopped > "$UNINSTALL_PROCESS_STATE"
+run_uninstall_fixture --confirm-remove-xmux > /dev/null
+assert_file_exists "$UNINSTALL_OFFICIAL/marker"
+assert_file_absent "$UNINSTALL_KILL_LOG"
+assert_not_contains "$UNINSTALL_QUERY_LOG" 'bundle identifier is \"com.cmuxterm.app\"'
+pass "uninstall permits running official cmux without querying or stopping it"
+
+prepare_uninstall_fixture "$TEST_ROOT/uninstall foreign process"
+printf '%s\n' foreign > "$UNINSTALL_PROCESS_STATE"
+run_uninstall_fixture --confirm-remove-xmux > /dev/null
+assert_file_absent "$UNINSTALL_APP"
+assert_file_absent "$UNINSTALL_KILL_LOG"
+pass "uninstall ignores a same-bundle PID whose executable is not installed xmux"
+
+prepare_uninstall_fixture "$TEST_ROOT/uninstall stale pid"
+printf '%s\n' stale > "$UNINSTALL_PROCESS_STATE"
+run_uninstall_fixture --confirm-remove-xmux > /dev/null
+assert_file_absent "$UNINSTALL_APP"
+assert_file_absent "$UNINSTALL_KILL_LOG"
+pass "uninstall does not treat a stale PID as exact xmux"
+
+make_stub "$STUB_DIR/make-socket" \
+  '/bin/rm -f "$1"' \
+  '/usr/bin/perl -MIO::Socket::UNIX -MSocket=SOCK_STREAM -e '\''my $path = shift @ARGV; my $socket = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => $path, Listen => 1) or die "socket: $!\n"; close $socket;'\'' "$1"'
+make_stub "$STUB_DIR/osascript-launch" \
+  ': "${XMUX_TEST_PROCESS_STATE:?}"' \
+  'state="$(<"$XMUX_TEST_PROCESS_STATE")"' \
+  '[[ "$state" == exact ]] && printf "%s\n" 5252' \
+  'exit 0'
+make_stub "$STUB_DIR/lsof-launch" \
+  'if [[ "${1:-}" == -t ]]; then' \
+  '  owner="$(<"${XMUX_TEST_SOCKET_OWNER_STATE:?}")"' \
+  '  case "$owner" in exact) printf "%s\n" 5252 ;; foreign) printf "%s\n" 5353 ;; none) exit 1 ;; *) exit 92 ;; esac' \
+  '  exit 0' \
+  'fi' \
+  'pid=""' \
+  'while [[ "$#" -gt 0 ]]; do if [[ "$1" == -p ]]; then pid="$2"; break; fi; shift; done' \
+  'case "$pid" in' \
+  '  5252) printf "p5252\nftxt\nn%s\n" "${XMUX_TEST_EXPECTED_EXECUTABLE:?}" ;;' \
+  '  5353) printf "p5353\nftxt\nn%s\n" "${XMUX_TEST_FOREIGN_EXECUTABLE:?}" ;;' \
+  '  *) exit 1 ;;' \
+  'esac'
+make_stub "$STUB_DIR/ps-launch" 'exit 0'
+make_stub "$STUB_DIR/open-launch" \
+  ': "${XMUX_TEST_LAUNCH_MODE:?}"' \
+  '[[ -z "${XMUX_TEST_OPEN_LOG:-}" ]] || printf "%s\n" "$*" >> "$XMUX_TEST_OPEN_LOG"' \
+  'case "$XMUX_TEST_LAUNCH_MODE" in' \
+  '  healthy|failed-ping)' \
+  '    printf "%s\n" exact > "${XMUX_TEST_PROCESS_STATE:?}"' \
+  '    "${XMUX_TEST_MAKE_SOCKET:?}" "${XMUX_SOCKET_PATH:?}"' \
+  '    printf "%s\n" exact > "${XMUX_TEST_SOCKET_OWNER_STATE:?}"' \
+  '    if [[ "$XMUX_TEST_LAUNCH_MODE" == healthy ]]; then printf "%s\n" healthy > "${XMUX_TEST_PING_STATE:?}"; else printf "%s\n" failed > "${XMUX_TEST_PING_STATE:?}"; fi' \
+  '    ;;' \
+  '  process-only) printf "%s\n" exact > "${XMUX_TEST_PROCESS_STATE:?}" ;;' \
+  '  timeout) ;;' \
+  '  *) exit 93 ;;' \
+  'esac'
+
+prepare_launch_fixture() {
+  LAUNCH_ROOT="$1"
+  LAUNCH_APP="$LAUNCH_ROOT/Applications/xmux.app"
+  LAUNCH_OFFICIAL="$LAUNCH_ROOT/Applications/cmux.app"
+  LAUNCH_SOCKET="$LAUNCH_ROOT/cmux-debug-xmux-main.sock"
+  LAUNCH_CLI="$LAUNCH_ROOT/bin/xmux"
+  LAUNCH_PROCESS_STATE="$LAUNCH_ROOT/process-state"
+  LAUNCH_SOCKET_OWNER_STATE="$LAUNCH_ROOT/socket-owner-state"
+  LAUNCH_PING_STATE="$LAUNCH_ROOT/ping-state"
+  LAUNCH_OPEN_LOG="$LAUNCH_ROOT/open.log"
+  LAUNCH_PING_LOG="$LAUNCH_ROOT/ping.log"
+  make_app "$LAUNCH_APP" 'com.cmuxterm.app.debug.xmux-main' 'xmux'
+  /bin/mkdir -p "$LAUNCH_OFFICIAL" "$(dirname "$LAUNCH_CLI")"
+  /usr/bin/plutil -replace LSEnvironment.CMUX_BUNDLED_CLI_PATH -string \
+    "$LAUNCH_APP/Contents/Resources/bin/cmux" "$LAUNCH_APP/Contents/Info.plist"
+  /usr/bin/plutil -replace LSEnvironment.CMUX_SHELL_INTEGRATION_DIR -string \
+    "$LAUNCH_APP/Contents/Resources/shell-integration" "$LAUNCH_APP/Contents/Info.plist"
+  make_stub "$LAUNCH_CLI" \
+    "# $LAUNCH_APP/Contents/Resources/bin/cmux" \
+    "# --socket $LAUNCH_SOCKET" \
+    '[[ -z "${XMUX_TEST_PING_LOG:-}" ]] || printf "%s\n" "$*" >> "$XMUX_TEST_PING_LOG"' \
+    '[[ "$(<"${XMUX_TEST_PING_STATE:?}")" == healthy ]] || exit 1' \
+    'printf "%s\n" PONG'
+  printf '%s\n' stopped > "$LAUNCH_PROCESS_STATE"
+  printf '%s\n' none > "$LAUNCH_SOCKET_OWNER_STATE"
+  printf '%s\n' failed > "$LAUNCH_PING_STATE"
+}
+
+run_launch_fixture() {
+  env \
+    XMUX_INSTALLED_APP="$LAUNCH_APP" \
+    XMUX_OFFICIAL_APP="$LAUNCH_OFFICIAL" \
+    XMUX_SOCKET_ROOT="$LAUNCH_ROOT" \
+    XMUX_SOCKET_PATH="$LAUNCH_SOCKET" \
+    XMUX_CLI_PATH="$LAUNCH_CLI" \
+    XMUX_CODESIGN_BIN="$STUB_DIR/codesign-ok" \
+    XMUX_OSASCRIPT_BIN="$STUB_DIR/osascript-launch" \
+    XMUX_LSOF_BIN="$STUB_DIR/lsof-launch" \
+    XMUX_PS_BIN="$STUB_DIR/ps-launch" \
+    XMUX_OPEN_BIN="$STUB_DIR/open-launch" \
+    XMUX_SLEEP_BIN=/usr/bin/true \
+    XMUX_RM_BIN="${XMUX_TEST_LAUNCH_RM_BIN:-/bin/rm}" \
+    XMUX_LAUNCH_TIMEOUT_SECONDS=2 \
+    XMUX_PING_TIMEOUT_SECONDS=1 \
+    XMUX_TEST_PROCESS_STATE="$LAUNCH_PROCESS_STATE" \
+    XMUX_TEST_SOCKET_OWNER_STATE="$LAUNCH_SOCKET_OWNER_STATE" \
+    XMUX_TEST_PING_STATE="$LAUNCH_PING_STATE" \
+    XMUX_TEST_OPEN_LOG="$LAUNCH_OPEN_LOG" \
+    XMUX_TEST_PING_LOG="$LAUNCH_PING_LOG" \
+    XMUX_TEST_MAKE_SOCKET="$STUB_DIR/make-socket" \
+    XMUX_TEST_EXPECTED_EXECUTABLE="$LAUNCH_APP/Contents/MacOS/xmux-test-executable" \
+    XMUX_TEST_FOREIGN_EXECUTABLE="$LAUNCH_ROOT/Other.app/Contents/MacOS/xmux" \
+    XMUX_TEST_LAUNCH_MODE="${XMUX_TEST_LAUNCH_MODE:-timeout}" \
+    "$XMUX_DIR/06_launch_and_verify_xmux.sh"
+}
+
+prepare_launch_fixture "$TEST_ROOT/launch stale socket"
+make_socket_path "$LAUNCH_SOCKET"
+stale_identity="$(/usr/bin/stat -f '%d:%i' "$LAUNCH_SOCKET")"
+XMUX_TEST_LAUNCH_MODE=healthy run_launch_fixture > "$LAUNCH_ROOT/result.log"
+new_identity="$(/usr/bin/stat -f '%d:%i' "$LAUNCH_SOCKET")"
+[[ "$stale_identity" != "$new_identity" ]] || fail "stale socket inode was not replaced"
+assert_contains "$LAUNCH_ROOT/result.log" 'Removed unowned stale xmux socket:'
+assert_contains "$LAUNCH_ROOT/result.log" 'Readiness: exact process, exact socket owner, and PONG verified.'
+assert_equals "$(<"$LAUNCH_PING_LOG")" 'ping'
+pass "launch removes only an unowned stale socket and requires a new owned PONG-ready socket"
+
+prepare_launch_fixture "$TEST_ROOT/launch non socket"
+printf '%s\n' keep > "$LAUNCH_SOCKET"
+if XMUX_TEST_LAUNCH_MODE=healthy run_launch_fixture > "$LAUNCH_ROOT/result.log" 2>&1; then
+  fail "launch accepted a non-socket object"
+fi
+assert_file_absent "$LAUNCH_OPEN_LOG"
+assert_contains "$LAUNCH_SOCKET" keep
+pass "launch rejects a non-socket object before opening xmux"
+
+prepare_launch_fixture "$TEST_ROOT/launch foreign socket"
+make_socket_path "$LAUNCH_SOCKET"
+printf '%s\n' foreign > "$LAUNCH_SOCKET_OWNER_STATE"
+if XMUX_TEST_LAUNCH_MODE=healthy run_launch_fixture > "$LAUNCH_ROOT/result.log" 2>&1; then
+  fail "launch accepted a foreign-owned socket"
+fi
+assert_file_absent "$LAUNCH_OPEN_LOG"
+assert_contains "$LAUNCH_ROOT/result.log" "refusing pre-launch xmux socket state 'foreign'"
+pass "launch rejects a socket owned by an unrelated process"
+
+prepare_launch_fixture "$TEST_ROOT/launch existing healthy"
+make_socket_path "$LAUNCH_SOCKET"
+printf '%s\n' exact > "$LAUNCH_PROCESS_STATE"
+printf '%s\n' exact > "$LAUNCH_SOCKET_OWNER_STATE"
+printf '%s\n' healthy > "$LAUNCH_PING_STATE"
+XMUX_TEST_LAUNCH_MODE=timeout run_launch_fixture > "$LAUNCH_ROOT/result.log"
+assert_file_absent "$LAUNCH_OPEN_LOG"
+assert_contains "$LAUNCH_ROOT/result.log" 'Launch result: existing exact xmux verified; no new launch'
+assert_equals "$(<"$LAUNCH_PING_LOG")" 'ping'
+pass "launch verifies an already-running exact xmux without claiming a new launch"
+
+prepare_launch_fixture "$TEST_ROOT/launch new healthy"
+XMUX_TEST_LAUNCH_MODE=healthy run_launch_fixture > "$LAUNCH_ROOT/result.log"
+assert_file_exists "$LAUNCH_OPEN_LOG"
+assert_contains "$LAUNCH_ROOT/result.log" 'Launch result: launched and verified'
+assert_equals "$(<"$LAUNCH_PING_LOG")" 'ping'
+pass "launch verifies a newly started exact xmux with a live owned socket and PONG"
+
+prepare_launch_fixture "$TEST_ROOT/launch failed ping"
+XMUX_TEST_LAUNCH_MODE=failed-ping run_launch_fixture > "$LAUNCH_ROOT/result.log" 2>&1 && \
+  fail "launch accepted a newly owned socket whose ping failed"
+assert_contains "$LAUNCH_ROOT/result.log" 'xmux readiness timed out'
+assert_not_contains "$LAUNCH_ROOT/result.log" 'Launch result:'
+pass "launch fails when a newly created exact-owned socket does not answer PONG"
+
+prepare_launch_fixture "$TEST_ROOT/launch old socket survives"
+make_socket_path "$LAUNCH_SOCKET"
+XMUX_TEST_LAUNCH_RM_BIN=/usr/bin/true XMUX_TEST_LAUNCH_MODE=healthy \
+  run_launch_fixture > "$LAUNCH_ROOT/result.log" 2>&1 && \
+  fail "launch accepted an old stale socket path that survived removal"
+assert_file_absent "$LAUNCH_OPEN_LOG"
+assert_contains "$LAUNCH_ROOT/result.log" 'stale xmux socket could not be removed safely'
+pass "launch rejects an old socket pathname that survives without replacement"
+
+prepare_launch_fixture "$TEST_ROOT/launch timeout"
+XMUX_TEST_LAUNCH_MODE=timeout run_launch_fixture > "$LAUNCH_ROOT/result.log" 2>&1 && \
+  fail "launch accepted a readiness timeout"
+assert_contains "$LAUNCH_ROOT/result.log" 'xmux readiness timed out after 2s'
+assert_not_contains "$LAUNCH_ROOT/result.log" 'Launch result:'
+pass "launch returns nonzero with content-free diagnostics on bounded timeout"
+
+prepare_launch_fixture "$TEST_ROOT/launch outside socket root"
+/bin/mkdir -p "$TEST_ROOT/outside socket root"
+LAUNCH_SOCKET="$TEST_ROOT/outside socket root/cmux-debug-xmux-main.sock"
+printf '%s\n' keep > "$LAUNCH_SOCKET"
+XMUX_TEST_LAUNCH_MODE=healthy run_launch_fixture > "$LAUNCH_ROOT/result.log" 2>&1 && \
+  fail "launch accepted a socket override outside its guarded root"
+assert_contains "$LAUNCH_SOCKET" keep
+assert_file_absent "$LAUNCH_OPEN_LOG"
+pass "launch never removes an arbitrary socket override outside the guarded custom root"
 
 DRY_BACKUP_ROOT="$TEST_ROOT/dry-backup"
 env XMUX_BACKUP_ROOT="$DRY_BACKUP_ROOT" XMUX_TIMESTAMP='20260722-130000' \
