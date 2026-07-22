@@ -12,10 +12,11 @@ xmux_verify_app_identity "$XMUX_INSTALLED_APP"
 xmux_verify_installed_resource_paths "$XMUX_INSTALLED_APP"
 
 [[ -x "$XMUX_CLI_PATH" ]] || xmux_die "xmux CLI wrapper is missing: $XMUX_CLI_PATH"
-/usr/bin/grep -Fq "$XMUX_INSTALLED_APP/Contents/Resources/bin/cmux" "$XMUX_CLI_PATH" \
-  || xmux_die "xmux CLI wrapper targets the wrong executable"
-/usr/bin/grep -Fq -- "--socket $XMUX_SOCKET_PATH" "$XMUX_CLI_PATH" \
-  || xmux_die "xmux CLI wrapper targets the wrong socket"
+/usr/bin/cmp -s "$XMUX_CLI_PATH" <(
+  xmux_render_cli_wrapper \
+    "$XMUX_INSTALLED_APP/Contents/Resources/bin/cmux" "$XMUX_SOCKET_PATH"
+) \
+  || xmux_die "xmux CLI wrapper content is not canonical for the installed executable and socket"
 
 launch_timeout="${XMUX_LAUNCH_TIMEOUT_SECONDS:-20}"
 case "$launch_timeout" in

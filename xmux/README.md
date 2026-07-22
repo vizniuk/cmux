@@ -109,11 +109,11 @@ The scripts never copy Keychain entries. Authentication remains independently ma
 
 ## Optional migrations
 
-Every migration is opt-in and has `_OPTIONAL_` in its filename. Each refuses to run until both official cmux and xmux are fully stopped, creates a timestamped pre-migration backup, preserves source data, and is safe when its source is absent.
+Every migration is opt-in and has `_OPTIONAL_` in its filename. Each fails closed before creating a backup or changing a target unless it can establish that both official cmux and xmux are fully stopped. Each preserves source data and is safe when its source is absent.
 
 - `./xmux/07_OPTIONAL_copy_existing_session.sh` copies the official primary and previous session snapshots to xmux-specific filenames. Its final receipt reports exact copied, skipped, and backed-up counts and identifies each source and target separately. **Restoring those sessions may restart represented commands. Never copy sessions while either application is running.**
 - `./xmux/08_OPTIONAL_copy_notification_history.sh` copies only the bundle-specific notification history file and does not touch active notification state.
-- `./xmux/09_OPTIONAL_copy_macos_preferences.sh` exports official macOS defaults and imports them into the xmux domain. It does not copy `cmux.json`, which is already shared.
+- `./xmux/09_OPTIONAL_copy_macos_preferences.sh` distinguishes an absent official defaults domain from probe or export failure. Before importing, it requires a validated nonempty source export and, when xmux defaults already exist, a validated recoverable xmux defaults backup. A failed import leaves that backup in place and reports its recovery path. It does not copy `cmux.json`, which is already shared.
 
 No optional migration runs during build, install, update, launch, or CLI setup.
 
@@ -147,7 +147,7 @@ Official cmux may remain running during uninstall and is never queried for termi
 
 ## Recovery
 
-`01_backup_existing_cmux.sh` prints a directory such as `/Users/xaero/Desktop/cmux-backup-YYYYMMDD-HHMMSS`. Keep both applications stopped before restoring mutable state.
+After a real successful backup, `01_backup_existing_cmux.sh` prints a directory such as `/Users/xaero/Desktop/cmux-backup-YYYYMMDD-HHMMSS`. Its dry run creates nothing and reports only planned export and backup paths. Keep both applications stopped before restoring mutable state.
 
 - Restore shared cmux or Ghostty configuration by copying the corresponding directory from `config/` in the backup to its exact default path.
 - Restore Application Support data by copying only the needed state file back to `/Users/xaero/Library/Application Support/cmux`; do not restore credential files or Keychain material.
@@ -180,7 +180,7 @@ Do not bypass verification. Rerun the build, verify that the built app exists at
 
 ### Socket unavailable
 
-Make sure only the explicit launch script is being used, then rerun it. Before launch it distinguishes an exact live xmux socket from an unowned stale socket, a foreign-owned socket, and a non-socket path. It removes only an unowned stale socket at the guarded custom location. Success requires the exact installed xmux process, a newly established socket when a launch was needed, an owner matching that executable, and a content-free `ping` response of `PONG`, all within a bounded wait. An already-running exact xmux is verified without claiming a new launch. Any foreign owner, failed ping, or timeout returns nonzero without claiming success.
+Make sure only the explicit launch script is being used, then rerun it. Before launch it verifies the CLI wrapper against the same canonical, shell-escaped content used by the installer, including paths containing spaces, and separately requires a live `PONG`. It distinguishes an exact live xmux socket from an unowned stale socket, a foreign-owned socket, and a non-socket path. It removes only an unowned stale socket at the guarded custom location. Success requires the exact installed xmux process, a newly established socket when a launch was needed, an owner matching that executable, and a content-free `ping` response of `PONG`, all within a bounded wait. An already-running exact xmux is verified without claiming a new launch. Any wrapper mismatch, foreign owner, failed ping, or timeout returns nonzero without claiming success.
 
 ```bash
 ./xmux/06_launch_and_verify_xmux.sh

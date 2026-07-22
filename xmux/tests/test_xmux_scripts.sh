@@ -73,6 +73,18 @@ make_stub() {
   /bin/chmod 0755 "$path"
 }
 
+render_wrapper() {
+  local output_path="$1"
+  local installed_cli="$2"
+  local socket_path="$3"
+  (
+    # shellcheck source=xmux/lib/common.sh
+    source "$XMUX_DIR/lib/common.sh"
+    xmux_render_cli_wrapper "$installed_cli" "$socket_path"
+  ) > "$output_path"
+  /bin/chmod 0755 "$output_path"
+}
+
 make_socket_path() {
   local socket_path="$1"
   /usr/bin/perl -MIO::Socket::UNIX -MSocket=SOCK_STREAM -e '
@@ -297,6 +309,9 @@ assert_file_exists "$BACKUP_PATH/Application Support/cmux/state/session.json"
 assert_file_absent "$BACKUP_PATH/Application Support/cmux/state/credentials.json"
 assert_file_exists "$BACKUP_PATH/com.cmuxterm.app.plist"
 pass "backup creates the expected tree without credentials"
+assert_contains "$TEST_ROOT/backup.log" 'Official defaults: present; exported.'
+assert_contains "$TEST_ROOT/backup.log" "Backup path: $BACKUP_PATH"
+pass "real successful backup reserves exported and actual-path wording for published artifacts"
 
 ABSENT_BACKUP_ROOT="$TEST_ROOT/backup defaults absent"
 env XMUX_BACKUP_ROOT="$ABSENT_BACKUP_ROOT" \
@@ -333,6 +348,9 @@ assert_file_absent "$FAILED_BACKUP_PATH/com.cmuxterm.app.plist"
 assert_not_contains "$TEST_ROOT/backup-failure.log" 'Backup path:'
 assert_contains "$TEST_ROOT/backup-failure.log" 'official defaults exist but export failed'
 pass "backup fails a real export error without publishing an empty or successful plist receipt"
+assert_not_contains "$TEST_ROOT/backup-failure.log" 'Official defaults: present; exported.'
+assert_not_contains "$TEST_ROOT/backup-failure.log" 'Dry run only; no backup was created.'
+pass "real backup export failure remains fatal without any success receipt"
 
 make_stub "$STUB_DIR/sudo" \
   'if [[ -n "${XMUX_TEST_SUDO_LOG:-}" ]]; then printf "%s\n" "$*" >> "$XMUX_TEST_SUDO_LOG"; fi' \
@@ -405,6 +423,68 @@ path_line_count="$(/usr/bin/grep -Fc '# xmux operations kit' "$ZSHRC")"
 assert_equals "$path_line_count" '1'
 pass "CLI wrapper uses the exact app/socket and does not duplicate the .zshrc PATH line"
 
+WRAPPER_CASE_ROOT="$TEST_ROOT/wrapper renderer"
+/bin/mkdir -p "$WRAPPER_CASE_ROOT"
+DEFAULT_WRAPPER="$WRAPPER_CASE_ROOT/default-wrapper"
+render_wrapper "$DEFAULT_WRAPPER" \
+  '/Applications/xmux.app/Contents/Resources/bin/cmux' \
+  '/tmp/cmux-debug-xmux-main.sock'
+expected_default_wrapper="$(printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'exec /Applications/xmux.app/Contents/Resources/bin/cmux --socket /tmp/cmux-debug-xmux-main.sock "$@"')"
+assert_equals "$(<"$DEFAULT_WRAPPER")" "$expected_default_wrapper"
+pass "canonical CLI wrapper renderer emits the exact default executable and socket"
+
+WRAPPER_SYNTAX_COUNT=0
+WRAPPER_ARGUMENT_COUNT=0
+exercise_rendered_wrapper() {
+  local case_name="$1"
+  local target_path="$2"
+  local socket_path="$3"
+  local wrapper_path="$WRAPPER_CASE_ROOT/$case_name-wrapper"
+  local argument_log="$WRAPPER_CASE_ROOT/$case_name-arguments.log"
+  make_stub "$target_path" \
+    ': "${XMUX_TEST_WRAPPER_ARGUMENT_LOG:?}"' \
+    'printf "argc=%s\n" "$#" > "$XMUX_TEST_WRAPPER_ARGUMENT_LOG"' \
+    'for argument in "$@"; do printf "arg=[%s]\n" "$argument" >> "$XMUX_TEST_WRAPPER_ARGUMENT_LOG"; done'
+  render_wrapper "$wrapper_path" "$target_path" "$socket_path"
+  /bin/bash -n "$wrapper_path"
+  WRAPPER_SYNTAX_COUNT=$((WRAPPER_SYNTAX_COUNT + 1))
+  XMUX_TEST_WRAPPER_ARGUMENT_LOG="$argument_log" \
+    "$wrapper_path" 'first argument' '*' 'last argument'
+  expected_arguments="$(printf '%s\n' \
+    'argc=5' \
+    'arg=[--socket]' \
+    "arg=[$socket_path]" \
+    'arg=[first argument]' \
+    'arg=[*]' \
+    'arg=[last argument]')"
+  assert_equals "$(<"$argument_log")" "$expected_arguments"
+  WRAPPER_ARGUMENT_COUNT=$((WRAPPER_ARGUMENT_COUNT + 1))
+}
+
+exercise_rendered_wrapper app-space \
+  "$WRAPPER_CASE_ROOT/Application With Space/bin/cmux" \
+  "$WRAPPER_CASE_ROOT/socket.sock"
+pass "canonical wrapper safely executes an application path containing spaces"
+exercise_rendered_wrapper socket-space \
+  "$WRAPPER_CASE_ROOT/application/bin/cmux" \
+  "$WRAPPER_CASE_ROOT/Socket Root/cmux.sock"
+pass "canonical wrapper safely preserves a socket path containing spaces"
+exercise_rendered_wrapper both-spaces \
+  "$WRAPPER_CASE_ROOT/Another Application/bin/cmux" \
+  "$WRAPPER_CASE_ROOT/Another Socket Root/cmux.sock"
+pass "canonical wrapper safely executes when both configured paths contain spaces"
+exercise_rendered_wrapper metacharacters \
+  "$WRAPPER_CASE_ROOT/app;literal-dollar-\$-bracket[1]/bin/cmux" \
+  "$WRAPPER_CASE_ROOT/socket;literal-dollar-\$-bracket[2]/cmux.sock"
+pass "canonical wrapper shell-escapes metacharacters without evaluating them"
+assert_equals "$WRAPPER_SYNTAX_COUNT" '4'
+pass "every generated special-path wrapper passes bash -n"
+assert_equals "$WRAPPER_ARGUMENT_COUNT" '4'
+pass "generated wrappers preserve every user argument boundary"
+
 DRY_CLI="$TEST_ROOT/dry-home/bin/xmux"
 DRY_ZSHRC="$TEST_ROOT/dry-home/.zshrc"
 env XMUX_INSTALLED_APP="$INSTALLED_APP" XMUX_CLI_PATH="$DRY_CLI" XMUX_ZSHRC="$DRY_ZSHRC" \
@@ -425,6 +505,134 @@ for optional_script in \
 done
 assert_file_absent "$TEST_ROOT/active-backups"
 pass "all optional migrations refuse while either relevant application is active"
+
+PROCESS_QUERY_STUB="$STUB_DIR/osascript-process-query"
+make_stub "$PROCESS_QUERY_STUB" \
+  ': "${XMUX_TEST_PROCESS_MODE:?}"' \
+  'query="$*"' \
+  'case "$query" in' \
+  '  *com.cmuxterm.app.debug.xmux-main*) bundle=xmux ;;' \
+  '  *com.cmuxterm.app*) bundle=official ;;' \
+  '  *) exit 70 ;;' \
+  'esac' \
+  '[[ -z "${XMUX_TEST_PROCESS_QUERY_LOG:-}" ]] || printf "%s\n" "$bundle" >> "$XMUX_TEST_PROCESS_QUERY_LOG"' \
+  'case "$XMUX_TEST_PROCESS_MODE:$bundle" in' \
+  '  both-stopped:*) exit 0 ;;' \
+  '  official-fails:official) exit 71 ;;' \
+  '  official-fails:xmux) exit 0 ;;' \
+  '  xmux-fails:official) exit 0 ;;' \
+  '  xmux-fails:xmux) exit 72 ;;' \
+  '  official-active:official) printf "%s\n" 6101 ;;' \
+  '  official-active:xmux) exit 0 ;;' \
+  '  xmux-active:official) exit 0 ;;' \
+  '  xmux-active:xmux) printf "%s\n" 6202 ;;' \
+  '  *) exit 73 ;;' \
+  'esac'
+
+run_process_gate() {
+  local mode="$1"
+  local query_log="$2"
+  env XMUX_OSASCRIPT_BIN="$PROCESS_QUERY_STUB" \
+    XMUX_TEST_PROCESS_MODE="$mode" \
+    XMUX_TEST_PROCESS_QUERY_LOG="$query_log" \
+    /bin/bash -c 'source "$1"; xmux_require_both_apps_stopped' \
+    xmux-process-gate "$XMUX_DIR/lib/common.sh"
+}
+
+PROCESS_GATE_ROOT="$TEST_ROOT/process query gates"
+/bin/mkdir -p "$PROCESS_GATE_ROOT"
+run_process_gate both-stopped "$PROCESS_GATE_ROOT/both-stopped.queries" \
+  > "$PROCESS_GATE_ROOT/both-stopped.log"
+assert_equals "$(<"$PROCESS_GATE_ROOT/both-stopped.queries")" "$(printf '%s\n' official xmux)"
+pass "process gate accepts only two successful stopped-application queries"
+
+if run_process_gate official-fails "$PROCESS_GATE_ROOT/official-fails.queries" \
+  > "$PROCESS_GATE_ROOT/official-fails.log" 2>&1; then
+  fail "process gate treated a failed official cmux query as stopped"
+fi
+assert_contains "$PROCESS_GATE_ROOT/official-fails.log" \
+  'cannot establish whether official cmux is stopped (bundle com.cmuxterm.app): process query failed'
+pass "process gate fails closed when official cmux state cannot be established"
+
+if run_process_gate xmux-fails "$PROCESS_GATE_ROOT/xmux-fails.queries" \
+  > "$PROCESS_GATE_ROOT/xmux-fails.log" 2>&1; then
+  fail "process gate treated a failed xmux query as stopped"
+fi
+assert_contains "$PROCESS_GATE_ROOT/xmux-fails.log" \
+  'cannot establish whether xmux is stopped (bundle com.cmuxterm.app.debug.xmux-main): process query failed'
+pass "process gate fails closed when xmux state cannot be established"
+
+if run_process_gate official-active "$PROCESS_GATE_ROOT/official-active.queries" \
+  > "$PROCESS_GATE_ROOT/official-active.log" 2>&1; then
+  fail "process gate accepted active official cmux"
+fi
+assert_contains "$PROCESS_GATE_ROOT/official-active.log" 'official cmux must be fully stopped'
+pass "process gate rejects an active official cmux process"
+
+if run_process_gate xmux-active "$PROCESS_GATE_ROOT/xmux-active.queries" \
+  > "$PROCESS_GATE_ROOT/xmux-active.log" 2>&1; then
+  fail "process gate accepted active xmux"
+fi
+assert_contains "$PROCESS_GATE_ROOT/xmux-active.log" 'xmux must be fully stopped'
+pass "process gate rejects an active xmux process"
+
+make_stub "$STUB_DIR/defaults-must-not-run" \
+  ': "${XMUX_TEST_UNEXPECTED_DEFAULTS_LOG:?}"' \
+  'printf "%s\n" "$*" >> "$XMUX_TEST_UNEXPECTED_DEFAULTS_LOG"' \
+  'exit 97'
+
+PROCESS_MIGRATION_ROOT="$TEST_ROOT/process failure migrations"
+for process_mode in official-fails xmux-fails; do
+  for optional_script in \
+    07_OPTIONAL_copy_existing_session.sh \
+    08_OPTIONAL_copy_notification_history.sh \
+    09_OPTIONAL_copy_macos_preferences.sh; do
+    case_root="$PROCESS_MIGRATION_ROOT/$process_mode-$optional_script"
+    support_root="$case_root/support"
+    backup_root="$case_root/backups"
+    defaults_log="$case_root/defaults.log"
+    /bin/mkdir -p "$support_root"
+    printf '%s\n' official-session > "$support_root/session-com.cmuxterm.app.json"
+    printf '%s\n' old-session > "$support_root/session-com.cmuxterm.app.debug.xmux-main.json"
+    printf '%s\n' official-history > "$support_root/notification-feed-history-com.cmuxterm.app.json"
+    printf '%s\n' old-history > "$support_root/notification-feed-history-com.cmuxterm.app.debug.xmux-main.json"
+    if env XMUX_OSASCRIPT_BIN="$PROCESS_QUERY_STUB" \
+      XMUX_TEST_PROCESS_MODE="$process_mode" \
+      XMUX_APPLICATION_SUPPORT="$support_root" \
+      XMUX_BACKUP_ROOT="$backup_root" \
+      XMUX_DEFAULTS_BIN="$STUB_DIR/defaults-must-not-run" \
+      XMUX_TEST_UNEXPECTED_DEFAULTS_LOG="$defaults_log" \
+      "$XMUX_DIR/$optional_script" > "$case_root/result.log" 2>&1; then
+      fail "$optional_script accepted $process_mode"
+    fi
+    assert_file_absent "$backup_root"
+    assert_file_absent "$defaults_log"
+    assert_equals "$(<"$support_root/session-com.cmuxterm.app.debug.xmux-main.json")" 'old-session'
+    assert_equals "$(<"$support_root/notification-feed-history-com.cmuxterm.app.debug.xmux-main.json")" 'old-history'
+    if [[ "$process_mode" == official-fails ]]; then
+      assert_contains "$case_root/result.log" 'bundle com.cmuxterm.app): process query failed'
+    else
+      assert_contains "$case_root/result.log" 'bundle com.cmuxterm.app.debug.xmux-main): process query failed'
+    fi
+    pass "$optional_script refuses $process_mode before backup or target mutation"
+  done
+done
+
+PROCESS_DRY_ROOT="$PROCESS_MIGRATION_ROOT/dry-run-query-failure"
+/bin/mkdir -p "$PROCESS_DRY_ROOT/support"
+printf '%s\n' old-session > \
+  "$PROCESS_DRY_ROOT/support/session-com.cmuxterm.app.debug.xmux-main.json"
+if env XMUX_OSASCRIPT_BIN="$PROCESS_QUERY_STUB" \
+  XMUX_TEST_PROCESS_MODE=official-fails \
+  XMUX_APPLICATION_SUPPORT="$PROCESS_DRY_ROOT/support" \
+  XMUX_BACKUP_ROOT="$PROCESS_DRY_ROOT/backups" \
+  "$XMUX_DIR/07_OPTIONAL_copy_existing_session.sh" --dry-run \
+  > "$PROCESS_DRY_ROOT/result.log" 2>&1; then
+  fail "optional migration dry-run treated a failed process query as stopped"
+fi
+assert_file_absent "$PROCESS_DRY_ROOT/backups"
+assert_equals "$(<"$PROCESS_DRY_ROOT/support/session-com.cmuxterm.app.debug.xmux-main.json")" 'old-session'
+pass "optional migration dry-run fails closed before planned backup on query failure"
 
 SESSION_CASE_ROOT="$TEST_ROOT/session receipt cases"
 SESSION_OFFICIAL_PRIMARY_NAME='session-com.cmuxterm.app.json'
@@ -504,6 +712,226 @@ assert_file_absent "$SESSION_FAILURE_SUPPORT/$SESSION_XMUX_PRIMARY_NAME"
 assert_not_contains "$SESSION_CASE_ROOT-failure.log" 'Primary snapshot copied:'
 assert_not_contains "$SESSION_CASE_ROOT-failure.log" 'Session migration receipt:'
 pass "session migration reports a snapshot copied only after successful copy"
+
+DEFAULTS_MIGRATION_STUB="$STUB_DIR/defaults-migration"
+make_stub "$DEFAULTS_MIGRATION_STUB" \
+  ': "${XMUX_TEST_DEFAULTS_LOG:?}"' \
+  ': "${XMUX_TEST_SOURCE_STATE:?}" "${XMUX_TEST_TARGET_STATE:?}"' \
+  ': "${XMUX_TEST_SOURCE_EXPORT_MODE:?}" "${XMUX_TEST_TARGET_EXPORT_MODE:?}"' \
+  ': "${XMUX_TEST_IMPORT_MODE:?}"' \
+  'command_name="${1:-}"' \
+  'printf "%s" "$command_name" >> "$XMUX_TEST_DEFAULTS_LOG"' \
+  'if [[ "$#" -gt 0 ]]; then shift; fi' \
+  'for argument in "$@"; do printf " [%s]" "$argument" >> "$XMUX_TEST_DEFAULTS_LOG"; done' \
+  'printf "\n" >> "$XMUX_TEST_DEFAULTS_LOG"' \
+  'case "$command_name" in' \
+  '  read)' \
+  '    case "$1" in' \
+  '      com.cmuxterm.app) state="$XMUX_TEST_SOURCE_STATE" ;;' \
+  '      com.cmuxterm.app.debug.xmux-main) state="$XMUX_TEST_TARGET_STATE" ;;' \
+  '      *) exit 74 ;;' \
+  '    esac' \
+  '    [[ "$state" == present ]] && exit 0' \
+  '    exit 1' \
+  '    ;;' \
+  '  domains)' \
+  '    domains=""' \
+  '    if [[ "$XMUX_TEST_SOURCE_STATE" != absent ]]; then domains="com.cmuxterm.app"; fi' \
+  '    if [[ "$XMUX_TEST_TARGET_STATE" != absent ]]; then' \
+  '      if [[ -n "$domains" ]]; then domains="$domains, "; fi' \
+  '      domains="${domains}com.cmuxterm.app.debug.xmux-main"' \
+  '    fi' \
+  '    printf "%s\n" "$domains"' \
+  '    ;;' \
+  '  export)' \
+  '    case "$1" in' \
+  '      com.cmuxterm.app) export_mode="$XMUX_TEST_SOURCE_EXPORT_MODE" ;;' \
+  '      com.cmuxterm.app.debug.xmux-main) export_mode="$XMUX_TEST_TARGET_EXPORT_MODE" ;;' \
+  '      *) exit 75 ;;' \
+  '    esac' \
+  '    case "$export_mode" in' \
+  '      success) mkdir -p "$(dirname "$2")"; printf "plist for %s\n" "$1" > "$2" ;;' \
+  '      nonzero) exit 76 ;;' \
+  '      no-file) exit 0 ;;' \
+  '      empty) mkdir -p "$(dirname "$2")"; : > "$2" ;;' \
+  '      *) exit 77 ;;' \
+  '    esac' \
+  '    ;;' \
+  '  import)' \
+  '    [[ "$XMUX_TEST_IMPORT_MODE" == success ]] || exit 78' \
+  '    ;;' \
+  '  *) exit 79 ;;' \
+  'esac'
+
+prepare_preferences_case() {
+  PREF_CASE_ROOT="$1"
+  PREF_BACKUP_ROOT="$PREF_CASE_ROOT/backups"
+  PREF_DEFAULTS_LOG="$PREF_CASE_ROOT/defaults.log"
+  PREF_RESULT_LOG="$PREF_CASE_ROOT/result.log"
+  PREF_TARGET_SENTINEL="$PREF_CASE_ROOT/xmux-target-sentinel"
+  PREF_BACKUP_PATH="$PREF_BACKUP_ROOT/cmux-pre-defaults-migration-20260722-150000"
+  PREF_SOURCE_EXPORT="$PREF_BACKUP_PATH/com.cmuxterm.app.plist"
+  PREF_TARGET_EXPORT="$PREF_BACKUP_PATH/com.cmuxterm.app.debug.xmux-main-before.plist"
+  /bin/mkdir -p "$PREF_CASE_ROOT"
+  printf '%s\n' unchanged > "$PREF_TARGET_SENTINEL"
+}
+
+run_preferences_case() {
+  local source_state="$1"
+  local target_state="$2"
+  local source_export_mode="$3"
+  local target_export_mode="$4"
+  local import_mode="$5"
+  shift 5
+  env XMUX_OSASCRIPT_BIN="$STUB_DIR/osascript-stopped" \
+    XMUX_DEFAULTS_BIN="$DEFAULTS_MIGRATION_STUB" \
+    XMUX_TEST_DEFAULTS_LOG="$PREF_DEFAULTS_LOG" \
+    XMUX_TEST_SOURCE_STATE="$source_state" \
+    XMUX_TEST_TARGET_STATE="$target_state" \
+    XMUX_TEST_SOURCE_EXPORT_MODE="$source_export_mode" \
+    XMUX_TEST_TARGET_EXPORT_MODE="$target_export_mode" \
+    XMUX_TEST_IMPORT_MODE="$import_mode" \
+    XMUX_BACKUP_ROOT="$PREF_BACKUP_ROOT" \
+    XMUX_TIMESTAMP='20260722-150000' \
+    "$XMUX_DIR/09_OPTIONAL_copy_macos_preferences.sh" "$@"
+}
+
+assert_preferences_target_unchanged() {
+  assert_equals "$(<"$PREF_TARGET_SENTINEL")" unchanged
+}
+
+assert_preferences_not_imported() {
+  if [[ -e "$PREF_DEFAULTS_LOG" ]] && /usr/bin/grep -q '^import ' "$PREF_DEFAULTS_LOG"; then
+    fail "preferences import ran before verified source and recovery state: $PREF_CASE_ROOT"
+  fi
+  assert_preferences_target_unchanged
+}
+
+PREF_FAILURE_LOGS=()
+PREF_EXPORT_FAILURE_DEFAULTS_LOGS=()
+
+prepare_preferences_case "$TEST_ROOT/preferences source absent"
+run_preferences_case absent absent success success success > "$PREF_RESULT_LOG"
+assert_file_absent "$PREF_BACKUP_ROOT"
+assert_preferences_not_imported
+assert_contains "$PREF_RESULT_LOG" 'Source domain: absent.'
+assert_contains "$PREF_RESULT_LOG" 'Target domain: absent; no target backup was required.'
+assert_contains "$PREF_RESULT_LOG" 'Import: skipped.'
+assert_not_contains "$PREF_RESULT_LOG" 'Migration backup directory:'
+pass "preferences migration distinguishes an absent source and skips without a backup or import"
+
+prepare_preferences_case "$TEST_ROOT/preferences source present target absent"
+run_preferences_case present absent success success success > "$PREF_RESULT_LOG"
+assert_file_exists "$PREF_SOURCE_EXPORT"
+assert_file_absent "$PREF_TARGET_EXPORT"
+assert_contains "$PREF_RESULT_LOG" 'Source domain: exported.'
+assert_contains "$PREF_RESULT_LOG" "Source export path: $PREF_SOURCE_EXPORT"
+assert_contains "$PREF_RESULT_LOG" 'Target domain: absent; no target backup was required.'
+assert_contains "$PREF_RESULT_LOG" 'Import: succeeded.'
+assert_contains "$PREF_DEFAULTS_LOG" "import [com.cmuxterm.app.debug.xmux-main] [$PREF_SOURCE_EXPORT]"
+assert_preferences_target_unchanged
+pass "preferences migration imports a validated source when the target domain is absent"
+
+prepare_preferences_case "$TEST_ROOT/preferences both present"
+run_preferences_case present present success success success > "$PREF_RESULT_LOG"
+assert_file_exists "$PREF_SOURCE_EXPORT"
+assert_file_exists "$PREF_TARGET_EXPORT"
+assert_contains "$PREF_RESULT_LOG" 'Target domain: backed up.'
+assert_contains "$PREF_RESULT_LOG" "Target backup path: $PREF_TARGET_EXPORT"
+assert_contains "$PREF_RESULT_LOG" 'Import: succeeded.'
+assert_preferences_target_unchanged
+pass "preferences migration publishes a recoverable target backup before successful import"
+
+prepare_preferences_case "$TEST_ROOT/preferences source probe failure"
+if run_preferences_case probe-fail absent success success success > "$PREF_RESULT_LOG" 2>&1; then
+  fail "preferences migration treated a failed source presence probe as absent"
+fi
+assert_file_absent "$PREF_BACKUP_ROOT"
+assert_preferences_not_imported
+assert_contains "$PREF_RESULT_LOG" 'Source domain: failed.'
+assert_not_contains "$PREF_RESULT_LOG" 'Import: succeeded.'
+PREF_FAILURE_LOGS+=("$PREF_RESULT_LOG")
+pass "preferences migration fails closed on source-domain presence probe failure"
+
+for source_export_mode in nonzero no-file empty; do
+  prepare_preferences_case "$TEST_ROOT/preferences source export $source_export_mode"
+  if run_preferences_case present absent "$source_export_mode" success success \
+    > "$PREF_RESULT_LOG" 2>&1; then
+    fail "preferences migration accepted source export mode $source_export_mode"
+  fi
+  assert_file_absent "$PREF_SOURCE_EXPORT"
+  assert_preferences_not_imported
+  assert_contains "$PREF_RESULT_LOG" 'Source domain: failed.'
+  assert_contains "$PREF_RESULT_LOG" 'Import: skipped.'
+  assert_not_contains "$PREF_RESULT_LOG" 'Import: succeeded.'
+  PREF_FAILURE_LOGS+=("$PREF_RESULT_LOG")
+  PREF_EXPORT_FAILURE_DEFAULTS_LOGS+=("$PREF_DEFAULTS_LOG")
+  case "$source_export_mode" in
+    nonzero) pass "preferences migration rejects a nonzero source export" ;;
+    no-file) pass "preferences migration rejects a zero-status source export with no plist" ;;
+    empty) pass "preferences migration rejects an empty source export plist" ;;
+  esac
+done
+
+prepare_preferences_case "$TEST_ROOT/preferences target probe failure"
+if run_preferences_case present probe-fail success success success > "$PREF_RESULT_LOG" 2>&1; then
+  fail "preferences migration accepted failed target presence probe"
+fi
+assert_file_absent "$PREF_BACKUP_ROOT"
+assert_preferences_not_imported
+assert_contains "$PREF_RESULT_LOG" 'Target domain: failed.'
+assert_not_contains "$PREF_RESULT_LOG" 'Import: succeeded.'
+PREF_FAILURE_LOGS+=("$PREF_RESULT_LOG")
+pass "preferences migration fails closed on target-domain presence probe failure"
+
+for target_export_mode in nonzero no-file empty; do
+  prepare_preferences_case "$TEST_ROOT/preferences target export $target_export_mode"
+  if run_preferences_case present present success "$target_export_mode" success \
+    > "$PREF_RESULT_LOG" 2>&1; then
+    fail "preferences migration accepted target backup mode $target_export_mode"
+  fi
+  assert_file_exists "$PREF_SOURCE_EXPORT"
+  assert_file_absent "$PREF_TARGET_EXPORT"
+  assert_preferences_not_imported
+  assert_contains "$PREF_RESULT_LOG" 'Source domain: exported.'
+  assert_contains "$PREF_RESULT_LOG" 'Target domain: failed.'
+  assert_contains "$PREF_RESULT_LOG" 'Import: skipped.'
+  assert_not_contains "$PREF_RESULT_LOG" 'Import: succeeded.'
+  PREF_FAILURE_LOGS+=("$PREF_RESULT_LOG")
+  PREF_EXPORT_FAILURE_DEFAULTS_LOGS+=("$PREF_DEFAULTS_LOG")
+  case "$target_export_mode" in
+    nonzero) pass "preferences migration rejects a nonzero target recovery export" ;;
+    no-file) pass "preferences migration rejects a zero-status target export with no recovery plist" ;;
+    empty) pass "preferences migration rejects an empty target recovery plist" ;;
+  esac
+done
+
+prepare_preferences_case "$TEST_ROOT/preferences import failure"
+if run_preferences_case present present success success failure > "$PREF_RESULT_LOG" 2>&1; then
+  fail "preferences migration accepted a failed import"
+fi
+assert_file_exists "$PREF_SOURCE_EXPORT"
+assert_file_exists "$PREF_TARGET_EXPORT"
+assert_preferences_target_unchanged
+assert_contains "$PREF_RESULT_LOG" 'Import: failed.'
+assert_contains "$PREF_RESULT_LOG" "recover xmux preferences from: $PREF_TARGET_EXPORT"
+assert_contains "$PREF_RESULT_LOG" "Target backup path: $PREF_TARGET_EXPORT"
+assert_not_contains "$PREF_RESULT_LOG" 'Import: succeeded.'
+PREF_FAILURE_LOGS+=("$PREF_RESULT_LOG")
+pass "preferences import failure preserves and reports the exact recovery backup"
+
+for defaults_log in "${PREF_EXPORT_FAILURE_DEFAULTS_LOGS[@]}"; do
+  if /usr/bin/grep -q '^import ' "$defaults_log"; then
+    fail "preferences import ran after required export failure: $defaults_log"
+  fi
+done
+pass "preferences import is never called after any required source or target export failure"
+
+for failure_log in "${PREF_FAILURE_LOGS[@]}"; do
+  assert_not_contains "$failure_log" 'Import: succeeded.'
+  assert_not_contains "$failure_log" 'No shared settings, credential, or Keychain material was copied.'
+done
+pass "preferences failure receipts never print migration success"
 
 FAKE_OPERATIONS="$TEST_ROOT/fake operations"
 /bin/mkdir -p "$FAKE_OPERATIONS"
@@ -729,18 +1157,26 @@ prepare_launch_fixture() {
   LAUNCH_PING_STATE="$LAUNCH_ROOT/ping-state"
   LAUNCH_OPEN_LOG="$LAUNCH_ROOT/open.log"
   LAUNCH_PING_LOG="$LAUNCH_ROOT/ping.log"
+  LAUNCH_ZSHRC="$LAUNCH_ROOT/home/.zshrc"
   make_app "$LAUNCH_APP" 'com.cmuxterm.app.debug.xmux-main' 'xmux'
   /bin/mkdir -p "$LAUNCH_OFFICIAL" "$(dirname "$LAUNCH_CLI")"
   /usr/bin/plutil -replace LSEnvironment.CMUX_BUNDLED_CLI_PATH -string \
     "$LAUNCH_APP/Contents/Resources/bin/cmux" "$LAUNCH_APP/Contents/Info.plist"
   /usr/bin/plutil -replace LSEnvironment.CMUX_SHELL_INTEGRATION_DIR -string \
     "$LAUNCH_APP/Contents/Resources/shell-integration" "$LAUNCH_APP/Contents/Info.plist"
-  make_stub "$LAUNCH_CLI" \
-    "# $LAUNCH_APP/Contents/Resources/bin/cmux" \
-    "# --socket $LAUNCH_SOCKET" \
+  make_stub "$LAUNCH_APP/Contents/Resources/bin/cmux" \
+    '[[ "${1:-}" == --socket ]] || exit 80' \
+    '[[ "${2:-}" == "${XMUX_SOCKET_PATH:?}" ]] || exit 81' \
+    'shift 2' \
     '[[ -z "${XMUX_TEST_PING_LOG:-}" ]] || printf "%s\n" "$*" >> "$XMUX_TEST_PING_LOG"' \
     '[[ "$(<"${XMUX_TEST_PING_STATE:?}")" == healthy ]] || exit 1' \
     'printf "%s\n" PONG'
+  env XMUX_INSTALLED_APP="$LAUNCH_APP" \
+    XMUX_OFFICIAL_APP="$LAUNCH_OFFICIAL" \
+    XMUX_CLI_PATH="$LAUNCH_CLI" \
+    XMUX_ZSHRC="$LAUNCH_ZSHRC" \
+    XMUX_SOCKET_PATH="$LAUNCH_SOCKET" \
+    "$XMUX_DIR/05_install_xmux_cli.sh" > /dev/null
   printf '%s\n' stopped > "$LAUNCH_PROCESS_STATE"
   printf '%s\n' none > "$LAUNCH_SOCKET_OWNER_STATE"
   printf '%s\n' failed > "$LAUNCH_PING_STATE"
@@ -816,11 +1252,59 @@ assert_equals "$(<"$LAUNCH_PING_LOG")" 'ping'
 pass "launch verifies an already-running exact xmux without claiming a new launch"
 
 prepare_launch_fixture "$TEST_ROOT/launch new healthy"
+[[ "$LAUNCH_APP" == *' '* && "$LAUNCH_SOCKET" == *' '* ]] \
+  || fail "launch integration fixture did not include spaces in both paths"
+expected_launch_wrapper="$(
+  # shellcheck source=xmux/lib/common.sh
+  source "$XMUX_DIR/lib/common.sh"
+  xmux_render_cli_wrapper "$LAUNCH_APP/Contents/Resources/bin/cmux" "$LAUNCH_SOCKET"
+)"
+assert_equals "$(<"$LAUNCH_CLI")" "$expected_launch_wrapper"
 XMUX_TEST_LAUNCH_MODE=healthy run_launch_fixture > "$LAUNCH_ROOT/result.log"
 assert_file_exists "$LAUNCH_OPEN_LOG"
 assert_contains "$LAUNCH_ROOT/result.log" 'Launch result: launched and verified'
 assert_equals "$(<"$LAUNCH_PING_LOG")" 'ping'
 pass "launch verifies a newly started exact xmux with a live owned socket and PONG"
+pass "real 05 to 06 integration accepts canonical app and socket paths containing spaces"
+
+prepare_launch_fixture "$TEST_ROOT/launch wrong wrapper executable"
+render_wrapper "$LAUNCH_CLI" "$LAUNCH_ROOT/Wrong.app/Contents/Resources/bin/cmux" "$LAUNCH_SOCKET"
+if XMUX_TEST_LAUNCH_MODE=healthy run_launch_fixture > "$LAUNCH_ROOT/result.log" 2>&1; then
+  fail "launch accepted a wrapper with a modified executable path"
+fi
+assert_file_absent "$LAUNCH_OPEN_LOG"
+assert_contains "$LAUNCH_ROOT/result.log" 'xmux CLI wrapper content is not canonical'
+pass "launch validation rejects a modified wrapper executable path"
+
+prepare_launch_fixture "$TEST_ROOT/launch wrong wrapper socket"
+render_wrapper "$LAUNCH_CLI" "$LAUNCH_APP/Contents/Resources/bin/cmux" "$LAUNCH_ROOT/wrong.sock"
+if XMUX_TEST_LAUNCH_MODE=healthy run_launch_fixture > "$LAUNCH_ROOT/result.log" 2>&1; then
+  fail "launch accepted a wrapper with a modified socket path"
+fi
+assert_file_absent "$LAUNCH_OPEN_LOG"
+assert_contains "$LAUNCH_ROOT/result.log" 'xmux CLI wrapper content is not canonical'
+pass "launch validation rejects a modified wrapper socket path"
+
+prepare_launch_fixture "$TEST_ROOT/launch malformed wrapper"
+make_stub "$LAUNCH_CLI" 'this is not a canonical wrapper'
+if XMUX_TEST_LAUNCH_MODE=healthy run_launch_fixture > "$LAUNCH_ROOT/result.log" 2>&1; then
+  fail "launch accepted a malformed wrapper"
+fi
+assert_file_absent "$LAUNCH_OPEN_LOG"
+assert_contains "$LAUNCH_ROOT/result.log" 'xmux CLI wrapper content is not canonical'
+pass "launch validation rejects a malformed wrapper"
+
+prepare_launch_fixture "$TEST_ROOT/launch raw path comments"
+make_stub "$LAUNCH_CLI" \
+  "# $LAUNCH_APP/Contents/Resources/bin/cmux" \
+  "# --socket $LAUNCH_SOCKET" \
+  'printf "%s\n" PONG'
+if XMUX_TEST_LAUNCH_MODE=healthy run_launch_fixture > "$LAUNCH_ROOT/result.log" 2>&1; then
+  fail "launch accepted raw-path comments instead of the canonical wrapper"
+fi
+assert_file_absent "$LAUNCH_OPEN_LOG"
+assert_contains "$LAUNCH_ROOT/result.log" 'xmux CLI wrapper content is not canonical'
+pass "raw-path comments and unrelated lines cannot satisfy wrapper validation"
 
 prepare_launch_fixture "$TEST_ROOT/launch failed ping"
 XMUX_TEST_LAUNCH_MODE=failed-ping run_launch_fixture > "$LAUNCH_ROOT/result.log" 2>&1 && \
@@ -856,12 +1340,38 @@ assert_file_absent "$LAUNCH_OPEN_LOG"
 pass "launch never removes an arbitrary socket override outside the guarded custom root"
 
 DRY_BACKUP_ROOT="$TEST_ROOT/dry-backup"
+DRY_BACKUP_PATH="$DRY_BACKUP_ROOT/cmux-backup-20260722-130000"
 env XMUX_BACKUP_ROOT="$DRY_BACKUP_ROOT" XMUX_TIMESTAMP='20260722-130000' \
   XMUX_CMUX_CONFIG_DIR="$CONFIG_ROOT/cmux" XMUX_GHOSTTY_CONFIG_DIR="$CONFIG_ROOT/ghostty" \
   XMUX_APPLICATION_SUPPORT="$APP_SUPPORT" XMUX_DEFAULTS_BIN="$STUB_DIR/defaults" \
-  "$XMUX_DIR/01_backup_existing_cmux.sh" --dry-run > /dev/null
+  "$XMUX_DIR/01_backup_existing_cmux.sh" --dry-run > "$TEST_ROOT/dry-backup.log"
+assert_contains "$TEST_ROOT/dry-backup.log" 'Official defaults: present; export planned.'
+assert_contains "$TEST_ROOT/dry-backup.log" "Planned backup path: $DRY_BACKUP_PATH"
+assert_contains "$TEST_ROOT/dry-backup.log" 'Dry run only; no backup was created.'
+pass "backup dry-run with present defaults uses explicit planned wording"
 assert_file_absent "$DRY_BACKUP_ROOT"
 pass "backup --dry-run causes no mutation"
+assert_file_absent "$DRY_BACKUP_PATH/com.cmuxterm.app.plist"
+pass "backup dry-run never publishes a defaults plist"
+assert_not_contains "$TEST_ROOT/dry-backup.log" 'Official defaults: present; exported.'
+assert_not_contains "$TEST_ROOT/dry-backup.log" "Backup path: $DRY_BACKUP_PATH"
+assert_not_contains "$TEST_ROOT/dry-backup.log" 'backup created'
+assert_not_contains "$TEST_ROOT/dry-backup.log" 'backup available'
+pass "backup dry-run emits no actual-backup success wording"
+
+DRY_ABSENT_BACKUP_ROOT="$TEST_ROOT/dry-backup-absent"
+DRY_ABSENT_BACKUP_PATH="$DRY_ABSENT_BACKUP_ROOT/cmux-backup-20260722-130001"
+env XMUX_BACKUP_ROOT="$DRY_ABSENT_BACKUP_ROOT" XMUX_TIMESTAMP='20260722-130001' \
+  XMUX_CMUX_CONFIG_DIR="$CONFIG_ROOT/cmux" XMUX_GHOSTTY_CONFIG_DIR="$CONFIG_ROOT/ghostty" \
+  XMUX_APPLICATION_SUPPORT="$APP_SUPPORT" XMUX_DEFAULTS_BIN="$STUB_DIR/defaults" \
+  XMUX_TEST_DEFAULTS_MODE=absent \
+  "$XMUX_DIR/01_backup_existing_cmux.sh" --dry-run > "$TEST_ROOT/dry-backup-absent.log"
+assert_file_absent "$DRY_ABSENT_BACKUP_ROOT"
+assert_contains "$TEST_ROOT/dry-backup-absent.log" 'Official defaults: absent; would skip.'
+assert_contains "$TEST_ROOT/dry-backup-absent.log" "Planned backup path: $DRY_ABSENT_BACKUP_PATH"
+assert_contains "$TEST_ROOT/dry-backup-absent.log" 'Dry run only; no backup was created.'
+assert_not_contains "$TEST_ROOT/dry-backup-absent.log" 'Official defaults: present; exported.'
+pass "backup dry-run with absent defaults reports would-skip and creates nothing"
 
 for required_path in \
   '/Users/xaero/Projects/cmux' \

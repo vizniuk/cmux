@@ -29,11 +29,7 @@ fi
 /bin/mkdir -p "$cli_directory"
 (
   umask 022
-  {
-    printf '%s\n' '#!/usr/bin/env bash'
-    printf '%s\n' 'set -euo pipefail'
-    printf 'exec %q --socket %q "$@"\n' "$installed_cli" "$XMUX_SOCKET_PATH"
-  } > "$temporary_wrapper"
+  xmux_render_cli_wrapper "$installed_cli" "$XMUX_SOCKET_PATH" > "$temporary_wrapper"
 )
 /bin/chmod 0755 "$temporary_wrapper"
 /bin/mv "$temporary_wrapper" "$XMUX_CLI_PATH"

@@ -25,8 +25,8 @@ fi
 defaults_export="$backup_path/com.cmuxterm.app.plist"
 defaults_export_status="absent; skipped"
 if "$XMUX_DEFAULTS_BIN" read "$XMUX_OFFICIAL_BUNDLE_ID" >/dev/null 2>&1; then
-  defaults_export_status="present; exported"
   if [[ "$XMUX_DRY_RUN" -eq 1 ]]; then
+    defaults_export_status="present; export planned"
     xmux_print_command "$XMUX_DEFAULTS_BIN" export "$XMUX_OFFICIAL_BUNDLE_ID" "$defaults_export"
   else
     temporary_defaults_export="$defaults_export.exporting.$$"
@@ -39,11 +39,22 @@ if "$XMUX_DEFAULTS_BIN" read "$XMUX_OFFICIAL_BUNDLE_ID" >/dev/null 2>&1; then
       xmux_die "official defaults export was empty: $XMUX_OFFICIAL_BUNDLE_ID"
     fi
     /bin/mv "$temporary_defaults_export" "$defaults_export"
+    defaults_export_status="present; exported"
   fi
 else
-  xmux_note "Official defaults domain is absent; skipped: $XMUX_OFFICIAL_BUNDLE_ID"
+  if [[ "$XMUX_DRY_RUN" -eq 1 ]]; then
+    defaults_export_status="absent; would skip"
+    xmux_note "Official defaults domain is absent; would skip: $XMUX_OFFICIAL_BUNDLE_ID"
+  else
+    xmux_note "Official defaults domain is absent; skipped: $XMUX_OFFICIAL_BUNDLE_ID"
+  fi
 fi
 
 xmux_note "Credential files and Keychain material were not copied."
 xmux_note "Official defaults: $defaults_export_status."
-xmux_note "Backup path: $backup_path"
+if [[ "$XMUX_DRY_RUN" -eq 1 ]]; then
+  xmux_note "Planned backup path: $backup_path"
+  xmux_note "Dry run only; no backup was created."
+else
+  xmux_note "Backup path: $backup_path"
+fi

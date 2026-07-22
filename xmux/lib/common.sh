@@ -280,6 +280,28 @@ xmux_bundle_pids() {
     -e 'end tell' 2>/dev/null | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed '/^$/d'
 }
 
+xmux_defaults_domain_state() {
+  local domain="$1"
+  if "$XMUX_DEFAULTS_BIN" read "$domain" >/dev/null 2>&1; then
+    printf 'present\n'
+    return 0
+  fi
+
+  local domains
+  domains="$("$XMUX_DEFAULTS_BIN" domains 2>/dev/null)" || return 2
+  local listed_domain
+  while IFS= read -r listed_domain; do
+    if [[ "$listed_domain" == "$domain" ]]; then
+      return 2
+    fi
+  done < <(
+    printf '%s\n' "$domains" \
+      | /usr/bin/tr ',' '\n' \
+      | /usr/bin/sed 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/d'
+  )
+  printf 'absent\n'
+}
+
 xmux_expected_executable_path() {
   local executable_name="$XMUX_FALLBACK_EXECUTABLE_NAME"
   if [[ -f "$XMUX_INSTALLED_APP/Contents/Info.plist" ]]; then
@@ -339,7 +361,8 @@ xmux_require_bundle_stopped() {
   local bundle_id="$1"
   local label="$2"
   local pids
-  pids="$(xmux_bundle_pids "$bundle_id" || true)"
+  pids="$(xmux_bundle_pids "$bundle_id")" \
+    || xmux_die "cannot establish whether $label is stopped (bundle $bundle_id): process query failed"
   [[ -z "$pids" ]] || xmux_die "$label must be fully stopped (bundle $bundle_id, pid ${pids//$'\n'/,})"
 }
 
@@ -447,6 +470,14 @@ xmux_ping_socket() {
     exit 127;
   ' "$ping_timeout" "$XMUX_CLI_PATH" ping 2>/dev/null)" || return 1
   [[ "$response" == "PONG" ]]
+}
+
+xmux_render_cli_wrapper() {
+  local installed_cli="$1"
+  local socket_path="$2"
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -euo pipefail'
+  printf 'exec %q --socket %q "$@"\n' "$installed_cli" "$socket_path"
 }
 
 xmux_safe_bundle_component() {
